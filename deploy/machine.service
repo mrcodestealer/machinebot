@@ -1,0 +1,18 @@
+[Unit]
+Description=machinebot — Lark Machine / Encoder bot (persistent connection)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust to where the repo is checked out on the server.
+WorkingDirectory=/root/machinebot
+# .env is loaded by main.py via python-dotenv; EnvironmentFile is optional.
+EnvironmentFile=-/root/machinebot/.env
+ExecStart=/root/machinebot/.venv/bin/python /root/machinebot/main.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

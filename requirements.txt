@@ -1,0 +1,14 @@
+# Core Lark bot (persistent connection + webhook)
+lark-oapi>=1.2.0
+flask>=3.0
+requests>=2.31
+python-dotenv>=1.0
+pycryptodome>=3.20            # only needed if the Lark console Encrypt Key is enabled
+
+# One-time maintenance / stress-test reminders (reminder.py + scheduler in main.py)
+apscheduler>=3.10
+
+# Machine engines: prod-batch set/unset (smmachine / prod_machine_batch), webmachine
+# scrape loop, OSM-Watch warm browser + encoder scraper (osmwatch)
+playwright>=1.44              # then: playwright install chromium
+pillow>=10.0                  # checkcredit screenshot helpers (lazy; shipped for completeness)
