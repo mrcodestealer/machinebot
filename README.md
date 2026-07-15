@@ -19,6 +19,16 @@ Runs on its own Lark app in **persistent connection** mode (Subscription mode �
 | `/encoder nwr2205 & nwr2206` | MAIN/POOL/CCTV encoder IPs from `latestencoder.json` (`/encoder refresh` re-scrapes) |
 | `/osmwatch [url]` | OSM-Watch dashboard screenshot (warm browser) |
 | `/loginosmwatch` | force a fresh OSM-Watch login QR (posted to the lab group) |
+| `/checkcredit <machine> [YYYY-MM-DD]` | today's/dated log → latest players → NP choice card (Third Http) |
+| `/checkcreditdate` | interactive card: machine + player + date → Third Http Detail |
+| `/machineerror <machine> [date]` | latest two players, error context screenshots only |
+| `/checkmachinelog <machine> [date]` | logic-log card + AI summary (+ Third Http follow-up) |
+| `/stuckcredit <machine> [date]` | stuck credit: log + Third Http transfer-out check |
+| `/npthirdhttp <player_id> [YYYY-MM-DD HH:MM:SS.mmm]` | NP/WF/DHS/NCH/CP/OSM/MDR/TBP Third Http Detail screenshot |
+| `/cctv <machine>` | EGM CCTV screenshot (no credit check) |
+| `/al [DD/MM]` | Amount Loss (CHECKLOG) card + copy-for-sheet TSV |
+| reply `1`–`4` after an NP prompt | Third Http Detail for the picked player |
+| paste a **Missing Credit** alert (@bot) | parses account/amount/date → checkcredit form card |
 | `/deploy` (or "git pull origin main and restart service") | git pull + restart the `machine` systemd unit |
 
 The `/wm` machine dashboard (webmachine blueprint) is served on the bot's Flask port
@@ -29,7 +39,10 @@ The `/wm` machine dashboard (webmachine blueprint) is served on the bot's Flask 
 - `main.py` — Lark plumbing + dispatch (authored for this bot, skeleton mirrored from logcreditbot)
 - `smmachine.py`, `prod_machine_batch.py` — prod-batch set/unset engine (Playwright)
 - `maintenancemachineagent.py` — LLM/regex intent parsing for maintenance messages
-- `checkcredit.py`, `np_third_http_page.py`, `third_http_warm_pool.py` — backend URL/credential routing
+- `checkcredit.py`, `np_third_http_page.py`, `third_http_warm_pool.py` — checkcredit engine
+  (OSS/LogNavigator log read, Third Http screenshots, cards) + backend URL/credential routing
+- `checkmachinelog.py` — logic-log reader (imports checkcredit; optional AI summary via chatagent)
+- `amountloss.py` — FPMS Amount Loss + CHECKLOG (`/al`); `chatagent.py` — optional LLM used by the AI summary
 - `webmachine.py` — machine dashboard + scrape loop; `webapp.py` here is a thin **alias** to it
 - `findmachine.py`, `machine_card.py` — find-machine form card + TRTC card rendering
 - `osmwatch.py` — OSM-Watch warm browser, QR login, encoder scraper (`latestencoder.json`)
@@ -128,9 +141,10 @@ credentials or scraped data.
 
 ## Notes / gotchas
 
-- **App sharing**: this app ID is also used by logcreditbot. Lark delivers each persistent-connection
-  event to only **one** of the connected clients — do not run both bots on the same app
-  simultaneously or commands will randomly go unanswered (see the deploy notes in the PR/commit).
+- **This bot replaces logcreditbot**: it shares logcreditbot's app ID *and* carries all of its
+  credit/log commands, so run **only machinebot** on this app (`systemctl disable --now logcredit`).
+  Lark delivers each persistent-connection event to only **one** connected client — running both
+  bots simultaneously makes commands randomly go unanswered.
 - Warm pools (`PROD_WARM_POOL`, `WEBMACHINE_WARM_POOL`, `THIRD_HTTP_WARM_POOL`) default **off**
   for CPU-only hosts; flip to `1` on beefier machines for faster set/unset.
 - The maintenance-agent LLM (`BOT_CHAT_*`) is optional — without a reachable backend it falls

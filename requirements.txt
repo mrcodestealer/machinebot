@@ -9,6 +9,18 @@ pycryptodome>=3.20            # only needed if the Lark console Encrypt Key is e
 apscheduler>=3.10
 
 # Machine engines: prod-batch set/unset (smmachine / prod_machine_batch), webmachine
-# scrape loop, OSM-Watch warm browser + encoder scraper (osmwatch)
+# scrape loop, OSM-Watch warm browser + encoder scraper (osmwatch), checkcredit /
+# checkmachinelog Third-Http screenshots
 playwright>=1.44              # then: playwright install chromium
-pillow>=10.0                  # checkcredit screenshot helpers (lazy; shipped for completeness)
+pillow>=10.0                  # error-context / EGM screenshot rendering
+
+# Amount Loss / CHECKLOG (/al) — Aliyun SLS logs + FPMS TOTP login
+pyotp>=2.9
+aliyun-log-python-sdk>=0.9
+aliyun-python-sdk-core>=2.15
+aliyun-python-sdk-sts>=3.1
+
+# Optional AI log summary (checkmachinelog → chatagent). Omit on CPU-only hosts;
+# the summary degrades gracefully when the LLM backend is unreachable.
+# torch
+# transformers

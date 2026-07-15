@@ -16,10 +16,24 @@ This is a self-contained bot that ONLY does the machine + encoder flows mirrored
   - ``/loginosmwatch``                         force a fresh OSM-Watch login QR (lab group)
   - ``/wm``                                    machine dashboard (webmachine blueprint + scrape loop)
 
+…plus the credit / log flows mirrored from ``logcreditbot`` (same Lark app):
+
+  - ``/checkcredit <machine> [YYYY-MM-DD]``    log → latest players → NP choice card (Third Http)
+  - ``/checkcreditdate``                       interactive card (machine + player + date)
+  - ``/machineerror <machine> [date]``         latest two players, error context only
+  - ``/checkmachinelog <machine> [date]``      logic log → card + AI summary (+ Third Http)
+  - ``/stuckcredit <machine> [date]``          stuck credit: log + Third Http transfer-out check
+  - ``/npthirdhttp <player_id> [date time]``   NP/WF/DHS/NCH/CP/OSM/MDR/TBP Third Http Detail
+  - ``/cctv <machine>``                        EGM CCTV screenshot · ``/al [DD/MM]`` Amount Loss
+  - reply **1**–**4** after an NP prompt · **Missing Credit** alert paste → checkcredit card
+
 The heavy lifting lives in the sibling modules copied verbatim from ``osedutybot``:
   - ``smmachine.py`` / ``prod_machine_batch.py``  prod-batch set/unset engine (Playwright EGM automation)
   - ``maintenancemachineagent.py``                LLM/regex intent parsing for maintenance messages
-  - ``checkcredit.py``                            backend URL/credential routing (``_np_resolve_backend``)
+  - ``checkcredit.py`` (+ ``np_third_http_page.py``, ``third_http_warm_pool.py``) — checkcredit engine
+    (OSS/LogNavigator log read, Third Http screenshots, cards) + backend routing (``_np_resolve_backend``)
+  - ``checkmachinelog.py``                        logic-log reader (optional AI summary via chatagent)
+  - ``amountloss.py`` / ``chatagent.py``          FPMS Amount Loss + CHECKLOG (``/al``) / optional LLM
   - ``webmachine.py`` (+ ``webapp.py`` alias)     machine dashboard + scrape loop → webmachine_data.json
   - ``findmachine.py`` / ``machine_card.py``      find-machine form card + TRTC card rendering
   - ``osmwatch.py``                               OSM-Watch warm browser + encoder scraper (``/encoder``)
@@ -501,6 +515,84 @@ def _lark_http_card_callback_response(body: dict) -> Response:
         status=200,
         mimetype="application/json",
     )
+
+
+# ================= /checkcredit thread binding + NP pending (per-chat) =================
+# Last NP prompt result in this chat — used by `/npthirdhttp` and reply 1–4 for date + credit
+# time window. Threaded replies stay under the user's /checkcredit command message.
+CHECKCREDIT_NP_PENDING: dict[str, dict] = {}
+CHECKCREDIT_THREAD_ROOT: dict[str, dict] = {}
+
+
+def _set_checkcredit_thread_root(chat_id: str, message_id: str) -> None:
+    mid = (message_id or "").strip()
+    if not mid:
+        return
+    CHECKCREDIT_THREAD_ROOT[chat_id] = {"message_id": mid, "ts": time.time()}
+
+
+def _get_checkcredit_thread_root(chat_id: str, max_age_sec: float = 3600.0) -> Optional[str]:
+    ent = CHECKCREDIT_THREAD_ROOT.get(chat_id)
+    if not ent:
+        return None
+    if time.time() - ent["ts"] > max_age_sec:
+        del CHECKCREDIT_THREAD_ROOT[chat_id]
+        return None
+    return str(ent.get("message_id") or "").strip() or None
+
+
+def _checkcredit_begin_thread(
+    chat_id: str,
+    parent_message_id: Optional[str] = None,
+) -> Optional[str]:
+    """Thread under the user's ``/checkcredit`` message (``reply_in_thread`` — not main chat)."""
+    parent = (parent_message_id or "").strip() or None
+    if parent:
+        _set_checkcredit_thread_root(chat_id, parent)
+    return parent
+
+
+def _checkcredit_send(
+    chat_id: str,
+    text: str,
+    *,
+    thread_root: Optional[str] = None,
+    msg_type: str = "text",
+    mentions=None,
+) -> dict:
+    root = (thread_root or _get_checkcredit_thread_root(chat_id) or "").strip()
+    if root:
+        return reply_message_in_thread(root, text, msg_type=msg_type, mentions=mentions)
+    return send_message(chat_id, text, msg_type=msg_type, mentions=mentions)
+
+
+def _checkcredit_send_image(chat_id: str, image_key: str, *, thread_root: Optional[str] = None) -> dict:
+    root = (thread_root or _get_checkcredit_thread_root(chat_id) or "").strip()
+    if root:
+        return reply_message_in_thread(root, image_key, msg_type="image")
+    return send_image_message(chat_id, image_key)
+
+
+def _set_checkcredit_np_pending(
+    chat_id: str,
+    payload: dict,
+    thread_root: Optional[str] = None,
+) -> None:
+    root = (thread_root or _get_checkcredit_thread_root(chat_id) or "").strip() or None
+    CHECKCREDIT_NP_PENDING[chat_id] = {"payload": payload, "ts": time.time(), "thread_root": root}
+    if root:
+        _set_checkcredit_thread_root(chat_id, root)
+
+
+def _get_checkcredit_np_pending(chat_id: str, max_age_sec: float = 3600.0):
+    ent = CHECKCREDIT_NP_PENDING.get(chat_id)
+    if not ent:
+        return None
+    if time.time() - ent["ts"] > max_age_sec:
+        del CHECKCREDIT_NP_PENDING[chat_id]
+        return None
+    return ent["payload"]
+
 
 
 # ================= Machine lookup card helpers (/nch /nwr /wf /tbr /tbp /cp /dhs /mdr) =================
@@ -1134,6 +1226,890 @@ REMINDER_TARGET_CHAT_ID = os.getenv(
 ).strip() or "oc_9de3d63fc589df6feeb9b0bee9c45b72"
 
 
+# ================= Check Credit / Log engine dispatch (mirrored from osedutybot) =================
+AMOUNT_LOSS_MAX_ATTEMPTS = 2
+AMOUNT_LOSS_RETRY_NOTICE = "Error occurred... Auto retry Please wait..."
+
+
+def run_amountloss_check(chat_id, date_str=None, *, scheduled_9am=False):
+    """在后台线程中执行 amount loss 检查，并将结果发送到指定 chat_id（失败自动重跑一轮）"""
+    try:
+        from amountloss import amount_loss_9am_enabled, fetch_fpms_data
+    except ImportError as e:
+        send_message(
+            chat_id,
+            "❌ 无法加载 FPMS 抓取模块（fetch_fpms_data）。"
+            f" 请把与开发环境一致的 amountloss.py 部署到服务器，并安装 playwright。\n{str(e)}",
+        )
+        return
+
+    if scheduled_9am and not amount_loss_9am_enabled():
+        print(
+            "[Amount Loss] 9:00 display/sheet fill skipped (temporarily disabled; AMOUNT_LOSS_9AM_ENABLED=1 to restore)",
+            flush=True,
+        )
+        return
+
+    for attempt in range(1, AMOUNT_LOSS_MAX_ATTEMPTS + 1):
+        try:
+            result = fetch_fpms_data(
+                headless=True,
+                target_date_str=date_str,
+                filterdata=True,
+                checklog=True,
+                scheduled_9am=scheduled_9am,
+            )
+            if isinstance(result, dict) and result.get("lark_card"):
+                sync_note = str(result.get("sync_note") or "").strip()
+                if sync_note:
+                    send_message(chat_id, sync_note)
+                card_json = json.dumps(result["lark_card"])
+                resp = send_message(chat_id, card_json, msg_type="interactive")
+                if resp.get("code") != 0:
+                    send_message(chat_id, result.get("text") or str(result))
+                tsv_all = (result.get("sheet_tsv_all") or "").strip()
+                tsv_game = (result.get("sheet_tsv_game") or "").strip()
+                if tsv_all:
+                    send_message(
+                        chat_id,
+                        "📋 Copy for Sheet — python3 amountloss.py --getdata\n```text\n" + tsv_all + "\n```",
+                    )
+                if tsv_game:
+                    send_message(
+                        chat_id,
+                        "📋 Copy for Sheet — By Game\n```text\n" + tsv_game + "\n```",
+                    )
+            else:
+                send_message(chat_id, result if isinstance(result, str) else str(result))
+            return
+        except Exception as e:
+            if attempt < AMOUNT_LOSS_MAX_ATTEMPTS:
+                send_message(chat_id, AMOUNT_LOSS_RETRY_NOTICE)
+                print(f"[Amount Loss] attempt {attempt} failed: {e!r}, auto-retrying...")
+            else:
+                send_message(chat_id, f"❌ Amount Loss 检查失败: {str(e)}")
+                print(f"[Amount Loss] failed after {AMOUNT_LOSS_MAX_ATTEMPTS} attempts: {e!r}")
+
+
+def _prewarm_third_http_for_machine(machine_query: str) -> None:
+    """R1: start the Third-Http warm browser login for this machine's backend NOW, so it
+    overlaps phase A (the OSS log read) instead of paying launch+login later on the critical
+    path. Non-blocking (queues a prewarm task on the per-tag worker); safe no-op when the pool
+    is disabled, credentials are missing, or the browser is already warm (login fast-paths)."""
+    try:
+        from third_http_warm_pool import third_http_warm_pool, third_http_warm_pool_enabled
+
+        if not third_http_warm_pool_enabled():
+            return
+        import checkcredit as _cc
+
+        tag = _cc._np_log_backend_tag(str(machine_query).strip())
+        if not tag or not _cc._np_backend_has_credentials(tag):
+            return
+        third_http_warm_pool().prewarm([tag])
+        print(
+            f"[third-http-warm] prewarm {tag} submitted (overlaps log read for {machine_query!r})",
+            flush=True,
+        )
+    except Exception as ex:
+        print(f"[third-http-warm] prewarm skip for {machine_query!r}: {ex!r}", flush=True)
+
+
+def _third_http_warm_enabled_for_bot() -> bool:
+    try:
+        from third_http_warm_pool import third_http_warm_pool_enabled
+
+        return bool(third_http_warm_pool_enabled())
+    except Exception:
+        return False
+
+
+def run_checkcredit_finderror(
+    chat_id,
+    machine_query: str,
+    date_str: str,
+    mode: str = "default",
+    navigator_logic_log_basename: Optional[str] = None,
+    thread_root_message_id: Optional[str] = None,
+):
+    """Background: same as checkcredit + `--date`. Uses OSS HTTP by default (see checkcredit_use_oss_source)."""
+    thread_root = (thread_root_message_id or _get_checkcredit_thread_root(chat_id) or "").strip() or None
+    if thread_root:
+        _set_checkcredit_thread_root(chat_id, thread_root)
+
+    # R1: warm the Third-Http browser login for this machine's backend now, so it overlaps
+    # the log read below — the later Detail screenshot (checkcredit/machineerror) then reuses
+    # the ready page instead of launching+logging-in on the critical path.
+    _prewarm_third_http_for_machine(machine_query)
+
+    def _cc_send(text, **kwargs):
+        return _checkcredit_send(chat_id, text, thread_root=thread_root, **kwargs)
+
+    try:
+        import checkcredit
+    except ImportError as e:
+        _cc_send(f"❌ Cannot load checkcredit module: {e}")
+        return
+    try:
+        td = datetime.strptime(date_str.strip(), "%Y-%m-%d").date()
+        use_oss = checkcredit.checkcredit_use_oss_source()
+        # ``base`` is the LogNavigator host — only used when source="navigator". checkcredit no
+        # longer defines a module-level DEFAULT_BASE, so fall back to CHECKCREDIT_BASE (empty is
+        # fine for the default OSS source, which ignores ``base``).
+        _cc_base = getattr(checkcredit, "DEFAULT_BASE", None) or os.getenv("CHECKCREDIT_BASE", "")
+        out = checkcredit.run_finderror(
+            str(machine_query).strip(),
+            target_date=td,
+            timeout_ms=max(15_000, 90_000),
+            base=_cc_base,
+            user=checkcredit.DEFAULT_USER,
+            pw=checkcredit.DEFAULT_PASS,
+            source="oss" if use_oss else "navigator",
+            navigator_logic_log_basename=navigator_logic_log_basename,
+        )
+        text = (out.get("text") or "").strip()
+        np = out.get("np_followup")
+        preview_img_path = None
+        preview_img_key = ""
+        preview_img_err = ""
+        preview_img_attempted = False
+        error_ctx_paths: list[str] = []
+        machineerror_fb: list[str] = []
+        if isinstance(np, dict):
+            try:
+                md = str(np.get("machine_display") or "").strip() or None
+                ms = str(np.get("machine_match_substr") or "").strip() or None
+                cap = getattr(checkcredit, "screenshot_egm_status_window", None)
+                if callable(cap) and md:
+                    preview_img_attempted = True
+                    preview_img_path = cap(
+                        machine_display=md,
+                        machine_substr=ms,
+                        timeout_ms=120_000,
+                        headed=False,
+                    )
+                    preview_img_key = upload_image_lark(preview_img_path) or ""
+                    if not preview_img_key:
+                        preview_img_err = "upload image failed"
+                        print("[checkcredit] EGM preview screenshot upload failed", flush=True)
+                if callable(getattr(checkcredit, "build_np_choice_lark_card", None)):
+                    np_choices = np.get("np_choices") or []
+                    intro_line = ""
+                    extra_md = ""
+                    extra_error_images: list[dict[str, str]] = []
+                    if str(mode or "").strip().lower() == "error_only":
+                        np_choices = np.get("np_choices_error_only") or []
+                        intro_line = "Found players error"
+                        extra_md = str(np.get("machineerror_context_md") or "")
+                        merged_rows = out.get("merged_players") or []
+                        pick_err = getattr(checkcredit, "select_top2_error_players", None)
+                        build_ctx = getattr(checkcredit, "build_error_context_screenshots", None)
+                        fb_ctx = getattr(checkcredit, "format_error_context_text_fallback", None)
+                        if callable(pick_err) and callable(build_ctx):
+                            err_rows = pick_err(merged_rows) or []
+                            for rr in err_rows[:2]:
+                                if not (rr.get("errors") or []):
+                                    continue
+                                ctx_items = build_ctx(rr, max_errors=6, lines_before_after=4) or []
+                                row_got_img = False
+                                for ci in ctx_items:
+                                    pth = str(ci.get("path") or "").strip()
+                                    if not pth:
+                                        continue
+                                    error_ctx_paths.append(pth)
+                                    ik = upload_image_lark(pth) or ""
+                                    if not ik:
+                                        try:
+                                            sz = os.path.getsize(pth)
+                                        except OSError:
+                                            sz = -1
+                                        print(
+                                            f"[checkcredit] error-context upload failed: path={pth} size={sz}",
+                                            flush=True,
+                                        )
+                                        continue
+                                    row_got_img = True
+                                    extra_error_images.append(
+                                        {
+                                            "img_key": ik,
+                                            "title": str(ci.get("title") or "Error context screenshot"),
+                                        }
+                                    )
+                                if not row_got_img and callable(fb_ctx):
+                                    chunk = fb_ctx(rr, max_errors=6)
+                                    if chunk:
+                                        machineerror_fb.append(chunk)
+                    else:
+                        intro_line = str(np.get("np_choice_intro") or "").strip()
+                    same_last_line = ""
+                    if str(mode or "").strip().lower() != "error_only":
+                        same_last_line = str(np.get("same_last_line") or "")
+                    np["np_choices"] = np_choices
+                    out["lark_card_candidates"] = checkcredit.build_np_choice_lark_card(
+                        np_choices,
+                        target_date_iso=str(np.get("target_date") or ""),
+                        machine_display=str(np.get("machine_display") or ""),
+                        third_http_backend=str(np.get("third_http_backend") or "NP"),
+                        image_key=preview_img_key,
+                        intro_line=intro_line,
+                        same_last_line=same_last_line,
+                        extra_md=extra_md,
+                        extra_error_images=extra_error_images,
+                        navigator_same_day_multi_log=bool(np.get("navigator_same_day_multi_log")),
+                    )
+            except Exception as e:
+                preview_img_err = str(e)
+                print(f"[checkcredit] EGM preview screenshot failed: {e!r}", flush=True)
+            finally:
+                if preview_img_path and os.path.isfile(preview_img_path):
+                    try:
+                        os.unlink(preview_img_path)
+                    except OSError:
+                        pass
+                for pth in error_ctx_paths:
+                    if pth and os.path.isfile(pth):
+                        try:
+                            os.unlink(pth)
+                        except OSError:
+                            pass
+            if preview_img_attempted and not preview_img_key:
+                msg = (
+                    f"⚠️ EGM preview screenshot unavailable: {preview_img_err}"
+                    if preview_img_err
+                    else "⚠️ EGM preview screenshot unavailable."
+                )
+                _cc_send(msg)
+        card = out.get("lark_card_candidates")
+        if isinstance(card, dict):
+            card_json = json.dumps(card)
+            resp = _cc_send(card_json, msg_type="interactive")
+            if resp.get("code") != 0:
+                _cc_send(text if text else "(no output)")
+            if machineerror_fb and str(mode or "").strip().lower() == "error_only":
+                _cc_send(
+                    "⚠️ Error log images unavailable (PNG render or Lark upload failed). Text context:\n\n"
+                    + "\n\n".join(machineerror_fb),
+                )
+        else:
+            _cc_send(text if text else "(no output)")
+
+        if isinstance(np, dict):
+            _set_checkcredit_np_pending(chat_id, np, thread_root=thread_root)
+    except Exception as e:
+        cmd = "machineerror" if str(mode or "").strip().lower() == "error_only" else "checkcredit"
+        _cc_send(f"❌ {cmd} failed: {e}")
+        print(f"[{cmd}] error: {e!r}")
+
+
+def run_check_machine_log_job(
+    chat_id: str,
+    machine_query: str,
+    date_str: str,
+    thread_root_message_id: Optional[str] = None,
+    *,
+    stuck_credit: bool = False,
+) -> None:
+    """OSS/LogNavigator logic log → threaded Lark card + AI summary (+ Third Http when applicable)."""
+    thread_root = (thread_root_message_id or _get_checkcredit_thread_root(chat_id) or "").strip() or None
+    if thread_root:
+        _set_checkcredit_thread_root(chat_id, thread_root)
+
+    # R1: kick the Third-Http browser login off concurrently with the log read below, so a
+    # cold/slept browser finishes authenticating while OSS fetch runs — the screenshot step
+    # then reuses the ready page instead of launching+logging-in on the critical path.
+    _prewarm_third_http_for_machine(machine_query)
+
+    def _cml_send(text, **kwargs):
+        return _checkcredit_send(chat_id, text, thread_root=thread_root, **kwargs)
+
+    try:
+        import checkmachinelog
+    except ImportError as e:
+        _cml_send(f"❌ Cannot load checkmachinelog module: {e}")
+        return
+    try:
+        td = datetime.strptime(date_str.strip(), "%Y-%m-%d").date()
+        out = checkmachinelog.run_check_machine_log(
+            str(machine_query).strip(),
+            target_date=td,
+            stuck_credit=stuck_credit,
+        )
+        card = out.get("lark_card")
+        if isinstance(card, dict):
+            resp = _cml_send(json.dumps(card, ensure_ascii=False), msg_type="interactive")
+            if resp.get("code") != 0:
+                text = (out.get("text") or "").strip()
+                if text:
+                    _cml_send(text)
+                else:
+                    _cml_send(f"❌ {'stuck credit' if stuck_credit else 'checkmachinelog'} card failed: {resp}")
+        else:
+            text = (out.get("text") or "").strip()
+            if text:
+                _cml_send(text)
+            else:
+                _cml_send(f"✅ {'stuck credit' if stuck_credit else 'checkmachinelog'} finished (no output).")
+
+        pick = out.get("third_http_followup")
+        if isinstance(pick, dict) and (pick.get("user_id") or "").strip():
+            be = str(pick.get("third_http_backend") or "NP").strip().upper()
+            uid = str(pick["user_id"]).strip()
+            cr = pick.get("credit_value")
+            cr_s = str(cr) if cr is not None else "n/a"
+            ts = str(pick.get("time_short") or "").strip()
+            md = str(pick.get("machine_display") or machine_query).strip()
+            if stuck_credit:
+                _cml_send(
+                    f"📋 **Stuck credit** on `{md}` — last player **`{uid}`** (credit `{cr_s}` @ `{ts}`).\n"
+                    f"**Checking Third Http ({be})** — did the player **transfer out credit**?\n\n"
+                    f"卡机额度 — 正在查 **Third Http ({be})** 玩家 **`{uid}`** 是否已成功转出…"
+                )
+                success_caption = (
+                    f"✅ **Third Http ({be})** — player `{uid}` **transferred out credit** successfully "
+                    f"(Detail matches log amount `{cr_s}` @ `{ts}`).\n"
+                    f"✅ Third Http 有匹配记录 — 玩家 **`{uid}`** 额度应已成功转出（卡机可清）。"
+                )
+            else:
+                err_p = str(pick.get("error_player_id") or "").strip()
+                kind = str(pick.get("verify_kind") or "").strip()
+                if kind == "transfer_out" and err_p and err_p != uid:
+                    _cml_send(
+                        f"📋 Log **error** player `{err_p}` · card **transfer-out** "
+                        f"`{cr_s}` @ `{ts}` → player **`{uid}`**.\n"
+                        f"**Checking Third Http ({be})** for **`{uid}`** (not error player).\n\n"
+                        f"日志 error 玩家 `{err_p}` ≠ 转出玩家 **`{uid}`** — 查 Third Http 转出记录…"
+                    )
+                    success_caption = (
+                        f"✅ **Third Http ({be})** — player **`{uid}`** **transferred out credit** "
+                        f"(Detail `{cr_s}` @ `{ts}`, machine `{md}`).\n"
+                        f"✅ Third Http — 玩家 **`{uid}`** 转出成功（非 error 玩家 `{err_p}`）。"
+                    )
+                else:
+                    _cml_send(
+                        f"📋 Log shows an **error** for player `{uid}` (credit `{cr_s}` @ `{ts}`).\n"
+                        f"**Now checking Third Http ({be})** — did the player **transfer out credit** successfully?\n\n"
+                        f"日志有 error — 正在查 **Third Http ({be})** 是否已成功转出额度…"
+                    )
+                    success_caption = (
+                        f"✅ **Third Http ({be})** — player `{uid}` **transferred out credit** successfully "
+                        f"(Detail matches log amount `{cr_s}` @ `{ts}`).\n"
+                        f"✅ Third Http 有匹配记录 — 玩家 **`{uid}`** 额度应已成功转出。"
+                    )
+            _np_run_screenshot_worker(
+                chat_id,
+                uid,
+                str(pick.get("target_date_iso") or date_str).strip(),
+                ts,
+                machine_substr=pick.get("machine_match_substr"),
+                expected_credit=cr if isinstance(cr, (int, float)) else None,
+                machine_display=str(pick.get("machine_display") or "").strip() or None,
+                thread_root=thread_root,
+                success_caption=success_caption,
+                time_short_candidates=pick.get("time_short_candidates"),
+            )
+    except Exception as e:
+        label = "stuck credit" if stuck_credit else "checkmachinelog"
+        _cml_send(f"❌ {label} failed: {e}")
+        print(f"[{label}] error: {e!r}")
+
+
+def run_checkcredit_navigator_next_log(chat_id: str) -> None:
+    """Open the next same-day logic log (card **check another logs**) — OSS or LogNavigator."""
+    pend = _get_checkcredit_np_pending(chat_id)
+    files = (pend or {}).get("navigator_logic_log_files") or []
+    opened = str((pend or {}).get("navigator_opened_logic_log_basename") or "").strip()
+    if not pend or len(files) < 2:
+        _checkcredit_send(
+            chat_id,
+            "❌ No alternate logic logs in context — run `/checkcredit …` again.",
+        )
+        return
+    try:
+        idx = files.index(opened) if opened in files else 0
+    except ValueError:
+        idx = 0
+    next_idx = (idx + 1) % len(files)
+    next_fn = str(files[next_idx] or "").strip()
+    if not next_fn:
+        _checkcredit_send(chat_id, "❌ Could not resolve next log filename.")
+        return
+    mq = str((pend.get("machine_display") or "")).strip()
+    date_iso = str((pend.get("target_date") or "")).strip()
+    if not mq or not date_iso:
+        _checkcredit_send(chat_id, "❌ Pending machine/date missing — run `/checkcreditdate …` again.")
+        return
+    thread_root = _get_checkcredit_thread_root(chat_id)
+    _checkcredit_send(chat_id, f"⏳ Opening next logic log `{next_fn}` …", thread_root=thread_root)
+    run_checkcredit_finderror(
+        chat_id,
+        mq,
+        date_iso,
+        mode="default",
+        navigator_logic_log_basename=next_fn,
+        thread_root_message_id=thread_root,
+    )
+
+
+def run_checkcredit_player_job(chat_id: str, machine: str, player_id: str, date_iso: str) -> None:
+    """OSS log → player credit row → Third Http Detail screenshot (same path as ``/npthirdhttp``)."""
+    try:
+        import checkcredit
+        from datetime import datetime as _dt
+
+        td = _dt.strptime(date_iso.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        _checkcredit_send(chat_id, "❌ Invalid date — use YYYY-MM-DD.")
+        return
+    except ImportError as e:
+        _checkcredit_send(chat_id, f"❌ Cannot load checkcredit: {e}")
+        return
+    md, lc, err = checkcredit.resolve_player_log_credit_snapshot(
+        machine.strip(), player_id.strip(), td
+    )
+    if err:
+        _checkcredit_send(chat_id, f"❌ {err}")
+        return
+    assert lc is not None
+    ts = str(lc.get("time_short") or "").strip()
+    if not ts:
+        _checkcredit_send(chat_id, "❌ No credit time in log for this player.")
+        return
+    exp: Optional[float] = None
+    v = lc.get("value")
+    if v is not None:
+        try:
+            exp = float(v)
+        except (TypeError, ValueError):
+            exp = None
+    display_md = (md or "").strip() or None
+    ms = checkcredit.machine_match_substr_from_display((md or "").strip()) or None
+    _np_run_screenshot_worker(
+        chat_id,
+        player_id.strip(),
+        date_iso.strip(),
+        ts,
+        machine_substr=ms,
+        expected_credit=exp,
+        machine_display=display_md,
+    )
+
+
+def run_cctv_screenshot_job(chat_id: str, machine_query: str) -> None:
+    """EGM Status: click **CCTV**, screenshot dialog only (no credit / log checks)."""
+    try:
+        import checkcredit
+    except ImportError as e:
+        send_message(chat_id, f"❌ Cannot load checkcredit module: {e}")
+        return
+    cap = getattr(checkcredit, "screenshot_egm_cctv_window", None)
+    resolve_route = getattr(checkcredit, "resolve_machine_display_for_egm_route", None)
+    if not callable(cap):
+        send_message(
+            chat_id,
+            "❌ `checkcredit.screenshot_egm_cctv_window` missing — deploy the latest `checkcredit.py`.",
+        )
+        return
+    mq = (machine_query or "").strip()
+    if not mq:
+        send_message(
+            chat_id,
+            "❌ Usage: `/cctv <machine>` — same machine label as checkcredit (e.g. `OSMCP181`, `Dragons-0181`).",
+        )
+        return
+    md_resolved = mq
+    ms_resolved: Optional[str] = None
+    if callable(resolve_route):
+        send_message(chat_id, "⏳ LogNavigator / OSS — resolving machine → correct backend (NCH, CP, …)…")
+        try:
+            md_resolved, ms_resolved = resolve_route(mq, timeout_ms=120_000)
+        except Exception as e:
+            send_message(chat_id, f"❌ Could not resolve machine / environment: {e}")
+            return
+        tag_fn = getattr(checkcredit, "_np_log_backend_tag", lambda _: "?")
+        send_message(
+            chat_id,
+            f"→ **{md_resolved}** · backend **{tag_fn(md_resolved)}** — EGM **CCTV**…",
+        )
+    else:
+        send_message(chat_id, "⏳ EGM **CCTV** — login → click **CCTV** → screenshot…")
+    path = None
+    try:
+        path = cap(
+            machine_display=md_resolved,
+            machine_substr=(ms_resolved or "").strip() or None,
+            timeout_ms=120_000,
+            headed=False,
+        )
+        key = upload_image_lark(path)
+        if not key:
+            send_message(chat_id, "❌ CCTV screenshot upload failed.")
+            return
+        r = send_image_message(chat_id, key)
+        if r.get("code") != 0:
+            send_message(chat_id, f"❌ Failed to send image: {r}")
+    except Exception as e:
+        send_message(chat_id, f"❌ CCTV screenshot failed: {e}")
+        print(f"[cctv] error: {e!r}", flush=True)
+    finally:
+        if path and os.path.isfile(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def _np_run_screenshot_worker(
+    chat_id: str,
+    uid: str,
+    date_iso: str,
+    time_short: str,
+    *,
+    machine_substr: Optional[str] = None,
+    expected_credit: Optional[float] = None,
+    machine_display: Optional[str] = None,
+    thread_root: Optional[str] = None,
+    success_caption: Optional[str] = None,
+    time_short_candidates: Optional[list[str]] = None,
+) -> None:
+    """NP / WF / DHS / NCH / CP / OSM / MDR / TBP Log Third Http → `recharge` Detail screenshot. Always **headless** on server."""
+    root = (thread_root or _get_checkcredit_thread_root(chat_id) or "").strip() or None
+
+    def _np_send(text, **kwargs):
+        return _checkcredit_send(chat_id, text, thread_root=root, **kwargs)
+
+    try:
+        import checkcredit
+
+        screenshot_np_recharge_detail = checkcredit.screenshot_np_recharge_detail
+    except ImportError as e:
+        _np_send(f"❌ Cannot load checkcredit module: {e}")
+        return
+    except AttributeError:
+        _np_send(
+            "❌ checkcredit.screenshot_np_recharge_detail missing — deploy the latest `checkcredit.py`.",
+        )
+        return
+    backend_tag = getattr(checkcredit, "_np_log_backend_tag", lambda _: "NP")(
+        (machine_display or "").strip() or None
+    )
+    _np_send(
+        f"⏳ {backend_tag} backend (Playwright): Log Third Http → recharge Detail"
+        f"{' (warm browser)' if _third_http_warm_enabled_for_bot() else ''}…",
+    )
+    path = None
+    try:
+        path = screenshot_np_recharge_detail(
+            uid,
+            date_iso,
+            time_short,
+            timeout_ms=120_000,
+            machine_substr=machine_substr,
+            expected_credit=expected_credit,
+            machine_display=machine_display,
+            headed=False,
+            time_short_candidates=time_short_candidates,
+        )
+        key = upload_image_lark(path)
+        if not key:
+            _np_send("❌ Failed to upload screenshot to Lark.")
+            return
+        if (success_caption or "").strip():
+            _np_send(success_caption.strip())
+        if root:
+            r = reply_message_in_thread(root, key, msg_type="image")
+        else:
+            r = send_image_message(chat_id, key)
+        if r.get("code") != 0:
+            _np_send(f"❌ Failed to send image: {r}")
+    except Exception as e:
+        err_s = str(e)
+        if "No Log Third Http rows" in err_s or "empty table after Search" in err_s:
+            tip = (
+                "\n💡 **No Third Http rows** for this UserId/time window — transfer likely **did not complete** "
+                f"(log error player `{uid}` @ `{time_short}`). "
+                "Widen `NP_BACKEND_WINDOW_MINUTES` if the log time is near the window edge."
+                "\n💡 Third Http **无记录** — 转出可能**未成功**（日志 error 玩家与时间见上）。"
+                " 可调大 `NP_BACKEND_WINDOW_MINUTES`。"
+            )
+        elif "did not load after Search" in err_s or "tbody stayed hidden" in err_s:
+            tip = (
+                "\n💡 Search results never became ready (empty/hidden table or slow UI). "
+                "Retry, or run locally: `python3 checkcredit.py --checkuser ... --pause`."
+                "\n💡 搜索结果未就绪（空表/隐藏 tbody 或页面慢），请重试或用 `--checkuser --pause` 本地查看。"
+            )
+        elif "No " in err_s and " Detail on pages" in err_s:
+            tip = (
+                "\n💡 Rows exist but **no matching recharge Detail** — bot already retries **machineId-only** "
+                "when log `amount` ≠ Detail `amount`. Try `NP_BACKEND_MAX_PAGES` / `NP_BACKEND_WINDOW_MINUTES`. "
+                "Disable machine-only pass: `NP_THIRD_HTTP_NO_MACHINE_ONLY_FALLBACK=1`."
+                "\n💡 有 recharge 行但 Detail 不匹配 — 已自动尝试仅匹配机台；可调页数/时间窗。"
+            )
+        elif "No usable temporary directory" in err_s or "writable temporary directory" in err_s:
+            tip = (
+                "\n💡 **Server has no writable `/tmp`** — screenshot never started (not an NP search miss). "
+                "On the bot host: `mkdir -p /root/machinebot/.tmp && chmod 700 /root/machinebot/.tmp`, "
+                "add `TMPDIR=/root/machinebot/.tmp` to `.env`, restart the bot, then retry stuck credit."
+                "\n💡 服务器 **没有可写临时目录**，截图步骤未执行（不是 Third Http 搜不到）。"
+                " 在主机创建 `.tmp` 并设置 `TMPDIR`，重启后再试。"
+            )
+        else:
+            tip = (
+                "\n💡 This screenshot runs **headless**. Try raising `NP_BACKEND_MAX_PAGES` / "
+                "`NP_BACKEND_WINDOW_MINUTES`, or widen `NP_BACKEND_AMOUNT_EPS` (default `0.05`) in `.env`. "
+                "For **TBP**, try `TBP_THIRD_HTTP_AMOUNT_SCALE` (e.g. `100` for cents) or "
+                "`TBP_THIRD_HTTP_NO_MACHINE_ONLY_FALLBACK=1` to disable the extra machine-only pass. "
+                "For a **visible** Chromium window, run locally: `python3 checkcredit.py --checkuser ... --pause`."
+            )
+        print(
+            "[npthirdhttp] screenshot context "
+            f"uid={uid!r} date={date_iso!r} time={time_short!r} "
+            f"machine_substr={machine_substr!r} credit={expected_credit!r} "
+            f"machine_display={machine_display!r}",
+            flush=True,
+        )
+        _np_send(f"❌ {backend_tag} third-http screenshot failed: {e}{tip}")
+        print(f"[npthirdhttp] error: {e!r}")
+    finally:
+        if path and os.path.isfile(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def run_np_third_http_by_choice(chat_id: str, choice_idx: int) -> None:
+    """choice_idx: 1–4 matching `np_choices` from last `/checkcreditdate` NP prompt."""
+    pend = _get_checkcredit_np_pending(chat_id)
+    choices = (pend or {}).get("np_choices") or []
+    if not pend or choice_idx < 1 or choice_idx > len(choices):
+        _checkcredit_send(
+            chat_id,
+            "❌ No active NP choice list — run `/checkcreditdate …` again, then reply **1**–**4**.",
+        )
+        return
+    ch = choices[choice_idx - 1]
+    uid = str(ch.get("user_id") or "").strip()
+    date_iso = (pend.get("target_date") or "").strip()
+    time_short = (ch.get("time_short") or "").strip()
+    if not uid or not date_iso or not time_short:
+        _checkcredit_send(chat_id, "❌ Pending NP choice is incomplete — use `/npthirdhttp …` with full date/time.")
+        return
+    ms = (pend.get("machine_match_substr") or "").strip() or None
+    exp = ch.get("credit_value")
+    if exp is not None:
+        try:
+            exp = float(exp)
+        except (TypeError, ValueError):
+            exp = None
+    if exp is None and ch.get("credit") not in (None, "", "n/a"):
+        try:
+            exp = float(str(ch.get("credit")).strip())
+        except ValueError:
+            exp = None
+    md = (pend.get("machine_display") or "").strip() or None
+    # If EGM small window currently shows the same member as selected player,
+    # short-circuit and prompt that the player has not left machine yet.
+    if md:
+        try:
+            import checkcredit
+
+            get_member = getattr(checkcredit, "get_egm_member_user_id", None)
+            if callable(get_member):
+                cur_member = str(
+                    get_member(
+                        machine_display=md,
+                        machine_substr=ms,
+                        timeout_ms=120_000,
+                        headed=False,
+                    )
+                    or ""
+                ).strip()
+                if cur_member and cur_member == uid:
+                    _checkcredit_send(chat_id, "Player haven't out the machine")
+                    return
+        except Exception as e:
+            print(f"[npthirdhttp] EGM member pre-check skipped: {e!r}", flush=True)
+    _np_run_screenshot_worker(
+        chat_id,
+        uid,
+        date_iso,
+        time_short,
+        machine_substr=ms,
+        expected_credit=exp,
+        machine_display=md,
+    )
+
+
+def run_np_third_http_job(chat_id: str, argv: list[str]):
+    """Background: NP Log Third Http Req → first `recharge` row → Detail dialog screenshot."""
+    try:
+        import checkcredit
+
+        _ = checkcredit.screenshot_np_recharge_detail
+    except ImportError as e:
+        _checkcredit_send(chat_id, f"❌ Cannot load checkcredit module: {e}")
+        return
+    except AttributeError:
+        _checkcredit_send(
+            chat_id,
+            "❌ checkcredit.screenshot_np_recharge_detail missing — deploy the latest `checkcredit.py`.",
+        )
+        return
+    if not argv:
+        _checkcredit_send(
+            chat_id,
+            "❌ Usage: `/npthirdhttp <player_id>` — or `/npthirdhttp <player_id> YYYY-MM-DD HH:MM:SS.mmm`",
+        )
+        return
+    uid = argv[0].strip()
+    date_iso: Optional[str] = None
+    time_short: Optional[str] = None
+    pend = None
+    if len(argv) == 2:
+        _checkcredit_send(
+            chat_id,
+            "❌ Use `/npthirdhttp <player_id>` after checkcredit, "
+            "or full `/npthirdhttp <player_id> YYYY-MM-DD HH:MM:SS.mmm` (three parts).",
+        )
+        return
+    if len(argv) >= 3:
+        date_iso = argv[1].strip()
+        time_short = argv[2].strip()
+        try:
+            datetime.strptime(date_iso, "%Y-%m-%d")
+        except ValueError:
+            _checkcredit_send(chat_id, "❌ Date must be `YYYY-MM-DD`.")
+            return
+        if not time_short:
+            _checkcredit_send(chat_id, "❌ Missing time (HH:MM:SS or HH:MM:SS.mmm).")
+            return
+    else:
+        pend = _get_checkcredit_np_pending(chat_id)
+        if not pend:
+            _checkcredit_send(
+                chat_id,
+                "❌ No pending `/checkcreditdate` context in this chat. "
+                "Run checkcredit first, or use `/npthirdhttp <player_id> YYYY-MM-DD HH:MM:SS.mmm`.",
+            )
+            return
+        date_iso = pend["target_date"]
+        time_short = ""
+        for ch in pend.get("np_choices") or []:
+            if str(ch.get("user_id")) == str(uid):
+                time_short = (ch.get("time_short") or "").strip()
+                break
+        if not time_short:
+            for p in pend.get("latest_two_players", []):
+                if str(p.get("user_id")) == str(uid):
+                    time_short = (p.get("time_short") or "").strip()
+                    break
+        if not time_short:
+            _checkcredit_send(
+                chat_id,
+                f"❌ User ID `{uid}` not in the last checkcredit NP list (choices 1–4). "
+                f"Use: `/npthirdhttp {uid} YYYY-MM-DD HH:MM:SS.mmm`",
+            )
+            return
+
+    assert date_iso is not None and time_short is not None
+    ms = None
+    exp = None
+    md: Optional[str] = None
+    if pend:
+        md = (pend.get("machine_display") or "").strip() or None
+        ms = (pend.get("machine_match_substr") or "").strip() or None
+        for ch in pend.get("np_choices") or []:
+            if str(ch.get("user_id")) == str(uid):
+                exp = ch.get("credit_value")
+                if exp is not None:
+                    try:
+                        exp = float(exp)
+                    except (TypeError, ValueError):
+                        exp = None
+                if exp is None and ch.get("credit") not in (None, "", "n/a"):
+                    try:
+                        exp = float(str(ch.get("credit")).strip())
+                    except ValueError:
+                        exp = None
+                break
+    _np_run_screenshot_worker(
+        chat_id,
+        uid,
+        date_iso,
+        time_short,
+        machine_substr=ms,
+        expected_credit=exp,
+        machine_display=md,
+    )
+
+
+def _parse_missing_credit_alert(text: str) -> Optional[dict]:
+    raw = (text or "").replace("\r\n", "\n")
+    if not re.search(r"(?i)(?:type\s*:\s*)?missing\s+credit", raw):
+        return None
+    out: dict[str, str] = {}
+    m = re.search(r"(?im)^\s*account\s*:\s*(\d+)", raw)
+    if m:
+        out["account"] = m.group(1)
+    m = re.search(r"(?im)^\s*amount\s+missing\s*:\s*([\d.]+)", raw)
+    if m:
+        out["amount"] = m.group(1)
+    m = re.search(
+        r"(?im)withdrawal\s+time\s*:\s*(\d{4})[/-](\d{2})[/-](\d{2})(?:\s+\d{2}:\d{2}:\d{2})?",
+        raw,
+    )
+    if m:
+        out["date_iso"] = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    m = re.search(r"(?im)proposal\s+withdrawal\s*:\s*(\S+)", raw)
+    if m:
+        out["proposal"] = m.group(1)
+    return out or None
+
+
+def _try_missing_credit_inquiry(
+    chat_id: str,
+    body: str,
+    *,
+    bot_mentioned: bool,
+    message_id: Optional[str],
+    send_func,
+) -> bool:
+    if not bot_mentioned:
+        return False
+    parsed = _parse_missing_credit_alert(body)
+    if not parsed:
+        return False
+    lines = [
+        "📋 **Missing Credit alert parsed**",
+        f"• Account: `{parsed.get('account', '?')}`",
+        f"• Amount missing: `{parsed.get('amount', '?')}`",
+        f"• Withdrawal date: `{parsed.get('date_iso', '?')}`",
+    ]
+    if parsed.get("proposal"):
+        lines.append(f"• Proposal: `{parsed['proposal']}`")
+    lines.append(
+        "\n⏳ I need the **machine type** (e.g. `NWR2074`) to scan logs. "
+        "Fill the form below — player/date are pre-filled when possible."
+    )
+    send_func(chat_id, "\n".join(lines))
+    try:
+        import checkcredit
+
+        card = checkcredit.build_checkcredit_player_form_card()
+        send_func(chat_id, json.dumps(card, ensure_ascii=False), msg_type="interactive")
+    except Exception as ex:
+        acct = parsed.get("account") or ""
+        dt = parsed.get("date_iso") or ""
+        send_func(
+            chat_id,
+            f"Use `/checkcreditdate <machine>` with player `{acct}` date `{dt}`.",
+        )
+        print(f"[missing-credit] card failed: {ex!r}", flush=True)
+    print(f"[missing-credit] parsed {parsed!r}", flush=True)
+    return True
+
+
+
 # ================= Self-deploy: git pull origin main + restart the systemd service =================
 MACHINEBOT_SERVICE = (os.getenv("MACHINEBOT_SERVICE") or "machine").strip() or "machine"
 _DEPLOY_ALLOWED_OPEN_IDS = {
@@ -1286,6 +2262,89 @@ def _run_card_callback_worker(data: dict, resolved: tuple) -> None:
                 send_message(chat_id_ca, f"❌ Reminder delete failed: {e}")
             return
 
+        # Reply "check another logs" — open the next same-day logic log.
+        if isinstance(parsed_ca, dict) and str(parsed_ca.get("k") or "").strip().lower() == "np_check_alt_logs":
+            threading.Thread(
+                target=run_checkcredit_navigator_next_log,
+                args=(chat_id_ca,),
+                daemon=True,
+            ).start()
+            return
+
+        # NP choice button (1–4) — Third Http Detail screenshot for the picked player.
+        if isinstance(parsed_ca, dict) and str(parsed_ca.get("k") or "").strip().lower() == "np_pick":
+            try:
+                idx_np = int(parsed_ca.get("i"))
+            except (TypeError, ValueError):
+                return
+            pend_np = _get_checkcredit_np_pending(chat_id_ca)
+            choices_np = (pend_np or {}).get("np_choices") or []
+            if pend_np and 1 <= idx_np <= len(choices_np):
+                threading.Thread(
+                    target=run_np_third_http_by_choice,
+                    args=(chat_id_ca, idx_np),
+                    daemon=True,
+                ).start()
+            return
+
+        # /checkcreditdate form submit — machine + player + date → Third Http Detail.
+        if (
+            isinstance(parsed_ca, dict)
+            and str(parsed_ca.get("k") or "").strip().lower() == "checkcredit_player_submit"
+        ):
+            act_ca = ev_ca.get("action") if isinstance(ev_ca.get("action"), dict) else {}
+            machine_raw = _lark_get_card_form_field(act_ca, "machine_type")
+            player_raw = _lark_get_card_form_field(act_ca, "player_id")
+            date_raw = _lark_get_card_form_field(act_ca, "log_date")
+            fv_cb = parsed_ca.get("form_value")
+            if isinstance(fv_cb, dict):
+                machine_raw = machine_raw or _lark_form_field_text(fv_cb.get("machine_type"))
+                player_raw = player_raw or _lark_form_field_text(fv_cb.get("player_id"))
+                date_raw = date_raw or _lark_form_field_text(fv_cb.get("log_date"))
+            machine_raw = machine_raw or _lark_form_field_text(parsed_ca.get("machine_type"))
+            player_raw = player_raw or _lark_form_field_text(parsed_ca.get("player_id"))
+            date_raw = date_raw or _lark_form_field_text(parsed_ca.get("log_date"))
+            machine_raw = machine_raw or _lark_find_field_deep(ev_ca, "machine_type")
+            player_raw = player_raw or _lark_find_field_deep(ev_ca, "player_id")
+            date_raw = date_raw or _lark_find_field_deep(ev_ca, "log_date")
+
+            def _normalize_checkcredit_date_iso(raw: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+                s = str(raw or "").strip()
+                if not s:
+                    return None, "Date is empty."
+                if re.match(r"^\d{10,13}$", s):
+                    try:
+                        ts = int(s)
+                        if ts > 10**12:
+                            ts = ts // 1000
+                        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d"), None
+                    except Exception:
+                        return None, "Invalid date timestamp."
+                m = re.match(r"^\s*(\d{4})-(\d{2})-(\d{2})", s)
+                if m:
+                    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}", None
+                m2 = re.match(r"^\s*(\d{4})/(\d{2})/(\d{2})", s)
+                if m2:
+                    return f"{m2.group(1)}-{m2.group(2)}-{m2.group(3)}", None
+                return None, "Date must be YYYY-MM-DD (or use the date picker)."
+
+            date_iso_cb, derr = _normalize_checkcredit_date_iso(date_raw)
+            if derr:
+                send_message(chat_id_ca, f"❌ {derr}")
+                return
+            machine_cb = str(machine_raw or "").strip()
+            player_cb = str(player_raw or "").strip()
+            if not machine_cb or not player_cb:
+                send_message(chat_id_ca, "❌ Please fill Machine type and Player ID.")
+                return
+            assert date_iso_cb is not None
+            threading.Thread(
+                target=run_checkcredit_player_job,
+                args=(chat_id_ca, machine_cb, player_cb, date_iso_cb),
+                daemon=True,
+            ).start()
+            return
+
         # Prod-batch confirm / cancel / job-cancel / sm wizard buttons (smmachine owns the keys).
         import smmachine as _sm_cb
 
@@ -1356,6 +2415,14 @@ _HELP_TEXT = (
     "• `/encoder <machine(s)>` — MAIN/POOL/CCTV IPs from OSM-Watch (`/encoder refresh` to rescrape)\n"
     "• `/osmwatch [url]` — OSM-Watch dashboard screenshot\n"
     "• `/loginosmwatch` — force a fresh OSM-Watch login QR (lab group)\n"
+    "• `/checkcredit <machine> [YYYY-MM-DD]` — log → players → NP choice card\n"
+    "• `/checkcreditdate` — interactive card (machine + player + date)\n"
+    "• `/machineerror <machine> [date]` — latest two players, error context\n"
+    "• `/checkmachinelog <machine> [date]` — logic log card + AI summary\n"
+    "• `/stuckcredit <machine> [date]` — stuck credit + Third Http transfer-out check\n"
+    "• `/npthirdhttp <player_id> [YYYY-MM-DD HH:MM:SS.mmm]` — Third Http Detail\n"
+    "• `/cctv <machine>` — EGM CCTV screenshot · `/al [DD/MM]` — Amount Loss\n"
+    "• reply **1**–**4** after an NP prompt · paste a **Missing Credit** alert to auto-fill\n"
     "• `/deploy` — git pull origin main + restart the systemd service"
 )
 
@@ -1386,14 +2453,16 @@ def _handle_machine_message(
     message_id,
     chat_type,
     bot_mentioned,
+    is_np_reply,
     original_text,
     clean_text,
     clean_text_multiline,
     mention_keys,
     incoming_message_obj,
+    message_content_raw,
 ) -> None:
     set_lark_incoming_message(message_id)
-    if message_id and (chat_type == "p2p" or bot_mentioned):
+    if message_id and (chat_type == "p2p" or bot_mentioned or is_np_reply):
         add_gotit_reaction(message_id)
 
     # Cheap imports (stdlib + dotenv at import time; Playwright loads lazily inside).
@@ -1421,6 +2490,13 @@ def _handle_machine_message(
             send_func(chat_id, reply)
         elif not handled and (chat_type == "p2p" or bot_mentioned):
             send_func(chat_id, _HELP_TEXT)
+
+    # ---- Reply 1–4 after an NP prompt (group works without @mention while a list is pending) ----
+    if is_np_reply:
+        idx_np = int(ct)
+        start_lark_background_thread(run_np_third_http_by_choice, chat_id, idx_np)
+        return
+
 
     # ---- OSM-Watch: force a fresh login QR (posted to the lab group) ----
     if cmd == "/loginosmwatch":
@@ -1528,6 +2604,172 @@ def _handle_machine_message(
 
         start_lark_background_thread(_run_stresstest)
         return
+
+    # /al or /al DD/MM: Amount Loss (CHECKLOG) → interactive card + TSV.
+    if re.match(r"^/al(?:\s+\d{1,2}/\d{1,2})?\s*$", low):
+        parts = ct.split()
+        date_param = parts[1].strip() if len(parts) > 1 else None
+        send_message(chat_id, "⏳ Checking Amount Loss (CHECKLOG), please wait...")
+        start_lark_background_thread(run_amountloss_check, chat_id, date_param)
+        return
+
+    # /cctv <machine> — EGM CCTV screenshot (no credit check).
+    if re.match(r"^/cctv\b", ct, re.I):
+        m_cv = re.match(r"^/cctv\s+(\S+)", ct, re.I)
+        if not m_cv:
+            send_message(
+                chat_id,
+                "❌ Usage: `/cctv <machine>` — EGM **CCTV** only (no credit check).\n"
+                "Example: `/cctv OSMCP181` · `/cctv Dragons-0181`",
+            )
+            return
+        start_lark_background_thread(run_cctv_screenshot_job, chat_id, m_cv.group(1))
+        return
+
+    # /npthirdhttp <player_id> [date time]
+    if low.startswith("/npthirdhttp"):
+        parts = ct.split()
+        start_lark_background_thread(run_np_third_http_job, chat_id, parts[1:])
+        return
+
+    # Bare /checkcreditdate — interactive card (machine + player + date).
+    if re.match(r"^/checkcreditdate\s*$", ct, re.I):
+        try:
+            import checkcredit
+
+            card_cp = checkcredit.build_checkcredit_player_form_card()
+            send_message(chat_id, json.dumps(card_cp), msg_type="interactive")
+        except Exception as e:
+            send_message(chat_id, f"❌ checkcredit date card failed: {e}")
+        return
+
+    # /checkmachinelog <machine> [YYYY-MM-DD]
+    if re.search(r"/checkmachinelog\b", ct, re.I):
+        m_cml = re.search(r"/checkmachinelog\b\s+(\S+)(?:\s+(\d{4}-\d{2}-\d{2}))?", ct, re.I)
+        if not m_cml:
+            send_message(
+                chat_id,
+                "❌ Usage:\n"
+                "• `/checkmachinelog <machine> [YYYY-MM-DD]` — last player, transfer-out credit, error ±10 lines (or success log)\n"
+                "Examples: `/checkmachinelog DHS3077` · `/checkmachinelog DHS3077 2026-06-26`",
+            )
+            return
+        machine_q = m_cml.group(1).strip()
+        date_arg = (m_cml.group(2) or "").strip() or datetime.now().strftime("%Y-%m-%d")
+        try:
+            datetime.strptime(date_arg, "%Y-%m-%d")
+        except ValueError:
+            send_message(chat_id, "❌ Date must be `YYYY-MM-DD`.")
+            return
+        try:
+            import checkcredit
+
+            use_oss = checkcredit.checkcredit_use_oss_source()
+        except Exception:
+            use_oss = True
+        thread_root = _checkcredit_begin_thread(chat_id, message_id)
+        wait_msg = (
+            "⏳ Running checkmachinelog via OSS HTTP, please wait..."
+            if use_oss
+            else "⏳ Running checkmachinelog (LogNavigator), please wait..."
+        )
+        _checkcredit_send(chat_id, wait_msg, thread_root=thread_root)
+        start_lark_background_thread(run_check_machine_log_job, chat_id, machine_q, date_arg, thread_root)
+        return
+
+    # /stuckcredit <machine> [YYYY-MM-DD]
+    if re.search(r"/stuckcredit\b", ct, re.I):
+        m_sc = re.search(r"/stuckcredit\b\s+(\S+)(?:\s+(\d{4}-\d{2}-\d{2}))?", ct, re.I)
+        if not m_sc:
+            send_message(
+                chat_id,
+                "❌ Usage:\n"
+                "• `/stuckcredit <machine> [YYYY-MM-DD]` — stuck credit: log + Third Http transfer-out check\n"
+                "Examples: `/stuckcredit NWR2938` · `/stuckcredit NWR2938 2026-06-26`",
+            )
+            return
+        machine_q = m_sc.group(1).strip()
+        date_arg = (m_sc.group(2) or "").strip() or datetime.now().strftime("%Y-%m-%d")
+        try:
+            datetime.strptime(date_arg, "%Y-%m-%d")
+        except ValueError:
+            send_message(chat_id, "❌ Date must be `YYYY-MM-DD`.")
+            return
+        try:
+            import checkcredit
+
+            use_oss = checkcredit.checkcredit_use_oss_source()
+        except Exception:
+            use_oss = True
+        thread_root = _checkcredit_begin_thread(chat_id, message_id)
+        wait_msg = (
+            "⏳ Stuck credit — reading machine log via OSS HTTP, then Third Http…"
+            if use_oss
+            else "⏳ Stuck credit — reading machine log (LogNavigator), then Third Http…"
+        )
+        _checkcredit_send(chat_id, wait_msg, thread_root=thread_root)
+        start_lark_background_thread(
+            run_check_machine_log_job, chat_id, machine_q, date_arg, thread_root, stuck_credit=True
+        )
+        return
+
+    # /checkcredit | /checkcreditdate <machine> | /machineerror
+    if re.search(r"/(?:checkcreditdate|checkcredit|machineerror)\b", ct, re.I):
+        # Longer token first in alternation so `/checkcreditdate` is not parsed as `/checkcredit` + `date`.
+        m_cc = re.search(
+            r"/(checkcreditdate|checkcredit|machineerror)\b\s+(\S+)(?:\s+(\d{4}-\d{2}-\d{2}))?",
+            ct,
+            re.I,
+        )
+        if not m_cc:
+            send_message(
+                chat_id,
+                "❌ Usage:\n"
+                "• `/checkcreditdate` — **interactive card**: machine + player + date → Third Http Detail\n"
+                "• `/checkcredit <machine>` — **today** (same as `--date` omitted in CLI)\n"
+                "• `/checkcreditdate <machine> [YYYY-MM-DD]` — optional date; omit for today\n"
+                "• `/machineerror <machine> [YYYY-MM-DD]` — latest two players with error only\n"
+                "Examples: `/checkcredit 1171` · `/checkcreditdate 2074 2026-04-27`",
+            )
+            return
+        cmd_cc = (m_cc.group(1) or "").strip().lower()
+        machine_q = m_cc.group(2).strip()
+        date_arg = (m_cc.group(3) or "").strip()
+        if not date_arg:
+            date_arg = datetime.now().strftime("%Y-%m-%d")
+        try:
+            datetime.strptime(date_arg, "%Y-%m-%d")
+        except ValueError:
+            send_message(chat_id, "❌ Date must be `YYYY-MM-DD` (e.g. `2026-04-27`).")
+            return
+        try:
+            import checkcredit
+
+            use_oss_wait = checkcredit.checkcredit_use_oss_source()
+        except Exception:
+            use_oss_wait = True
+        thread_root = _checkcredit_begin_thread(chat_id, message_id)
+        wait_msg = (
+            "⏳ Running machineerror via OSS HTTP, please wait..."
+            if cmd_cc == "machineerror" and use_oss_wait
+            else "⏳ Running machineerror, browser may take a while — please wait..."
+            if cmd_cc == "machineerror"
+            else "⏳ Running checkcredit via OSS HTTP , please wait..."
+            if use_oss_wait
+            else "⏳ Running LogNavigator checkcredit, browser may take a while — please wait..."
+        )
+        _checkcredit_send(chat_id, wait_msg, thread_root=thread_root)
+        start_lark_background_thread(
+            run_checkcredit_finderror,
+            chat_id,
+            machine_q,
+            date_arg,
+            "error_only" if cmd_cc == "machineerror" else "default",
+            None,
+            thread_root,
+        )
+        return
+
 
     # ---- Scheduled maintenance announcement (action + future date/time + machine list) ----
     if maintenancemachineagent.is_maintenance_schedule_message(original_text, mention_keys):
@@ -1710,6 +2952,14 @@ def _handle_machine_message(
         _handle_deploy_command(chat_id)
         return
 
+    # Missing Credit alert → parse + checkcredit form card (requires @mention).
+    _full_body = _lark_full_message_body(original_text, clean_text_multiline, message_content_raw)
+    if _try_missing_credit_inquiry(
+        chat_id, _full_body, bot_mentioned=bot_mentioned, message_id=message_id, send_func=send_message
+    ):
+        return
+
+
     # ---- Nothing matched — help only when directly addressed ----
     if chat_type == "p2p" or bot_mentioned:
         send_message(chat_id, _HELP_TEXT)
@@ -1842,7 +3092,16 @@ def lark_webhook():
                     bot_mentioned = True
                     break
 
-        if chat_type != "p2p" and not bot_mentioned:
+        stripped_choice = clean_text.strip()
+        pend_np = _get_checkcredit_np_pending(chat_id)
+        _np_choices = (pend_np or {}).get("np_choices") or []
+        # Only an IN-RANGE digit is an NP pick — an out-of-range "3"/"4" in a group without
+        # @mention is silently acked (not answered with an error), matching osedutybot.
+        is_np_reply = stripped_choice in ("1", "2", "3", "4") and 1 <= int(stripped_choice) <= len(
+            _np_choices
+        )
+
+        if chat_type != "p2p" and not bot_mentioned and not is_np_reply:
             return _lark_im_ack()
 
         _handle_machine_message(
@@ -1851,11 +3110,13 @@ def lark_webhook():
             message_id,
             chat_type,
             bot_mentioned,
+            is_np_reply,
             original_text,
             clean_text,
             clean_text_multiline,
             mention_keys,
             message,
+            message_content_raw,
         )
         return _lark_im_done()
 
