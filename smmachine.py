@@ -3866,7 +3866,33 @@ def _run_prod_batch_bot_job_thread(
             job_id=job_id,
         )
 
-    def on_phase_retry(step_verify: str, attempt: int, failed: list) -> None:
+    def on_env_start(env: str, count: int) -> None:
+        send_message(
+            chat_id,
+            f"⏳ **{env}** — {ACTION_LABELS.get(action, action)} started on **{count}** machine(s)...",
+        )
+
+    def on_phase_continue(
+        prev_step: str, next_step: str, dropped: list, continuing: list
+    ) -> None:
+        from prod_machine_batch import PHASE_LABELS
+
+        prev_label = PHASE_LABELS.get(prev_step, prev_step)
+        next_label = PHASE_LABELS.get(next_step, next_step)
+        lines = [
+            f"▶️ **{next_label}** — continuing with **{len(continuing)}** machine(s) that passed {prev_label}.",
+            "",
+            f"⏭️ **Skipped ({len(dropped)})** — {prev_label} failed after all retries:",
+        ]
+        for m in dropped[:20]:
+            lines.append(f"• {m.get('belongs', '')} — {m.get('machine') or m.get('name') or ''}")
+        if len(dropped) > 20:
+            lines.append(f"... and {len(dropped) - 20} more")
+        send_message(chat_id, "\n".join(lines))
+
+    def on_phase_retry(
+        step_verify: str, attempt: int, failed: list, done: list | None = None
+    ) -> None:
         from prod_machine_batch import (
             PHASE_LABELS,
             _failure_is_game_running,
@@ -3874,32 +3900,61 @@ def _run_prod_batch_bot_job_thread(
         )
 
         max_r = _max_phase_retries()
+        done = done or []
+        is_final = attempt >= max_r
         game_running = bool(failed) and all(
             _failure_is_game_running(str(m.get("error") or ""), m.get("live"))
             for m in failed
         )
 
+        done_lines: list[str] = []
+        if done:
+            done_lines.append(f"✅ **Done ({len(done)}):**")
+            for m in done[:20]:
+                done_lines.append(
+                    f"• {m.get('belongs', '')} — {m.get('machine') or m.get('name') or ''}"
+                )
+            if len(done) > 20:
+                done_lines.append(f"... and {len(done) - 20} more")
+            done_lines.append("")
+
+        fail_head = (
+            f"🔄 **Still retrying ({len(failed)}):**"
+            if not is_final
+            else f"❌ **Still failed ({len(failed)}):**"
+        )
+
         if step_verify == "set_maint" and game_running:
-            names = [
-                f"• {m.get('belongs', '')} — {m.get('machine') or m.get('name') or ''}"
-                for m in failed[:20]
-            ]
-            extra = f"\n... and {len(failed) - 20} more" if len(failed) > 20 else ""
-            send_message(
-                chat_id,
+            head = (
                 "⚠️ **Game currently running** error occurred — will retry **set maintenance** again.\n"
                 f"Attempt **{attempt}** / **{max_r}**.\n\n"
-                + "\n".join(names)
-                + extra,
+                if not is_final
+                else "⚠️ **Game currently running** — attempt "
+                f"**{attempt}** / **{max_r}** was the last, **no more retries** for these machine(s).\n\n"
             )
+            body_lines = list(done_lines)
+            body_lines.append(fail_head)
+            for m in failed[:20]:
+                body_lines.append(
+                    f"• {m.get('belongs', '')} — {m.get('machine') or m.get('name') or ''}"
+                )
+            if len(failed) > 20:
+                body_lines.append(f"... and {len(failed) - 20} more")
+            send_message(chat_id, head + "\n".join(body_lines))
             return
 
         label = PHASE_LABELS.get(step_verify, step_verify)
         lines = [
-            f"**{label} — failed ({len(failed)} machine(s))**",
-            f"Will retry automatically (attempt {attempt}/{max_r}) unless you tap **Cancel** below.",
+            f"**{label} — {len(failed)} machine(s) still failing**",
+            (
+                f"Will retry automatically (attempt {attempt}/{max_r}) unless you tap **Cancel** below."
+                if not is_final
+                else f"Attempt {attempt}/{max_r} was the last — **no more retries** for these machine(s)."
+            ),
             "",
         ]
+        lines.extend(done_lines)
+        lines.append(fail_head)
         for m in failed[:30]:
             nm = m.get("machine") or m.get("name") or ""
             err = (m.get("error") or "").strip()
@@ -3909,7 +3964,7 @@ def _run_prod_batch_bot_job_thread(
             lines.append(f"... and {len(failed) - 30} more")
         _prod_batch_send_lark_md(
             chat_id,
-            f"{label} — retry {attempt}",
+            f"{label} — retry {attempt}" if not is_final else f"{label} — final attempt failed",
             "\n".join(lines),
             send_message,
             header_template="red",
@@ -3926,6 +3981,8 @@ def _run_prod_batch_bot_job_thread(
             manual_stop_check=manual_stop_check,
             on_manual_stop=on_manual,
             on_phase_retry=on_phase_retry,
+            on_phase_continue=on_phase_continue,
+            on_env_start=on_env_start,
         )
         with _PROD_BATCH_JOBS_LOCK:
             cancelled = bool(_PROD_BATCH_JOBS.get(job_id, {}).get("cancel_requested"))
@@ -3955,6 +4012,14 @@ def _run_prod_batch_bot_job_thread(
                 f"All **{max_r}** attempts were **game currently running**.",
                 "",
             ]
+            if ok_n:
+                lines.append(f"✅ **Done ({ok_n}):**")
+                for m in (summary.get("success") or [])[:30]:
+                    lines.append(f"✓ {m.get('belongs')} — {m.get('machine')}")
+                if ok_n > 30:
+                    lines.append(f"... and {ok_n - 30} more done")
+                lines.append("")
+                lines.append(f"❌ **Still failed ({fail_n}):**")
             for m in failed[:30]:
                 lines.append(f"• {m.get('belongs')} — {m.get('machine')}")
             if fail_n > 30:

@@ -1847,14 +1847,16 @@ def _run_step_with_retries(
     *,
     timeout_ms: int,
     max_pages: int,
-    on_phase_retry: Optional[Callable[[str, int, list[dict]], None]] = None,
-) -> tuple[bool, list[dict]]:
+    on_phase_retry: Optional[Callable[[str, int, list[dict], list[dict]], None]] = None,
+) -> tuple[bool, list[dict], list[dict]]:
     """
     Run one batch step, recheck live EGM, retry only failures until all pass or max attempts.
-    Returns (passed, remaining_failures).
+    Returns (passed, remaining_failures, done_ok) — done_ok so exhausted-retry runs still report
+    the machines that DID verify (otherwise they'd vanish from the final summary).
     """
     pending = list(targets)
     max_r = _max_phase_retries()
+    done_so_far: list[dict] = []
 
     ok_login, login_err = _ensure_env_egm_page(
         page, belongs, timeout_ms=timeout_ms, max_pages=max_pages
@@ -1867,11 +1869,11 @@ def _run_step_with_retries(
                 "error": login_err or "login failed",
             }
             for m in pending
-        ]
+        ], []
 
     for attempt in range(1, max_r + 1):
         if cancel_check() or manual_stop_check():
-            return False, pending
+            return False, pending, done_so_far
 
         ok_part: list[dict] = []
         fail_part: list[dict] = []
@@ -1890,13 +1892,17 @@ def _run_step_with_retries(
             ok_list=ok_part,
             fail_list=fail_part,
         )
+        done_so_far.extend(ok_part)
         if not fail_part:
-            return True, []
+            return True, [], done_so_far
         if on_phase_retry:
-            on_phase_retry(step_verify, attempt, fail_part)
+            try:
+                on_phase_retry(step_verify, attempt, fail_part, list(done_so_far))
+            except Exception:
+                logger.exception("on_phase_retry callback failed for %s", belongs)
         pending = fail_part
 
-    return False, pending
+    return False, pending, done_so_far
 
 
 def _run_single_action_env(
@@ -1910,7 +1916,7 @@ def _run_single_action_env(
     *,
     timeout_ms: int,
     max_pages: int,
-    on_phase_retry: Optional[Callable[[str, int, list[dict]], None]] = None,
+    on_phase_retry: Optional[Callable[[str, int, list[dict], list[dict]], None]] = None,
 ) -> tuple[list[dict], list[dict]]:
     """set_maint / set_test / unset_* — retry until live EGM confirms, then return ok/fail lists."""
     buttons = ACTION_BUTTONS.get(action, [])
@@ -1918,7 +1924,7 @@ def _run_single_action_env(
         return [], list(machines)
 
     targets = list(machines)
-    passed, still_fail = _run_step_with_retries(
+    passed, still_fail, done_ok = _run_step_with_retries(
         page,
         belongs,
         targets,
@@ -1933,7 +1939,7 @@ def _run_single_action_env(
         on_phase_retry=on_phase_retry,
     )
     if not passed:
-        return [], still_fail
+        return done_ok, still_fail
 
     return [
         {"belongs": m.get("belongs", belongs), "machine": _machine_display_name(m)}
@@ -1953,11 +1959,15 @@ def _run_phased_env(
     *,
     timeout_ms: int,
     max_pages: int,
-    on_phase_retry: Optional[Callable[[str, int, list[dict]], None]] = None,
+    on_phase_retry: Optional[Callable[[str, int, list[dict], list[dict]], None]] = None,
+    on_phase_continue: Optional[Callable[[str, str, list[dict], list[dict]], None]] = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     For ``set_both`` / ``unset_both``: phase 1 (e.g. maintenance) → live recheck → retry failures
     until all pass; then phase 2 (test) the same way; then final combined verify on EGM page.
+
+    A machine that exhausts retries in one phase is dropped (reported failed) but the remaining
+    phase(s) still run for the machines that DID pass — one stuck machine no longer aborts the env.
     """
     steps = PHASED_STEPS.get(parent_action, [])
     if not steps:
@@ -1967,11 +1977,11 @@ def _run_phased_env(
     all_ok: list[dict] = []
     all_fail: list[dict] = []
 
-    for step_verify, step_buttons in steps:
+    for step_idx, (step_verify, step_buttons) in enumerate(steps):
         if cancel_check() or manual_stop_check():
             return all_ok, all_fail
 
-        phase_passed, pending = _run_step_with_retries(
+        phase_passed, pending, phase_done = _run_step_with_retries(
             page,
             belongs,
             targets,
@@ -1987,7 +1997,20 @@ def _run_phased_env(
         )
         if not phase_passed:
             all_fail.extend(pending)
-            return all_ok, all_fail
+            if cancel_check() or manual_stop_check():
+                return all_ok, all_fail
+            # Retries exhausted for `pending` — continue the remaining step(s) with the
+            # machines that did pass this phase instead of aborting the whole env.
+            done_names = {str(x.get("machine") or "") for x in phase_done}
+            targets = [m for m in targets if _machine_display_name(m) in done_names]
+            if not targets:
+                return all_ok, all_fail
+            if on_phase_continue and step_idx < len(steps) - 1:
+                next_verify = steps[step_idx + 1][0]
+                try:
+                    on_phase_continue(step_verify, next_verify, list(pending), list(targets))
+                except Exception:
+                    logger.exception("on_phase_continue callback failed for %s", belongs)
 
     _refresh_egm_table(page, timeout_ms=timeout_ms, max_pages=max_pages)
     try:
@@ -1995,7 +2018,9 @@ def _run_phased_env(
             page, targets, timeout_ms=timeout_ms, max_pages=max_pages
         )
     except Exception as exc:
-        return all_ok, [
+        # Keep machines already failed in earlier phases — only the survivors get the
+        # final-verify error.
+        return all_ok, all_fail + [
             {
                 "belongs": m.get("belongs", belongs),
                 "machine": _machine_display_name(m),
@@ -2054,7 +2079,8 @@ def _dispatch_env_processing(
     *,
     timeout_ms: int,
     max_pages: int | None,
-    on_phase_retry: Optional[Callable[[str, int, list[dict]], None]] = None,
+    on_phase_retry: Optional[Callable[[str, int, list[dict], list[dict]], None]] = None,
+    on_phase_continue: Optional[Callable[[str, str, list[dict], list[dict]], None]] = None,
 ) -> tuple[list[dict], list[dict]]:
     """Run one environment's machines on ``page`` using the right strategy for ``action``."""
     if action in PHASED_STEPS:
@@ -2062,6 +2088,7 @@ def _dispatch_env_processing(
             page, belongs, env_machines, action, remark,
             cancel_check, manual_stop_check,
             timeout_ms=timeout_ms, max_pages=max_pages, on_phase_retry=on_phase_retry,
+            on_phase_continue=on_phase_continue,
         )
     if action in AUTO_RETRY_ACTIONS:
         return _run_single_action_env(
@@ -2167,7 +2194,8 @@ class _ProdEnvWarm:
         *,
         timeout_ms: int,
         max_pages: int | None,
-        on_phase_retry: Optional[Callable[[str, int, list[dict]], None]] = None,
+        on_phase_retry: Optional[Callable[[str, int, list[dict], list[dict]], None]] = None,
+        on_phase_continue: Optional[Callable[[str, str, list[dict], list[dict]], None]] = None,
         want_shots: bool,
     ) -> dict:
         done = threading.Event()
@@ -2182,6 +2210,7 @@ class _ProdEnvWarm:
             "timeout_ms": timeout_ms,
             "max_pages": max_pages,
             "on_phase_retry": on_phase_retry,
+            "on_phase_continue": on_phase_continue,
             "want_shots": want_shots,
             "done": done,
             "box": box,
@@ -2247,6 +2276,7 @@ class _ProdEnvWarm:
                 timeout_ms=timeout_ms,
                 max_pages=max_pages,
                 on_phase_retry=task["on_phase_retry"],
+                on_phase_continue=task.get("on_phase_continue"),
             )
             box["ok"] = ok
             box["fail"] = fail
@@ -2377,7 +2407,9 @@ class _ProdEnvWarmPool:
         *,
         timeout_ms: int,
         max_pages: int | None,
-        on_phase_retry: Optional[Callable[[str, int, list[dict]], None]] = None,
+        on_phase_retry: Optional[Callable[[str, int, list[dict], list[dict]], None]] = None,
+        on_phase_continue: Optional[Callable[[str, str, list[dict], list[dict]], None]] = None,
+        on_env_start: Optional[Callable[[str, int], None]] = None,
         want_shots: bool,
     ) -> list[dict]:
         """Run each environment's machines on its warm browser, in parallel; collect result boxes."""
@@ -2386,6 +2418,11 @@ class _ProdEnvWarmPool:
 
         def _run(env: str, env_machines: list[dict]) -> None:
             worker = self._get(env)
+            if on_env_start:
+                try:
+                    on_env_start(env, len(env_machines))
+                except Exception:
+                    logger.exception("on_env_start callback failed for %s", env)
             boxes[env] = worker.run_env(
                 action,
                 env_machines,
@@ -2395,6 +2432,7 @@ class _ProdEnvWarmPool:
                 timeout_ms=timeout_ms,
                 max_pages=max_pages,
                 on_phase_retry=on_phase_retry,
+                on_phase_continue=on_phase_continue,
                 want_shots=want_shots,
             )
 
@@ -2456,7 +2494,9 @@ def run_prod_batch_job(
     cancel_check: Optional[Callable[[], bool]] = None,
     manual_stop_check: Optional[Callable[[], bool]] = None,
     on_manual_stop: Optional[Callable[[dict], None]] = None,
-    on_phase_retry: Optional[Callable[[str, int, list[dict]], None]] = None,
+    on_phase_retry: Optional[Callable[[str, int, list[dict], list[dict]], None]] = None,
+    on_phase_continue: Optional[Callable[[str, str, list[dict], list[dict]], None]] = None,
+    on_env_start: Optional[Callable[[str, int], None]] = None,
     capture_screenshots: bool | None = None,
 ) -> dict[str, Any]:
     """
@@ -2501,7 +2541,9 @@ def run_prod_batch_job(
             boxes = pool.run_for_envs(
                 by_env, action, remark, cancel_check, manual_stop_check,
                 timeout_ms=timeout_ms, max_pages=max_pages,
-                on_phase_retry=on_phase_retry, want_shots=want_shots,
+                on_phase_retry=on_phase_retry, on_phase_continue=on_phase_continue,
+                on_env_start=on_env_start,
+                want_shots=want_shots,
             )
             for box in boxes:
                 all_ok.extend(box.get("ok") or [])
@@ -2530,6 +2572,11 @@ def run_prod_batch_job(
             for belongs, env_machines in by_env.items():
                 if cancel_check():
                     break
+                if on_env_start:
+                    try:
+                        on_env_start(belongs, len(env_machines))
+                    except Exception:
+                        logger.exception("on_env_start callback failed for %s", belongs)
                 ok, fail = _dispatch_env_processing(
                     page,
                     belongs,
@@ -2541,6 +2588,7 @@ def run_prod_batch_job(
                     timeout_ms=timeout_ms,
                     max_pages=max_pages,
                     on_phase_retry=on_phase_retry,
+                    on_phase_continue=on_phase_continue,
                 )
                 all_ok.extend(ok)
                 all_fail.extend(fail)
