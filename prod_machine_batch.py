@@ -18,8 +18,10 @@ from typing import Any, Callable, Optional
 from urllib.parse import quote
 
 from smmachine import (
+    _blocking_modal_present,
     _can_pagination_next,
     _click_pagination_next,
+    _dismiss_intercepting_modal,
     _ensure_row_checkbox_checked,
     _ensure_row_checkbox_unchecked,
     _find_row_for_target,
@@ -857,23 +859,25 @@ def _submit_row_maintenance_action(
             btn.click(force=True, timeout=min(30_000, timeout_ms))
         except Exception as ex2:
             return False, f"row Maintenance click failed: {ex2!r}"
-    _page_pause(page, 500)
-    if _visible_confirm_layer(page) is not None:
+    # Poll for the confirmation layer (el-dialog form OR el-message-box $confirm). Polling a few
+    # seconds ensures a slow-rendering confirm is applied HERE — otherwise it could linger and later
+    # be cancelled by the pagination guard (silently dropping the action).
+    layer = None
+    deadline = time.monotonic() + min(5.0, max(2.0, timeout_ms / 1000.0))
+    while time.monotonic() < deadline:
+        layer = _visible_confirm_layer(page)
+        if layer is not None:
+            break
+        _page_pause(page, 250)
+
+    if layer is not None:
         try:
             _click_save_confirm(page, remark, timeout_ms=timeout_ms)
             _wait_batch_done(page, timeout_ms=timeout_ms)
         except Exception as e:
             return False, f"confirm/save failed: {e}"
     else:
-        _page_pause(page, 800)
-        if _visible_confirm_layer(page) is not None:
-            try:
-                _click_save_confirm(page, remark, timeout_ms=timeout_ms)
-                _wait_batch_done(page, timeout_ms=timeout_ms)
-            except Exception as e:
-                return False, f"confirm/save failed: {e}"
-        else:
-            _wait_batch_done(page, timeout_ms=timeout_ms)
+        _wait_batch_done(page, timeout_ms=timeout_ms)
     return True, ""
 
 
@@ -1135,23 +1139,25 @@ def _submit_batch_action(page, label: str, remark: str, *, timeout_ms: int) -> t
     if not clicked:
         return False, why
 
-    _page_pause(page, 500)
-    if _visible_confirm_layer(page) is not None:
+    # Poll for the confirmation layer (el-dialog form OR el-message-box $confirm). Polling a few
+    # seconds ensures a slow-rendering confirm is applied HERE — otherwise it could linger and later
+    # be cancelled by the pagination guard (silently dropping the action).
+    layer = None
+    deadline = time.monotonic() + min(5.0, max(2.0, timeout_ms / 1000.0))
+    while time.monotonic() < deadline:
+        layer = _visible_confirm_layer(page)
+        if layer is not None:
+            break
+        _page_pause(page, 250)
+
+    if layer is not None:
         try:
             _click_save_confirm(page, remark, timeout_ms=timeout_ms)
             _wait_batch_done(page, timeout_ms=timeout_ms)
         except Exception as e:
             return False, f"confirm/save failed: {e}"
     else:
-        _page_pause(page, 800)
-        if _visible_confirm_layer(page) is not None:
-            try:
-                _click_save_confirm(page, remark, timeout_ms=timeout_ms)
-                _wait_batch_done(page, timeout_ms=timeout_ms)
-            except Exception as e:
-                return False, f"confirm/save failed: {e}"
-        else:
-            _wait_batch_done(page, timeout_ms=timeout_ms)
+        _wait_batch_done(page, timeout_ms=timeout_ms)
     return True, ""
 
 
@@ -1500,27 +1506,78 @@ def _truthy_env(name: str) -> bool:
     return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _click_save_confirm(page, remark: str, *, timeout_ms: int) -> None:
-    _page_pause(page, 500)
-    dlg = page.locator(".el-dialog__wrapper").filter(has=page.locator(".el-dialog")).last
-    if dlg.count() == 0:
-        dlg = page.locator(".el-dialog").last
-    dlg.wait_for(state="visible", timeout=min(30_000, timeout_ms))
-    inner = dlg.locator(".el-dialog").first if dlg.locator(".el-dialog").count() else dlg
-    if remark:
-        for sel in ("textarea", "input[type='text']"):
-            ta = inner.locator(sel).first
-            if ta.count() and ta.is_visible():
-                ta.fill(remark)
-                break
-    for name_pat in (r"^save$", r"confirm", r"^ok$"):
+def _confirm_layer_is_message_box(layer) -> bool:
+    try:
+        return layer.locator(".el-message-box").count() > 0
+    except Exception:
+        return False
+
+
+def _click_confirm_primary(inner, *, timeout_ms: int) -> None:
+    """Click the apply/confirm button of a dialog or message-box (Save / Confirm / OK / primary)."""
+    for name_pat in (r"^save$", r"confirm", r"^ok$", r"确定", r"^yes$"):
         btn = inner.get_by_role("button", name=re.compile(name_pat, re.I))
         if btn.count():
             btn.first.click(timeout=min(30_000, timeout_ms))
-            _wait_table_idle(page, timeout_ms)
             return
     inner.locator("button.el-button--primary").first.click(timeout=min(30_000, timeout_ms))
+
+
+def _click_save_confirm(page, remark: str, *, timeout_ms: int) -> None:
+    """
+    Apply a batch action's confirmation layer, then clear any post-op notice.
+
+    Handles BOTH confirmation widgets Element UI can raise:
+      * ``.el-dialog``      — remark form; fill remark, click Save/Confirm/OK/primary.
+      * ``.el-message-box`` — ``$confirm`` / ``$prompt``; fill remark if it has an input, click confirm.
+
+    After applying, a post-op notice (``$alert`` "N set, M offline/skipped") often follows — it is
+    dismissed so it cannot linger and intercept the next pagination click (the original bug).
+    """
+    _page_pause(page, 400)
+    layer = _visible_confirm_layer(page)
+    if layer is None:
+        dlg = page.locator(".el-dialog__wrapper").filter(has=page.locator(".el-dialog")).last
+        if dlg.count() == 0:
+            dlg = page.locator(".el-dialog").last
+        dlg.wait_for(state="visible", timeout=min(30_000, timeout_ms))
+        layer = dlg
+
+    if _confirm_layer_is_message_box(layer):
+        inner = layer.locator(".el-message-box").first
+        if inner.count() == 0:
+            inner = layer
+        if remark:
+            box = inner.locator("input, textarea").first
+            if box.count():
+                try:
+                    if box.is_visible():
+                        box.fill(remark)
+                except Exception:
+                    pass
+        _click_confirm_primary(inner, timeout_ms=timeout_ms)
+    else:
+        inner = layer.locator(".el-dialog").first if layer.locator(".el-dialog").count() else layer
+        if remark:
+            for sel in ("textarea", "input[type='text']"):
+                ta = inner.locator(sel).first
+                if ta.count() and ta.is_visible():
+                    try:
+                        ta.fill(remark)
+                    except Exception:
+                        pass
+                    break
+        _click_confirm_primary(inner, timeout_ms=timeout_ms)
+
     _wait_table_idle(page, timeout_ms)
+
+    # Acknowledge / clear any post-op notice so it can't intercept the next pagination click.
+    _page_pause(page, 300)
+    for _ in range(3):
+        if not _blocking_modal_present(page):
+            break
+        _dismiss_intercepting_modal(page, timeout_ms=timeout_ms)
+        _page_pause(page, 250)
 
 
 def _wait_batch_done(page, *, timeout_ms: int) -> None:
@@ -1666,6 +1723,11 @@ def _process_env_batch(
 ) -> tuple[list[dict], list[dict]]:
     if cancel_check() or manual_stop_check():
         return ok_list, fail_list
+
+    # A leftover Warning/notice modal from a previous attempt would intercept every pagination click
+    # on this reused page — clear it before selecting so one stuck popup can't fail all retries.
+    if _blocking_modal_present(page):
+        _dismiss_intercepting_modal(page, timeout_ms=timeout_ms)
 
     try:
         # Read each row's live state in the same pagination pass that ticks its checkbox, so we

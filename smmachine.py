@@ -717,17 +717,127 @@ def _can_pagination_next(page) -> bool:
         return False
 
 
+def _blocking_modal_present(page) -> bool:
+    """
+    True when a visible Element UI modal overlay (message-box / dialog) could intercept clicks.
+
+    Note: these wrappers are ``position: fixed``, so ``offsetParent`` is ``null`` even when visible —
+    visibility must be judged from computed style + bounding rect, not ``offsetParent``.
+    """
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                  for (const s of ['.el-message-box__wrapper', '.el-dialog__wrapper']) {
+                    for (const el of document.querySelectorAll(s)) {
+                      const st = getComputedStyle(el);
+                      if (st.display === 'none' || st.visibility === 'hidden'
+                          || parseFloat(st.opacity || '1') < 0.05) continue;
+                      const r = el.getBoundingClientRect();
+                      if (r.width > 0 && r.height > 0) return true;
+                    }
+                  }
+                  return false;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def _dismiss_intercepting_modal(page, *, timeout_ms: int) -> bool:
+    """
+    Clear a leftover modal overlay (Element UI message-box / dialog) that is intercepting clicks.
+
+    Safe for the mutation flow: it NEVER clicks a two-button confirm's primary/apply button. It only
+    presses Escape, clicks Cancel/Close/No (or the header X), or — for a single-button notice
+    (``$alert``) — clicks its lone acknowledge button. So a stale popup is cleared without applying
+    any unintended backend action. Returns ``True`` if no blocking modal remains.
+    """
+    if not _blocking_modal_present(page):
+        return False
+
+    # 1) Escape — cancels (never confirms) a $confirm; closes $alert where allowed.
+    for _ in range(2):
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        page.wait_for_timeout(200)
+        if not _blocking_modal_present(page):
+            return True
+
+    # 2) Cancel / Close / No, or the header X — on the topmost message-box or dialog.
+    for wrap_sel in (".el-message-box__wrapper", ".el-dialog__wrapper"):
+        layer = page.locator(wrap_sel).last
+        if layer.count() == 0:
+            continue
+        try:
+            if not layer.is_visible():
+                continue
+        except Exception:
+            continue
+        for name_pat in (r"^cancel$", r"^close$", r"^no$", r"取消", r"关闭"):
+            btn = layer.get_by_role("button", name=re.compile(name_pat, re.I))
+            if btn.count():
+                try:
+                    btn.first.click(timeout=min(10_000, timeout_ms))
+                    page.wait_for_timeout(250)
+                    if not _blocking_modal_present(page):
+                        return True
+                except Exception:
+                    continue
+        x = layer.locator(".el-dialog__headerbtn, .el-message-box__headerbtn").first
+        if x.count():
+            try:
+                x.click(timeout=min(10_000, timeout_ms))
+                page.wait_for_timeout(250)
+                if not _blocking_modal_present(page):
+                    return True
+            except Exception:
+                pass
+
+    # 3) Single-button notice ($alert): its only button is an acknowledge — safe to click.
+    mb = page.locator(".el-message-box__wrapper").filter(has=page.locator(".el-message-box")).last
+    if mb.count():
+        try:
+            btns = mb.locator(".el-message-box__btns button")
+            if btns.count() == 1:
+                btns.first.click(timeout=min(10_000, timeout_ms))
+                page.wait_for_timeout(250)
+        except Exception:
+            pass
+
+    return not _blocking_modal_present(page)
+
+
 def _click_pagination_prev(page, *, timeout_ms: int) -> None:
     btn = _pagination_prev_btn(page)
     btn.wait_for(state="visible", timeout=min(15_000, timeout_ms))
-    btn.click(timeout=min(30_000, timeout_ms))
+    if _blocking_modal_present(page):
+        _dismiss_intercepting_modal(page, timeout_ms=timeout_ms)
+    try:
+        btn.click(timeout=min(30_000, timeout_ms))
+    except Exception:
+        if _dismiss_intercepting_modal(page, timeout_ms=timeout_ms):
+            btn.click(timeout=min(30_000, timeout_ms))
+        else:
+            raise
     page.wait_for_timeout(900)
 
 
 def _click_pagination_next(page, *, timeout_ms: int) -> None:
     btn = _pagination_next_btn(page)
     btn.wait_for(state="visible", timeout=min(15_000, timeout_ms))
-    btn.click(timeout=min(30_000, timeout_ms))
+    if _blocking_modal_present(page):
+        _dismiss_intercepting_modal(page, timeout_ms=timeout_ms)
+    try:
+        btn.click(timeout=min(30_000, timeout_ms))
+    except Exception:
+        if _dismiss_intercepting_modal(page, timeout_ms=timeout_ms):
+            btn.click(timeout=min(30_000, timeout_ms))
+        else:
+            raise
     page.wait_for_timeout(900)
 
 
