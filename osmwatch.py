@@ -281,8 +281,7 @@ def _alert_tag_open_id() -> str:
     once the target user's open_id is known (it's logged whenever they use the bot)."""
     return (
         os.getenv("OSMWATCH_ALERT_TAG_OPEN_ID", "").strip()
-        or os.getenv("omduty", "").strip()
-        or "ou_d7bc33724e2d6ced4050c944c2ca5650"
+        or "ou_25f5d54bda075158f85c0272c602a0a0"
     )
 
 
@@ -1292,10 +1291,10 @@ def _fmt_encoder_machine(entry: dict, only_types: "set[str] | None" = None) -> s
             head += f"  {meta}"
         lines.append(head)
         room, user, sig = info.get("room_id") or "", info.get("user_id") or "", info.get("user_sig") or ""
-        if room:
-            lines.append(f"🏠 ROOM ID  : `{room}`")
         if ENCODER_APP_ID:
             lines.append(f"🆔 APP ID   : `{ENCODER_APP_ID}`")
+        if room:
+            lines.append(f"🏠 ROOM ID  : `{room}`")
         if user:
             lines.append(f"👤 User ID  : `{user}`")
         if sig:
@@ -1387,10 +1386,10 @@ def _encoder_machine_md(entry: dict, only_types: "set[str] | None" = None) -> st
         if meta:
             block.append(meta)
         room, user, sig = info.get("room_id") or "", info.get("user_id") or "", info.get("user_sig") or ""
-        if room:
-            block.append(f"🏠 ROOM ID  : `{room}`")
         if ENCODER_APP_ID:
             block.append(f"🆔 APP ID   : `{ENCODER_APP_ID}`")
+        if room:
+            block.append(f"🏠 ROOM ID  : `{room}`")
         if user:
             block.append(f"👤 User ID  : `{user}`")
         if sig:
