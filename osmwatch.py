@@ -256,6 +256,93 @@ def send_text_message(chat_id: str, text: str) -> dict:
     return requests.post(url, headers=headers, params=params, json=payload, timeout=30).json()
 
 
+def send_interactive_card(chat_id: str, card: dict) -> dict:
+    import json
+
+    token = get_tenant_access_token()
+    url = f"{_lark_base()}/open-apis/im/v1/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {
+        "receive_id": chat_id,
+        "msg_type": "interactive",
+        "content": json.dumps(card),
+    }
+    params = {"receive_id_type": "chat_id"}
+    return requests.post(url, headers=headers, params=params, json=payload, timeout=30).json()
+
+
+# --- OSM-Watch access alerts (tag + "Show Qr Code" button) --------------------
+# Card-callback key for the "Show Qr Code" button (main.py dispatches on it).
+OSMWATCH_SHOW_QR_CALLBACK_KEY = "osmwatch_show_qr"
+
+
+def _alert_tag_open_id() -> str:
+    """open_id to @mention on OSM-Watch access alerts. Set ``OSMWATCH_ALERT_TAG_OPEN_ID``
+    once the target user's open_id is known (it's logged whenever they use the bot)."""
+    return (
+        os.getenv("OSMWATCH_ALERT_TAG_OPEN_ID", "").strip()
+        or os.getenv("omduty", "").strip()
+        or "ou_d7bc33724e2d6ced4050c944c2ca5650"
+    )
+
+
+def _access_fail_card(tag_open_id: str) -> dict:
+    at = f'<at id="{tag_open_id}"></at> ' if tag_open_id else ""
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "width_mode": "fill"},
+        "header": {"template": "red",
+                   "title": {"tag": "plain_text", "content": "❌ Failed to access OSM-Watch"}},
+        "body": {"elements": [
+            {"tag": "div", "text": {"tag": "lark_md",
+             "content": f"{at}⚠️ The bot **failed to access OSM-Watch** (session expired / not signed in).\n"
+                        f"Tap **Show Qr Code** below, then scan it with your Lark app to sign the bot in."}},
+            {"tag": "column_set", "flex_mode": "none", "columns": [
+                {"tag": "column", "width": "weighted", "weight": 1, "elements": [
+                    {"tag": "button",
+                     "text": {"tag": "plain_text", "content": "Show Qr Code"},
+                     "type": "primary",
+                     "behaviors": [{"type": "callback", "value": {"k": OSMWATCH_SHOW_QR_CALLBACK_KEY}}]},
+                ]},
+            ]},
+        ]},
+    }
+
+
+def notify_access_failed(chat_id: str | None = None) -> None:
+    """Post the '❌ Failed to access OSM-Watch' card (tag + Show Qr Code button) to the group.
+
+    Always goes to the configured OSM-Watch group; a different triggering chat gets a short
+    pointer to it (the user asked alerts land in the group, not wherever the command ran)."""
+    group = _qr_chat_default() or None
+    if group:
+        try:
+            send_interactive_card(group, _access_fail_card(_alert_tag_open_id()))
+        except Exception as e:
+            print(f"[osmwatch] could not send access-failed card: {e!r}", flush=True)
+    if chat_id and chat_id != group:
+        try:
+            send_text_message(
+                chat_id,
+                "⚠️ OSM-Watch: bot isn't signed in — a QR request was posted to the group.",
+            )
+        except Exception:
+            pass
+
+
+def notify_access_ok(chat_id: str | None = None) -> None:
+    """Post the '✅ Can access into OSM-Watch' confirmation (tag) after a successful login."""
+    target = (_qr_chat_default() or None) or chat_id
+    if not target:
+        return
+    tag = _alert_tag_open_id()
+    at = f'<at user_id="{tag}"></at> ' if tag else ""
+    try:
+        send_text_message(target, f"{at}✅ Can access into OSM-Watch now.")
+    except Exception as e:
+        print(f"[osmwatch] could not send access-ok message: {e!r}", flush=True)
+
+
 def send_screenshot_to_lark(shot_path: str, chat_id: str) -> bool:
     key = upload_image_lark(shot_path)
     if not key:
@@ -1018,6 +1105,10 @@ _ENCODER_TYPE_LABEL = {"main": "MAIN", "pool": "POOL", "cctv": "CCTV"}
 _ENCODER_TYPE_EMOJI = {"main": "🎬", "pool": "🎱", "cctv": "📹"}
 _ENCODER_QUERY_SPLIT = re.compile(r"[\s,&]+")
 
+# TRTC SDKAppID shown next to every room. Fixed across all OSM-Watch rooms; override
+# per-deployment with OSMWATCH_ENCODER_APP_ID if a site ever uses a different app.
+ENCODER_APP_ID = os.getenv("OSMWATCH_ENCODER_APP_ID", "20008185").strip()
+
 
 def _encoder_enabled() -> bool:
     return _truthy(os.getenv("OSMWATCH_ENCODER", "1"))
@@ -1160,39 +1251,67 @@ def _parse_encoder_queries(arg: str) -> list[str]:
     return [t for t in _ENCODER_QUERY_SPLIT.split((arg or "").strip()) if t]
 
 
-def _fmt_encoder_machine(entry: dict) -> str:
+def _entry_types_filtered(entry: dict, only_types: "set[str] | None" = None):
+    """Ordered ``(type, info)`` pairs for a machine, optionally restricted to ``only_types``.
+
+    ``only_types`` powers ``/main`` / ``/pool`` / ``/cctv`` (show just that stream); ``None``
+    (``/encoder``) shows all of main/pool/cctv.
+    """
+    types = entry.get("types") or {}
+    ordered = list(_ENCODER_TYPE_ORDER) + [t for t in types if t not in _ENCODER_TYPE_ORDER]
+    out = []
+    for t in ordered:
+        if only_types and t not in only_types:
+            continue
+        info = types.get(t)
+        if info:
+            out.append((t, info))
+    return out
+
+
+def _only_types_label(only_types: "set[str] | None") -> str:
+    """Space-suffixed label for a type filter, e.g. ``"MAIN "`` (or ``""`` for all)."""
+    if not only_types:
+        return ""
+    labels = [_ENCODER_TYPE_LABEL.get(t, t.upper()) for t in _ENCODER_TYPE_ORDER if t in only_types]
+    labels += [t.upper() for t in only_types if t not in _ENCODER_TYPE_ORDER]
+    return (" ".join(labels) + " ") if labels else ""
+
+
+def _fmt_encoder_machine(entry: dict, only_types: "set[str] | None" = None) -> str:
     machine = entry.get("machine") or "?"
     env = entry.get("env") or ""
     lines = [f"🎥 **{machine}**" + (f" ({env})" if env else "")]
-    types = entry.get("types") or {}
-    ordered = list(_ENCODER_TYPE_ORDER) + [t for t in types if t not in _ENCODER_TYPE_ORDER]
-    for t in ordered:
-        info = types.get(t)
-        if not info:
-            continue
+    for t, info in _entry_types_filtered(entry, only_types):
         ip = info.get("ip") or "—"
         meta = " · ".join(x for x in (info.get("status") or "", info.get("updated") or "") if x)
         label = _ENCODER_TYPE_LABEL.get(t, t.upper())
-        head = f" • **{label} Encoder** IP ADDRESS — `{ip}`"
+        emoji = _ENCODER_TYPE_EMOJI.get(t, "🎞️")
+        head = f"{emoji} **{label} Encoder** IP ADDRESS — `{ip}`"
         if meta:
             head += f"  {meta}"
         lines.append(head)
         room, user, sig = info.get("room_id") or "", info.get("user_id") or "", info.get("user_sig") or ""
         if room:
-            lines.append(f"     ROOM ID  : `{room}`")
+            lines.append(f"🏠 ROOM ID  : `{room}`")
+        if ENCODER_APP_ID:
+            lines.append(f"🆔 APP ID   : `{ENCODER_APP_ID}`")
         if user:
-            lines.append(f"     User ID  : `{user}`")
+            lines.append(f"👤 User ID  : `{user}`")
         if sig:
-            lines.append(f"     User Sig : `{sig}`")
+            lines.append(f"🔑 User Sig : `{sig}`")
     return "\n".join(lines)
 
 
-def query_encoder(arg: str) -> list[str]:
+def query_encoder(arg: str, only_types: "set[str] | None" = None) -> list[str]:
     """Look up machines in latestencoder.json; return Lark-ready message string(s).
 
     Tokens split on whitespace / comma / ``&`` and matched as case-insensitive
-    substrings of the machine name (e.g. ``nwr2205`` -> ``NWR2205``)."""
+    substrings of the machine name (e.g. ``nwr2205`` -> ``NWR2205``). ``only_types``
+    restricts output to one stream (``/main`` / ``/pool`` / ``/cctv``)."""
     snap = load_latestencoder()
+    label = _only_types_label(only_types)  # "MAIN " / "" — used in headings + usage
+    cmd_hint = f"/{next(iter(only_types))}" if (only_types and len(only_types) == 1) else "/encoder"
     if not snap or not snap.get("machines"):
         return ["⚠️ Encoder data isn't ready yet — it's scraped in the background. "
                 "Try again shortly (or run `/encoder refresh`)."]
@@ -1200,7 +1319,7 @@ def query_encoder(arg: str) -> list[str]:
     updated = snap.get("updated_at") or "?"
     tokens = _parse_encoder_queries(arg)
     if not tokens:
-        return [f"Usage: `/encoder <machine>` — e.g. `/encoder nwr2205` "
+        return [f"Usage: `{cmd_hint} <machine>` — e.g. `{cmd_hint} nwr2205` "
                 f"(multiple: `nwr2205 & nwr2206`).\n"
                 f"📅 {snap.get('machine_count', '?')} machines · updated {updated}"]
 
@@ -1210,18 +1329,20 @@ def query_encoder(arg: str) -> list[str]:
         for key, entry in machines.items():
             if up in key:
                 matched.setdefault(key, entry)
+    if only_types:
+        matched = {k: v for k, v in matched.items() if _entry_types_filtered(v, only_types)}
 
     if not matched:
-        return [f"🔎 No encoder machine matched: {', '.join(tokens)}\n📅 updated {updated}"]
+        return [f"🔎 No {label}encoder machine matched: {', '.join(tokens)}\n📅 updated {updated}"]
 
     cap = _encoder_max_matches()
     keys = list(matched.keys())
     truncated = len(keys) > cap
     keys = keys[:cap]
 
-    header = (f"🎬 **Encoder RTC** — {len(matched)} match(es) for {', '.join(tokens)}"
+    header = (f"🎬 **{label}Encoder RTC** — {len(matched)} match(es) for {', '.join(tokens)}"
               f"\n📅 updated {updated}")
-    blocks = [header] + [_fmt_encoder_machine(matched[k]) for k in keys]
+    blocks = [header] + [_fmt_encoder_machine(matched[k], only_types) for k in keys]
     if truncated:
         blocks.append(f"… {len(matched) - cap} more not shown — narrow your query.")
 
@@ -1249,17 +1370,12 @@ def _encoder_status_emoji(status: str) -> str:
     return "▫️"
 
 
-def _encoder_machine_md(entry: dict) -> str:
+def _encoder_machine_md(entry: dict, only_types: "set[str] | None" = None) -> str:
     """lark_md body for one machine card block (emoji per stream type)."""
     machine = entry.get("machine") or "?"
     env = entry.get("env") or ""
     parts = [f"🎥 **{machine}**" + (f"  ·  {env}" if env else "")]
-    types = entry.get("types") or {}
-    ordered = list(_ENCODER_TYPE_ORDER) + [t for t in types if t not in _ENCODER_TYPE_ORDER]
-    for t in ordered:
-        info = types.get(t)
-        if not info:
-            continue
+    for t, info in _entry_types_filtered(entry, only_types):
         emoji = _ENCODER_TYPE_EMOJI.get(t, "🎞️")
         label = _ENCODER_TYPE_LABEL.get(t, t.upper())
         ip = info.get("ip") or "—"
@@ -1273,6 +1389,8 @@ def _encoder_machine_md(entry: dict) -> str:
         room, user, sig = info.get("room_id") or "", info.get("user_id") or "", info.get("user_sig") or ""
         if room:
             block.append(f"🏠 ROOM ID  : `{room}`")
+        if ENCODER_APP_ID:
+            block.append(f"🆔 APP ID   : `{ENCODER_APP_ID}`")
         if user:
             block.append(f"👤 User ID  : `{user}`")
         if sig:
@@ -1281,9 +1399,11 @@ def _encoder_machine_md(entry: dict) -> str:
     return "\n\n".join(parts)
 
 
-def build_encoder_card(arg: str) -> dict | None:
+def build_encoder_card(arg: str, only_types: "set[str] | None" = None) -> dict | None:
     """Build a Lark schema-2.0 interactive card for the query, or None to signal
-    the caller to fall back to plain text (no data / no tokens / no match)."""
+    the caller to fall back to plain text (no data / no tokens / no match).
+
+    ``only_types`` restricts the card to one stream (``/main`` / ``/pool`` / ``/cctv``)."""
     snap = load_latestencoder()
     if not snap or not snap.get("machines"):
         return None
@@ -1297,6 +1417,8 @@ def build_encoder_card(arg: str) -> dict | None:
         for key, entry in machines.items():
             if up in key:
                 matched.setdefault(key, entry)
+    if only_types:
+        matched = {k: v for k, v in matched.items() if _entry_types_filtered(v, only_types)}
     if not matched:
         return None
 
@@ -1312,7 +1434,8 @@ def build_encoder_card(arg: str) -> dict | None:
         {"tag": "hr"},
     ]
     for i, k in enumerate(keys):
-        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": _encoder_machine_md(matched[k])}})
+        elements.append({"tag": "div", "text": {"tag": "lark_md",
+                         "content": _encoder_machine_md(matched[k], only_types)}})
         if i != len(keys) - 1:
             elements.append({"tag": "hr"})
     if truncated:
@@ -1320,10 +1443,13 @@ def build_encoder_card(arg: str) -> dict | None:
         elements.append({"tag": "div", "text": {"tag": "lark_md",
                          "content": f"… {len(matched) - cap} more not shown — narrow your query."}})
 
+    label = _only_types_label(only_types)
+    hemoji = _ENCODER_TYPE_EMOJI.get(next(iter(only_types)), "🎬") if (only_types and len(only_types) == 1) else "🎬"
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "width_mode": "fill"},
-        "header": {"template": "blue", "title": {"tag": "plain_text", "content": "🎬 Encoder RTC Info"}},
+        "header": {"template": "blue",
+                   "title": {"tag": "plain_text", "content": f"{hemoji} {label}Encoder RTC Info"}},
         "body": {"elements": elements},
     }
 
@@ -1516,6 +1642,16 @@ class _OsmWatchWarm:
         except Exception:
             pass
 
+    def _report_access_failed(self, chat_id: str | None, *, auto: bool) -> None:
+        """Post the button-gated 'Failed to access OSM-Watch' card. For auto/background
+        failures, post at most once (until re-login) so keepalive can't spam the group."""
+        if auto:
+            if _get_needs_manual():
+                print("[osmwatch-warm] access failed (already waiting for QR scan)", flush=True)
+                return
+            _set_needs_manual(True)
+        notify_access_failed(chat_id)
+
     def _handle_ensure(self, task: dict) -> None:
         if not self._healthy():
             self._launch()
@@ -1530,11 +1666,9 @@ class _OsmWatchWarm:
         if verdict == "error":
             print("[osmwatch-warm] dashboard returned an error status; will retry next keepalive.", flush=True)
             return
-        # verdict == "login" → session expired.
-        if task.get("auto") and not _get_needs_manual():
-            self._do_qr_login()
-        else:
-            print("[osmwatch-warm] session expired; waiting for /loginosmwatch", flush=True)
+        # verdict == "login" → session expired. Post the button-gated access-failed card
+        # (tag + "Show Qr Code") once instead of auto-pushing a QR; wait for the button.
+        self._report_access_failed(None, auto=bool(task.get("auto")))
 
     def _handle_login(self, task: dict) -> None:
         chat_id = task.get("chat_id")
@@ -1575,8 +1709,7 @@ class _OsmWatchWarm:
                     pass
                 _save_state(self._context)
                 _set_needs_manual(False)
-                if qr_chat:
-                    send_text_message(qr_chat, "✅ OSM-Watch: bot logged in successfully.")
+                notify_access_ok(qr_chat)
                 return True
             _set_needs_manual(True)
             if qr_chat:
@@ -1602,19 +1735,12 @@ class _OsmWatchWarm:
                 self._notify_blocked(chat_id)
                 return
             if verdict != "authenticated":
-                if verdict == "login" and not _get_needs_manual():
-                    self._do_qr_login()  # one auto attempt
-                    verdict = self._check_auth(timeout_ms)
-                if verdict != "authenticated":
-                    box["error"] = "blocked" if verdict == "blocked" else "not_authenticated"
-                    if verdict == "blocked":
-                        self._notify_blocked(chat_id)
-                    elif chat_id:
-                        send_text_message(
-                            chat_id,
-                            "⚠️ OSM-Watch: not logged in. Tag me and send /loginosmwatch to sign in.",
-                        )
-                    return
+                box["error"] = "blocked" if verdict == "blocked" else "not_authenticated"
+                if verdict == "blocked":
+                    self._notify_blocked(chat_id)
+                else:
+                    self._report_access_failed(chat_id, auto=False)
+                return
             url = task.get("url") or OSM_BASE
             if self._page.url.rstrip("/") != url.rstrip("/"):
                 resp = self._page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -1689,22 +1815,14 @@ class _OsmWatchWarm:
                 self._launch()
             verdict = self._check_auth()
             if verdict != "authenticated":
-                if verdict == "login" and not _get_needs_manual():
-                    self._do_qr_login()  # one auto attempt
-                    verdict = self._check_auth()
-                if verdict != "authenticated":
-                    print(f"[osmwatch-enc] skip scrape — verdict={verdict}", flush=True)
-                    if box is not None:
-                        box["error"] = "blocked" if verdict == "blocked" else "not_authenticated"
-                    if chat_id:
-                        if verdict == "blocked":
-                            self._notify_blocked(chat_id)
-                        else:
-                            send_text_message(
-                                chat_id,
-                                "⚠️ OSM-Watch: not logged in — tag me and send /loginosmwatch first.",
-                            )
-                    return
+                print(f"[osmwatch-enc] skip scrape — verdict={verdict}", flush=True)
+                if box is not None:
+                    box["error"] = "blocked" if verdict == "blocked" else "not_authenticated"
+                if verdict == "blocked":
+                    self._notify_blocked(chat_id)
+                else:
+                    self._report_access_failed(chat_id, auto=bool(task.get("auto")))
+                return
             snap = self._scrape_encoder_into_file()
             if box is not None:
                 box["snapshot"] = snap

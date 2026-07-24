@@ -24,7 +24,8 @@ This is a self-contained bot that ONLY does the machine + encoder flows mirrored
   - ``/checkmachinelog <machine> [date]``      logic log → card + AI summary (+ Third Http)
   - ``/stuckcredit <machine> [date]``          stuck credit: log + Third Http transfer-out check
   - ``/npthirdhttp <player_id> [date time]``   NP/WF/DHS/NCH/CP/OSM/MDR/TBP Third Http Detail
-  - ``/cctv <machine>``                        EGM CCTV screenshot · ``/al [DD/MM]`` Amount Loss
+  - ``/cctvshot <machine>``                    EGM CCTV screenshot · ``/al [DD/MM]`` Amount Loss
+  - ``/main /pool /cctv <machine(s)>``         one encoder stream (MAIN/POOL/CCTV) from OSM-Watch
   - reply **1**–**4** after an NP prompt · **Missing Credit** alert paste → checkcredit card
 
 The heavy lifting lives in the sibling modules copied verbatim from ``osedutybot``:
@@ -207,12 +208,57 @@ def add_message_reaction(message_id, emoji_type, *, fallbacks: tuple[str, ...] =
     return None
 
 
+def remove_message_reaction(message_id, reaction_id):
+    """Delete a previously-added reaction by its reaction_id (im/v1 messages reactions DELETE)."""
+    mid = (message_id or "").strip()
+    rid = (reaction_id or "").strip()
+    if not mid or not rid:
+        return None
+    token = get_tenant_access_token()
+    url = f"https://open.larksuite.com/open-apis/im/v1/messages/{mid}/reactions/{rid}"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        response = requests.delete(url, headers=headers, timeout=20)
+        try:
+            body = response.json()
+        except Exception:
+            body = {}
+        if response.status_code == 200 and int(body.get("code", -1)) == 0:
+            print(f"✅ Removed reaction {rid} from message {mid}", flush=True)
+            return body
+        print(f"⚠️ remove reaction failed: status={response.status_code} body={body!r}", flush=True)
+    except Exception as e:
+        print(f"⚠️ remove reaction error: {e!r}", flush=True)
+    return None
+
+
 # Lark UI tooltip may say "GotIt"; official emoji_type is **Get** (see im message-reaction emojis doc).
 _GOT_IT_REACTION_FALLBACKS = ("GotIt", "GOTIT", "LGTM", "OnIt", "CheckMark")
 
+# reaction_id of the "got it" reaction we added, per message — so we can REMOVE it when done.
+_gotit_reaction_ids: dict[str, str] = {}
+_gotit_reaction_lock = threading.Lock()
+
 
 def add_gotit_reaction(message_id):
-    return add_message_reaction(message_id, "Get", fallbacks=_GOT_IT_REACTION_FALLBACKS)
+    body = add_message_reaction(message_id, "Get", fallbacks=_GOT_IT_REACTION_FALLBACKS)
+    mid = (message_id or "").strip()
+    rid = ((body or {}).get("data") or {}).get("reaction_id")
+    if mid and rid:
+        with _gotit_reaction_lock:
+            _gotit_reaction_ids[mid] = rid
+    return body
+
+
+def remove_gotit_reaction(message_id):
+    """Remove the 'got it' reaction we added on ``message_id`` (if any)."""
+    mid = (message_id or "").strip()
+    if not mid:
+        return
+    with _gotit_reaction_lock:
+        rid = _gotit_reaction_ids.pop(mid, None)
+    if rid:
+        remove_message_reaction(mid, rid)
 
 
 _DONE_REACTION_FALLBACKS = ("Done", "CheckMark", "JIAYI")
@@ -244,8 +290,10 @@ def defer_lark_done_reaction() -> None:
 
 def mark_lark_process_done(message_id: Optional[str] = None) -> None:
     mid = (message_id or _lark_user_message_id.get() or "").strip()
-    if mid:
-        add_done_reaction(mid)
+    if not mid:
+        return
+    remove_gotit_reaction(mid)  # unreact "got it" …
+    add_done_reaction(mid)      # … then react "done"
 
 
 def finish_lark_incoming_message_if_sync() -> None:
@@ -1713,7 +1761,7 @@ def run_cctv_screenshot_job(chat_id: str, machine_query: str) -> None:
     if not mq:
         send_message(
             chat_id,
-            "❌ Usage: `/cctv <machine>` — same machine label as checkcredit (e.g. `OSMCP181`, `Dragons-0181`).",
+            "❌ Usage: `/cctvshot <machine>` — same machine label as checkcredit (e.g. `OSMCP181`, `Dragons-0181`).",
         )
         return
     md_resolved = mq
@@ -2345,6 +2393,19 @@ def _run_card_callback_worker(data: dict, resolved: tuple) -> None:
             ).start()
             return
 
+        # OSM-Watch "Show Qr Code" button → drive the QR login (a fresh QR posts to the group).
+        if key_ca == "osmwatch_show_qr":
+            def _run_show_qr(cid=chat_id_ca):
+                try:
+                    import osmwatch as _ow_mod
+
+                    _ow_mod.request_login(cid)
+                except Exception as _qe:
+                    print(f"❌ osmwatch show_qr: {_qe!r}", flush=True)
+
+            threading.Thread(target=_run_show_qr, daemon=True).start()
+            return
+
         # Prod-batch confirm / cancel / job-cancel / sm wizard buttons (smmachine owns the keys).
         import smmachine as _sm_cb
 
@@ -2421,10 +2482,20 @@ _HELP_TEXT = (
     "• `/checkmachinelog <machine> [date]` — logic log card + AI summary\n"
     "• `/stuckcredit <machine> [date]` — stuck credit + Third Http transfer-out check\n"
     "• `/npthirdhttp <player_id> [YYYY-MM-DD HH:MM:SS.mmm]` — Third Http Detail\n"
-    "• `/cctv <machine>` — EGM CCTV screenshot · `/al [DD/MM]` — Amount Loss\n"
+    "• `/cctvshot <machine>` — EGM CCTV screenshot · `/al [DD/MM]` — Amount Loss\n"
     "• reply **1**–**4** after an NP prompt · paste a **Missing Credit** alert to auto-fill\n"
+    "• `/main /pool /cctv <machine(s)>` — only that encoder stream from OSM-Watch\n"
     "• `/deploy` — git pull origin main + restart the systemd service"
 )
+
+# Encoder-stream commands: `/encoder` shows all of MAIN/POOL/CCTV; the others filter to one stream.
+# NOTE: `/cctv` here is the CCTV *encoder* stream; the EGM CCTV screenshot moved to `/cctvshot`.
+_ENCODER_TYPE_CMDS: dict[str, "set[str] | None"] = {
+    "/encoder": None,
+    "/main": {"main"},
+    "/pool": {"pool"},
+    "/cctv": {"cctv"},
+}
 
 # (prefix, module, function, card title, usage text) — mirrored from osedutybot's ladder.
 _MACHINE_LOOKUPS = (
@@ -2473,6 +2544,20 @@ def _handle_machine_message(
     low = ct.lower()
     cmd_parts = ct.split()
     cmd = cmd_parts[0].lower() if cmd_parts else ""
+
+    # Log the sender's open_id on every command so it can be read from the logs (e.g. to fill
+    # OSMWATCH_ALERT_TAG_OPEN_ID). Users can also DM `/whoami` to get it back in chat.
+    if sender_id and cmd.startswith("/"):
+        print(f"👤 [lark] command open_id={sender_id} chat_id={chat_id} cmd={cmd!r}", flush=True)
+
+    if cmd in ("/whoami", "/myid"):
+        _uid = (sender_id or "").strip()
+        _at = f'<at user_id="{_uid}"></at> ' if _uid else ""
+        send_message(
+            chat_id,
+            f"{_at}Your open_id: `{_uid or 'unknown'}`\nchat_id: `{chat_id}`",
+        )
+        return
 
     def _thread_root_for_prod_batch() -> Optional[str]:
         root = _prod_batch_thread_root_from_incoming_message(
@@ -2550,10 +2635,12 @@ def _handle_machine_message(
         return
 
     # ---- Encoder / TRTC lookup from latestencoder.json (osmwatch keeps it fresh) ----
-    if cmd == "/encoder":
+    # `/encoder` shows all of MAIN/POOL/CCTV; `/main` `/pool` `/cctv` show only that stream.
+    if cmd in _ENCODER_TYPE_CMDS:
+        _enc_only = _ENCODER_TYPE_CMDS[cmd]  # None for /encoder, else {"main"} / {"pool"} / {"cctv"}
         _enc_arg = " ".join(cmd_parts[1:]).strip()
 
-        def _run_encoder(chat_id_enc=chat_id, arg_enc=_enc_arg):
+        def _run_encoder(chat_id_enc=chat_id, arg_enc=_enc_arg, only_enc=_enc_only):
             try:
                 import osmwatch as _ow_mod
 
@@ -2563,17 +2650,17 @@ def _handle_machine_message(
                     return
                 # Prefer an interactive emoji card; fall back to plain text when the
                 # card can't render (no data / no match / usage) or the send fails.
-                _enc_card = _ow_mod.build_encoder_card(arg_enc)
+                _enc_card = _ow_mod.build_encoder_card(arg_enc, only_types=only_enc)
                 if _enc_card:
                     _enc_resp = send_message(chat_id_enc, json.dumps(_enc_card), msg_type="interactive")
                     if isinstance(_enc_resp, dict) and _enc_resp.get("code") == 0:
                         return
-                for _msg in _ow_mod.query_encoder(arg_enc):
+                for _msg in _ow_mod.query_encoder(arg_enc, only_types=only_enc):
                     send_message(chat_id_enc, _msg)
             except Exception as _enc_err:
                 print(f"❌ encoder: {_enc_err!r}", flush=True)
                 try:
-                    send_message(chat_id_enc, f"❌ /encoder failed: {_enc_err}")
+                    send_message(chat_id_enc, f"❌ {cmd} failed: {_enc_err}")
                 except Exception:
                     pass
 
@@ -2613,14 +2700,15 @@ def _handle_machine_message(
         start_lark_background_thread(run_amountloss_check, chat_id, date_param)
         return
 
-    # /cctv <machine> — EGM CCTV screenshot (no credit check).
-    if re.match(r"^/cctv\b", ct, re.I):
-        m_cv = re.match(r"^/cctv\s+(\S+)", ct, re.I)
+    # /cctvshot <machine> — EGM CCTV screenshot (no credit check).
+    # (`/cctv` is the CCTV *encoder* stream — handled above via _ENCODER_TYPE_CMDS.)
+    if re.match(r"^/cctvshot\b", ct, re.I):
+        m_cv = re.match(r"^/cctvshot\s+(\S+)", ct, re.I)
         if not m_cv:
             send_message(
                 chat_id,
-                "❌ Usage: `/cctv <machine>` — EGM **CCTV** only (no credit check).\n"
-                "Example: `/cctv OSMCP181` · `/cctv Dragons-0181`",
+                "❌ Usage: `/cctvshot <machine>` — EGM **CCTV** screenshot (no credit check).\n"
+                "Example: `/cctvshot OSMCP181` · `/cctvshot Dragons-0181`",
             )
             return
         start_lark_background_thread(run_cctv_screenshot_job, chat_id, m_cv.group(1))
