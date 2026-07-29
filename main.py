@@ -2485,7 +2485,20 @@ _HELP_TEXT = (
     "• `/cctvshot <machine>` — EGM CCTV screenshot · `/al [DD/MM]` — Amount Loss\n"
     "• reply **1**–**4** after an NP prompt · paste a **Missing Credit** alert to auto-fill\n"
     "• `/main /pool /cctv <machine(s)>` — only that encoder stream from OSM-Watch\n"
+    "• `who am i` — your Lark open_id (for tagging / config)\n"
     "• `/deploy` — git pull origin main + restart the systemd service"
+)
+
+# "Who am I?" — slash form **and** plain English, since users type it either way. Anchored to the
+# whole message so an embedded phrase in a longer paste never hijacks that message.
+_WHOAMI_RE = re.compile(
+    r"^\s*/?(?:"
+    r"whoami"
+    r"|myid"
+    r"|who\s*am\s*i"
+    r"|(?:what(?:'s|s|\s+is)?\s+)?my\s+(?:open[\s_-]?id|user\s*id|id)"
+    r")\s*[?!.]*\s*$",
+    re.I,
 )
 
 # Encoder-stream commands: `/encoder` shows all of MAIN/POOL/CCTV; the others filter to one stream.
@@ -2545,12 +2558,13 @@ def _handle_machine_message(
     cmd_parts = ct.split()
     cmd = cmd_parts[0].lower() if cmd_parts else ""
 
-    # Log the sender's open_id on every command so it can be read from the logs (e.g. to fill
-    # OSMWATCH_ALERT_TAG_OPEN_ID). Users can also DM `/whoami` to get it back in chat.
-    if sender_id and cmd.startswith("/"):
-        print(f"👤 [lark] command open_id={sender_id} chat_id={chat_id} cmd={cmd!r}", flush=True)
+    # Log the sender's open_id on every handled message so it can be read from the logs
+    # (e.g. to fill OSMWATCH_ALERT_TAG_OPEN_ID). Users can also ask "who am i" in chat.
+    if sender_id:
+        print(f"👤 [lark] sender open_id={sender_id} chat_id={chat_id} cmd={cmd!r}", flush=True)
 
-    if cmd in ("/whoami", "/myid"):
+    # "who am i" / "/whoami" / "my open id" … → reply with the SENDER's own open_id.
+    if _WHOAMI_RE.match(ct):
         _uid = (sender_id or "").strip()
         _at = f'<at user_id="{_uid}"></at> ' if _uid else ""
         send_message(
