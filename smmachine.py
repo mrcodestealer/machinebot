@@ -752,10 +752,11 @@ def _dismiss_intercepting_modal(page, *, timeout_ms: int) -> bool:
     Safe for the mutation flow: it NEVER clicks a two-button confirm's primary/apply button. It only
     presses Escape, clicks Cancel/Close/No (or the header X), or — for a single-button notice
     (``$alert``) — clicks its lone acknowledge button. So a stale popup is cleared without applying
-    any unintended backend action. Returns ``True`` if no blocking modal remains.
+    any unintended backend action. Returns ``True`` if no blocking modal remains — including when
+    none was open, since "nothing is blocking" is the success condition callers actually test.
     """
     if not _blocking_modal_present(page):
-        return False
+        return True
 
     # 1) Escape — cancels (never confirms) a $confirm; closes $alert where allowed.
     for _ in range(2):
@@ -811,34 +812,51 @@ def _dismiss_intercepting_modal(page, *, timeout_ms: int) -> bool:
     return not _blocking_modal_present(page)
 
 
+def _click_pagination_button(page, btn, *, timeout_ms: int) -> None:
+    """
+    Click a pagination button, surviving an Element UI modal that steals pointer events.
+
+    The blocking Warning box frequently animates in *during* the click — Playwright's log shows the
+    wrapper carrying ``msgbox-fade-enter-active`` — so a single pre-click check cannot catch it, and
+    one long click just burns its whole timeout retrying against the overlay. Each attempt therefore
+    uses a short timeout and clears any modal in between, keeping the same overall budget while
+    actually dismissing the blocker. Last resort is a DOM click, which ignores the overlay entirely
+    (safe here: paging the table is read-only).
+    """
+    per_try = max(5_000, min(10_000, timeout_ms))
+    last: Exception | None = None
+    for _ in range(3):
+        if not _dismiss_intercepting_modal(page, timeout_ms=timeout_ms):
+            # An overlay we must not touch (e.g. a two-button confirm whose only other control is
+            # the apply button) is covering the page. A real click can only burn its timeout
+            # against it, so stop retrying and fall through to the DOM click.
+            break
+        try:
+            btn.click(timeout=per_try)
+            page.wait_for_timeout(900)
+            return
+        except Exception as exc:
+            last = exc
+    try:
+        btn.evaluate("el => el.click()")
+        page.wait_for_timeout(900)
+        return
+    except Exception:
+        pass
+    if last is not None:
+        raise last
+
+
 def _click_pagination_prev(page, *, timeout_ms: int) -> None:
     btn = _pagination_prev_btn(page)
     btn.wait_for(state="visible", timeout=min(15_000, timeout_ms))
-    if _blocking_modal_present(page):
-        _dismiss_intercepting_modal(page, timeout_ms=timeout_ms)
-    try:
-        btn.click(timeout=min(30_000, timeout_ms))
-    except Exception:
-        if _dismiss_intercepting_modal(page, timeout_ms=timeout_ms):
-            btn.click(timeout=min(30_000, timeout_ms))
-        else:
-            raise
-    page.wait_for_timeout(900)
+    _click_pagination_button(page, btn, timeout_ms=timeout_ms)
 
 
 def _click_pagination_next(page, *, timeout_ms: int) -> None:
     btn = _pagination_next_btn(page)
     btn.wait_for(state="visible", timeout=min(15_000, timeout_ms))
-    if _blocking_modal_present(page):
-        _dismiss_intercepting_modal(page, timeout_ms=timeout_ms)
-    try:
-        btn.click(timeout=min(30_000, timeout_ms))
-    except Exception:
-        if _dismiss_intercepting_modal(page, timeout_ms=timeout_ms):
-            btn.click(timeout=min(30_000, timeout_ms))
-        else:
-            raise
-    page.wait_for_timeout(900)
+    _click_pagination_button(page, btn, timeout_ms=timeout_ms)
 
 
 def _go_first_page(page, *, timeout_ms: int, max_steps: int) -> None:
