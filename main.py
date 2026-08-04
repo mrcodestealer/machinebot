@@ -2475,6 +2475,7 @@ _HELP_TEXT = (
     "• `/nch /nwr /wf /tbr /tbp /cp /dhs /mdr <id(s)>` — asset / encoder sheet lookup\n"
     "• `/encoder <machine(s)>` — MAIN/POOL/CCTV IPs from OSM-Watch (`/encoder refresh` to rescrape)\n"
     "• `/osmwatch [url]` — OSM-Watch dashboard screenshot\n"
+    "• `/checkosmwatch` — check the bot can still access OSM-Watch (Show Qr Code if not)\n"
     "• `/loginosmwatch` — force a fresh OSM-Watch login QR (lab group)\n"
     "• `/checkcredit <machine> [YYYY-MM-DD]` — log → players → NP choice card\n"
     "• `/checkcreditdate` — interactive card (machine + player + date)\n"
@@ -2617,6 +2618,28 @@ def _handle_machine_message(
                     pass
 
         start_lark_background_thread(_run_osmwatch_login)
+        return
+
+    # ---- OSM-Watch: is the bot still signed in? (read-only probe) ----
+    if cmd in ("/checkosmwatch", "/osmwatchcheck"):
+        def _run_osmwatch_check(chat_id_ck=chat_id):
+            try:
+                import osmwatch as _ow_mod
+
+                send_message(chat_id_ck, "🔍 Checking OSM-Watch access…")
+                box = _ow_mod.check_access(chat_id_ck)
+                print(
+                    f"[osmwatch-check] verdict={box.get('verdict')!r} err={box.get('error')!r}",
+                    flush=True,
+                )
+            except Exception as _ck_err:
+                print(f"❌ checkosmwatch: {_ck_err!r}", flush=True)
+                try:
+                    send_message(chat_id_ck, f"❌ /checkosmwatch failed: {_ck_err}")
+                except Exception:
+                    pass
+
+        start_lark_background_thread(_run_osmwatch_check)
         return
 
     # ---- OSM-Watch dashboard screenshot (warm browser) ----

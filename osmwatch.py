@@ -285,8 +285,9 @@ def _alert_tag_open_id() -> str:
     )
 
 
-def _access_fail_card(tag_open_id: str) -> dict:
+def _access_fail_card(tag_open_id: str, detail: str = "") -> dict:
     at = f'<at id="{tag_open_id}"></at> ' if tag_open_id else ""
+    extra = f"\n\n`{detail.strip()[:300]}`" if (detail or "").strip() else ""
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "width_mode": "fill"},
@@ -295,7 +296,8 @@ def _access_fail_card(tag_open_id: str) -> dict:
         "body": {"elements": [
             {"tag": "div", "text": {"tag": "lark_md",
              "content": f"{at}⚠️ The bot **failed to access OSM-Watch** (session expired / not signed in).\n"
-                        f"Tap **Show Qr Code** below, then scan it with your Lark app to sign the bot in."}},
+                        f"Tap **Show Qr Code** below, then scan it with your Lark app to sign the bot in."
+                        f"{extra}"}},
             {"tag": "column_set", "flex_mode": "none", "columns": [
                 {"tag": "column", "width": "weighted", "weight": 1, "elements": [
                     {"tag": "button",
@@ -1572,6 +1574,22 @@ class _OsmWatchWarm:
         done.wait()
         return box
 
+    def check_access(self, *, timeout_ms: int = 60_000, wait_s: float = 150.0) -> dict:
+        """
+        Read-only access probe for ``/check``: load the dashboard and report the verdict.
+
+        Blocks until the worker answers (bounded by ``wait_s`` so a wedged worker can't hang the
+        calling command thread). Returns a box with ``verdict`` and/or ``error``.
+        """
+        done = threading.Event()
+        box: dict = {}
+        self._tasks.put({
+            "kind": "check", "timeout_ms": timeout_ms, "done": done, "box": box,
+        })
+        if not done.wait(timeout=wait_s):
+            box.setdefault("error", f"timed out after {int(wait_s)}s waiting for the OSM-Watch worker")
+        return box
+
     def scrape_encoder(self, *, chat_id: str | None = None, block: bool = False) -> dict:
         """Queue an encoder scrape. With ``block`` the caller waits for completion."""
         task: dict = {"kind": "encoder_scrape", "auto": False, "chat_id": chat_id}
@@ -1594,6 +1612,8 @@ class _OsmWatchWarm:
             try:
                 if kind in ("ensure", "keepalive"):
                     self._handle_ensure(task)
+                elif kind == "check":
+                    self._handle_check(task)
                 elif kind == "login":
                     self._handle_login(task)
                 elif kind == "capture":
@@ -1668,6 +1688,25 @@ class _OsmWatchWarm:
         # verdict == "login" → session expired. Post the button-gated access-failed card
         # (tag + "Show Qr Code") once instead of auto-pushing a QR; wait for the button.
         self._report_access_failed(None, auto=bool(task.get("auto")))
+
+    def _handle_check(self, task: dict) -> None:
+        """``/checkosmwatch`` — report the current access verdict. Never triggers a QR login."""
+        box = task.get("box")
+        timeout_ms = int(task.get("timeout_ms") or 60_000)
+        try:
+            if not self._healthy():
+                self._launch()
+            verdict = self._check_auth(timeout_ms)
+            if box is not None:
+                box["verdict"] = verdict
+                box["url"] = self._page.url or ""
+            if verdict == "authenticated":
+                _save_state(self._context)
+                _set_needs_manual(False)
+        except Exception as e:
+            if box is not None:
+                box["error"] = repr(e)
+            self._teardown()
 
     def _handle_login(self, task: dict) -> None:
         chat_id = task.get("chat_id")
@@ -1883,6 +1922,59 @@ def refresh_encoder(chat_id: str | None = None) -> None:
     w = warm()
     w.start()
     w.scrape_encoder(chat_id=chat_id)
+
+
+ACCESS_VERDICT_LABELS = {
+    "authenticated": "✅ Can access into OSM-Watch",
+    "login": "❌ Failed to access OSM-Watch — not signed in",
+    "blocked": "⛔ Blocked by Cloudflare/WAF",
+    "error": "⚠️ OSM-Watch returned an error",
+}
+
+
+def send_access_status(chat_id: str, box: dict) -> str:
+    """
+    Reply in ``chat_id`` with the access verdict from :func:`check_access`.
+
+    Success is a plain line; a login failure is the same actionable card used by the auto-alert
+    (tag + **Show Qr Code**), so the fix is one tap away from wherever ``/checkosmwatch`` was run.
+    Returns the verdict that was reported.
+    """
+    verdict = str(box.get("verdict") or "").strip()
+    err = str(box.get("error") or "").strip()
+    if verdict == "authenticated":
+        send_text_message(chat_id, f"✅ Can access into OSM-Watch.\n🔗 {box.get('url') or OSM_BASE}")
+        return verdict
+    if verdict == "blocked":
+        send_text_message(
+            chat_id,
+            "⛔ OSM-Watch: the request was blocked by Cloudflare/WAF — this is **not** a login "
+            "problem, so a QR won't help. Allowlist the bot server's IP or add a WAF bypass rule.",
+        )
+        return verdict
+    # login / error / unknown → actionable card so the QR is one tap away.
+    detail = err or (f"verdict={verdict}" if verdict else "no verdict returned")
+    try:
+        send_interactive_card(chat_id, _access_fail_card(_alert_tag_open_id(), detail))
+    except Exception as e:
+        print(f"[osmwatch] access-status card failed: {e!r}", flush=True)
+        send_text_message(chat_id, f"❌ Failed to access OSM-Watch ({detail}).")
+    return verdict or "unknown"
+
+
+def check_access(chat_id: str | None = None, *, notify: bool = True) -> dict:
+    """
+    ``/checkosmwatch`` entry point — read-only probe of whether the bot can still reach OSM-Watch.
+
+    Never starts a QR login by itself; it only reports, and the reply's button drives the login.
+    Returns the raw box (``verdict`` / ``error`` / ``url``).
+    """
+    w = warm()
+    w.start()
+    box = w.check_access()
+    if notify and chat_id:
+        send_access_status(chat_id, box)
+    return box
 
 
 # ---------------------------------------------------------------------------
