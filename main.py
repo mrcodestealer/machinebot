@@ -2468,6 +2468,7 @@ _HELP_TEXT = (
     "🛠 I'm the **Machine / Encoder** bot. Commands:\n"
     "• `set maintenance NWR2008` / `unset test TBP8609 …` — PROD batch set/unset (confirm card)\n"
     "• `/sm` — set-machine wizard (env → action → machines)\n"
+    "• `/sst` — scheduled set maintenance/test form (date + time, auto-runs; one group only)\n"
     "• `/stresstest <paste announcement>` — one-time reminder 10 min before the set time\n"
     "• paste a maintenance schedule (with @bot) — auto reminder 10 min before\n"
     "• `machine status NWR2008` — read-only status from the live scrape\n"
@@ -2510,6 +2511,22 @@ _ENCODER_TYPE_CMDS: dict[str, "set[str] | None"] = {
     "/pool": {"pool"},
     "/cctv": {"cctv"},
 }
+
+
+def _sst_run_batch(chat_id: str, action: str, machines: list) -> None:
+    """Fire a scheduled ``/sst`` run through the normal prod-batch job path."""
+    import smmachine as _sm
+
+    _sm.start_prod_batch_job_direct(
+        chat_id=chat_id,
+        action=action,
+        machines=machines,
+        send_message=send_message,
+    )
+
+
+def _sst_send_card(chat_id: str, card: dict) -> Any:
+    return send_message(chat_id, json.dumps(card), msg_type="interactive")
 
 # (prefix, module, function, card title, usage text) — mirrored from osedutybot's ladder.
 _MACHINE_LOOKUPS = (
@@ -2618,6 +2635,29 @@ def _handle_machine_message(
                     pass
 
         start_lark_background_thread(_run_osmwatch_login)
+        return
+
+    # ---- /sst — scheduled Set Maintenance / Test form card (one group only) ----
+    if cmd == "/sst":
+        try:
+            import sst as _sst_mod
+
+            if not _sst_mod.chat_allowed(chat_id):
+                send_message(chat_id, "🚫 `/sst` is only available in the designated group.")
+                return
+            _sst_sid = _sst_mod.new_session(chat_id, thread_root=_thread_root_for_prod_batch())
+            _sst_sess = _sst_mod.get_session(_sst_sid) or {}
+            send_message(
+                chat_id,
+                json.dumps(_sst_mod.build_form_card(_sst_sid, _sst_sess)),
+                msg_type="interactive",
+            )
+        except Exception as _sst_err:
+            print(f"❌ sst: {_sst_err!r}", flush=True)
+            try:
+                send_message(chat_id, f"❌ /sst failed: {_sst_err}")
+            except Exception:
+                pass
         return
 
     # ---- OSM-Watch: is the bot still signed in? (read-only probe) ----
@@ -3136,6 +3176,32 @@ def lark_webhook():
             thread_r = str(parsed_sync.get("r") or "").strip()
             if thread_r and chat_id_ca:
                 _set_prod_batch_thread_root(chat_id_ca, thread_r)
+            # /sst form buttons update the card IN-PLACE — must answer inside the 3s window.
+            try:
+                import sst as _sst_sync
+
+                if str(parsed_sync.get("k") or "").strip().lower() == _sst_sync.SST_CARD_KEY:
+                    _ev_s = data.get("event") if isinstance(data.get("event"), dict) else {}
+                    _act_s = _ev_s.get("action") if isinstance(_ev_s.get("action"), dict) else {}
+                    _fv_s = _act_s.get("form_value") if isinstance(_act_s.get("form_value"), dict) else None
+                    if _fv_s is None and isinstance(parsed_sync.get("form_value"), dict):
+                        _fv_s = parsed_sync.get("form_value")
+                    _sst_resp = _sst_sync.handle_card_callback(
+                        parsed_sync,
+                        chat_id=chat_id_ca or "",
+                        form_value=_fv_s,
+                        scheduler=scheduler,
+                        send_card=_sst_send_card,
+                        send_text=send_message,
+                        run_batch=_sst_run_batch,
+                    )
+                    if _sst_resp is not None:
+                        if eid_ca:
+                            _remember_processed_message_id(str(eid_ca))
+                        return _lark_http_card_callback_response(_sst_resp)
+            except Exception as _sst_sync_err:
+                print(f"❌ sst card callback failed: {_sst_sync_err!r}", flush=True)
+
             # /sm wizard env pick updates the card IN-PLACE — must answer inside the 3s window.
             try:
                 import smmachine as _sm_sync
