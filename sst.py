@@ -144,8 +144,11 @@ def _initial_time_index(current: str) -> int:
 
 
 def _toggle_button(label: str, *, on: bool, sid: str, which: str) -> dict:
+    # ``name`` is REQUIRED for every interactive component inside a form container — without it
+    # Lark rejects the whole card (and the send failure used to be silent).
     return {
         "tag": "button",
+        "name": f"sst_toggle_{which}",
         "text": {"tag": "plain_text", "content": ("✅ " if on else "") + label},
         "type": "primary" if on else "default",
         "behaviors": [{"type": "callback", "value": {"k": SST_CARD_KEY, "a": "toggle",
@@ -198,7 +201,6 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
             "required": True,
             "initial_index": _initial_time_index(time_v),
         },
-        {"tag": "hr"},
         {"tag": "div", "text": {"tag": "lark_md", "content": "**What to set** — tap to select:"}},
         {
             "tag": "column_set",
@@ -211,7 +213,6 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
             ],
         },
         {"tag": "div", "text": {"tag": "lark_md", "content": selection_text(maint, test)}},
-        {"tag": "hr"},
         machines_el,
         {
             "tag": "column_set",

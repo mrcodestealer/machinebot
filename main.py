@@ -342,6 +342,26 @@ def _lark_build_message_content(text, msg_type: str = "text") -> str:
     return json.dumps({"text": text})
 
 
+def _lark_log_send_result(resp: Any, *, where: str, payload: Any = None) -> Any:
+    """
+    Log a non-zero Lark send result.
+
+    Without this a rejected interactive card (bad schema, unknown field …) failed **silently** —
+    the user saw only the bot's reactions and no message at all, with nothing in the journal.
+    """
+    try:
+        code = int((resp or {}).get("code", 0))
+    except Exception:
+        return resp
+    if code != 0:
+        msg = str((resp or {}).get("msg") or "")
+        print(f"❌ [lark] send failed ({where}): code={code} msg={msg!r}", flush=True)
+        if payload is not None:
+            snippet = str(payload)
+            print(f"   payload[:600]={snippet[:600]}", flush=True)
+    return resp
+
+
 def _lark_post_message_reply(
     parent_message_id: str,
     text,
@@ -368,7 +388,11 @@ def _lark_post_message_reply(
         body["reply_in_thread"] = True
     if mentions:
         body["mentions"] = mentions
-    return requests.post(url, headers=headers, json=body).json()
+    return _lark_log_send_result(
+        requests.post(url, headers=headers, json=body).json(),
+        where=f"reply({msg_type})",
+        payload=body.get("content"),
+    )
 
 
 def send_message(
@@ -405,7 +429,9 @@ def send_message(
     rid_type = (receive_id_type or "chat_id").strip() or "chat_id"
     params = {"receive_id_type": rid_type}
     response = requests.post(url, headers=headers, params=params, json=body)
-    return response.json()
+    return _lark_log_send_result(
+        response.json(), where=f"send({msg_type})", payload=content
+    )
 
 
 def _extract_lark_message_id(resp: Any) -> str:
