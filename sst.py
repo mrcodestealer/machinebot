@@ -184,7 +184,9 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
         "label_position": "top",
         "placeholder": {"tag": "plain_text", "content": "NWR2205\nNWR2206\nNWR2207"},
         "required": True,
-        "max_length": 4000,
+        # Lark hard-caps form input max_length at 1000 — anything larger is rejected with
+        # "max_length exceed the default maximum 1000" and the whole card fails to render.
+        "max_length": 1000,
     }
     if machines_v:
         machines_el["default_value"] = machines_v

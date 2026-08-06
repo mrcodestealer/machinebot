@@ -2879,7 +2879,9 @@ def _prod_batch_sm_action_form_card(
                 "content": "One per line — e.g. NCH1299",
             },
             "required": True,
-            "max_length": 4000,
+            # Lark hard-caps form input max_length at 1000; a larger value makes the whole
+            # card fail to render ("max_length exceed the default maximum 1000").
+            "max_length": 1000,
         },
     ]
     for row_start in (0, 3):
