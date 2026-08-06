@@ -445,32 +445,118 @@ def build_reminder_card(session: dict[str, Any], found: list[dict], when: dateti
     }
 
 
-def schedule_session(
-    sid: str,
-    session: dict[str, Any],
-    found: list[dict],
-    when: datetime,
+# ---------------------------------------------------------------------------
+# persistence — survives a service restart / redeploy
+# ---------------------------------------------------------------------------
+from pathlib import Path  # noqa: E402
+
+_ROOT_DIR = Path(__file__).resolve().parent
+STORE_PATH = _ROOT_DIR / (_os.environ.get("SST_STORE_FILE") or "scheduledSetMachine.json")
+
+# A schedule missed while the bot was down still runs if it's this fresh; older ones are
+# reported as missed instead of firing hours late.
+SST_MISFIRE_GRACE_MIN = 10
+
+_STORE_LOCK = threading.Lock()
+
+
+def _store_read() -> list[dict]:
+    try:
+        raw = json.loads(STORE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    items = raw.get("schedules") if isinstance(raw, dict) else raw
+    return [x for x in (items or []) if isinstance(x, dict)]
+
+
+def _store_write(items: list[dict]) -> None:
+    """Atomic write so a concurrent reader never sees a truncated file."""
+    tmp = STORE_PATH.with_suffix(".tmp")
+    payload = {"updated_at": datetime.now().isoformat(timespec="seconds"), "schedules": items}
+    try:
+        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(STORE_PATH)
+    except OSError as e:
+        print(f"[sst] could not persist {STORE_PATH.name}: {e!r}", flush=True)
+
+
+def store_list() -> list[dict]:
+    with _STORE_LOCK:
+        items = _store_read()
+    return sorted(items, key=lambda x: str(x.get("when") or ""))
+
+
+def store_add(entry: dict) -> None:
+    with _STORE_LOCK:
+        items = [x for x in _store_read() if str(x.get("id")) != str(entry.get("id"))]
+        items.append(entry)
+        _store_write(items)
+
+
+def store_remove(sched_id: str) -> dict | None:
+    with _STORE_LOCK:
+        items = _store_read()
+        keep, gone = [], None
+        for x in items:
+            if str(x.get("id")) == str(sched_id) and gone is None:
+                gone = x
+            else:
+                keep.append(x)
+        if gone is not None:
+            _store_write(keep)
+        return gone
+
+
+def _entry_when(entry: dict) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(entry.get("when")))
+    except (TypeError, ValueError):
+        return None
+
+
+def _entry_session(entry: dict) -> dict[str, Any]:
+    """Minimal session-shaped dict so the card builders work from a stored entry."""
+    return {"maint": bool(entry.get("maint")), "test": bool(entry.get("test"))}
+
+
+# ---------------------------------------------------------------------------
+# scheduling
+# ---------------------------------------------------------------------------
+def cancel_jobs(scheduler: Any, sched_id: str) -> None:
+    for jid in (f"sst_remind_{sched_id}", f"sst_run_{sched_id}"):
+        try:
+            scheduler.remove_job(jid)
+        except Exception:
+            pass
+
+
+def register_entry(
+    entry: dict,
     *,
     scheduler: Any,
     send_card: Callable[[str, dict], Any],
-    run_batch: Callable[[str, str, list[dict]], Any],
+    run_batch: Callable[..., Any],
     now: Optional[datetime] = None,
+    catch_up: bool = False,
 ) -> tuple[bool, str]:
     """
-    Register both jobs: the lead-time reminder and the action itself.
+    Register the reminder + action jobs for one stored entry.
 
-    ``send_card(chat_id, card)`` posts an interactive card; ``run_batch(chat_id, action, machines)``
-    starts the prod-batch job. Returns ``(ok, message)``.
+    ``send_card(chat_id, card)`` must return the posted card's ``message_id`` (or ""), which becomes
+    the thread root so the batch's own progress messages and screenshots land **inside** the
+    "Now will start …" card's thread. ``run_batch(chat_id, action, machines, thread_root=…)``.
     """
-    action = selection_action(bool(session.get("maint")), bool(session.get("test")))
-    if not action:
-        return False, selection_text(False, False)
-    chat_id = SST_ALLOWED_CHAT_ID
+    sched_id = str(entry.get("id") or "")
+    when = _entry_when(entry)
+    action = selection_action(bool(entry.get("maint")), bool(entry.get("test")))
+    chat_id = str(entry.get("chat_id") or SST_ALLOWED_CHAT_ID)
+    machines = [m for m in (entry.get("machines") or []) if isinstance(m, dict)]
+    if not (sched_id and when and action and machines):
+        return False, "invalid schedule entry"
     now = now or datetime.now()
-    if when <= now:
-        return False, f"⚠️ {when.strftime('%Y-%m-%d %I:%M%p')} is already in the past — pick a future time."
 
-    machines = [{k: v for k, v in m.items() if k != "token"} for m in found]
+    session = _entry_session(entry)
+    found = machines
 
     def _fire_reminder() -> None:
         try:
@@ -479,29 +565,206 @@ def schedule_session(
             print(f"[sst] reminder card failed: {e!r}", flush=True)
 
     def _fire_action() -> None:
+        root = ""
         try:
-            send_card(chat_id, build_start_card(session, found, when))
+            root = str(send_card(chat_id, build_start_card(session, found, when)) or "")
         except Exception as e:  # noqa: BLE001
             print(f"[sst] start card failed: {e!r}", flush=True)
+        # The schedule has fired — drop it so a later restart can't replay it.
+        store_remove(sched_id)
         try:
-            run_batch(chat_id, action, machines)
+            run_batch(chat_id, action, machines, thread_root=root or None)
         except Exception as e:  # noqa: BLE001
             print(f"[sst] scheduled batch failed to start: {e!r}", flush=True)
+
+    if when <= now:
+        if not catch_up:
+            return False, f"⚠️ {when.strftime('%Y-%m-%d %I:%M%p')} is already in the past — pick a future time."
+        late_min = (now - when).total_seconds() / 60.0
+        if late_min > SST_MISFIRE_GRACE_MIN:
+            return False, (f"missed by {int(late_min)} min (grace {SST_MISFIRE_GRACE_MIN} min) — not run")
+        scheduler.add_job(func=_fire_action, trigger="date",
+                          run_date=now + timedelta(seconds=5),
+                          id=f"sst_run_{sched_id}", replace_existing=True)
+        return True, f"catching up (was due {int(late_min)} min ago)"
 
     remind_at = when - timedelta(minutes=SST_REMINDER_LEAD_MIN)
     if remind_at > now:
         scheduler.add_job(func=_fire_reminder, trigger="date", run_date=remind_at,
-                          id=f"sst_remind_{sid}", replace_existing=True)
+                          id=f"sst_remind_{sched_id}", replace_existing=True)
     scheduler.add_job(func=_fire_action, trigger="date", run_date=when,
-                      id=f"sst_run_{sid}", replace_existing=True)
+                      id=f"sst_run_{sched_id}", replace_existing=True)
+    return True, ("reminder " + remind_at.strftime("%I:%M%p")) if remind_at > now else "reminder skipped"
 
-    remind_txt = (f" · reminder {remind_at.strftime('%I:%M%p')}"
-                  if remind_at > now else " · reminder skipped (less than "
-                                           f"{SST_REMINDER_LEAD_MIN} min away)")
+
+def schedule_session(
+    sid: str,
+    session: dict[str, Any],
+    found: list[dict],
+    when: datetime,
+    *,
+    scheduler: Any,
+    send_card: Callable[[str, dict], Any],
+    run_batch: Callable[..., Any],
+    now: Optional[datetime] = None,
+    created_by: str = "",
+) -> tuple[bool, str]:
+    """Persist the schedule to ``scheduledSetMachine.json`` and register its jobs."""
+    action = selection_action(bool(session.get("maint")), bool(session.get("test")))
+    if not action:
+        return False, selection_text(False, False)
+    now = now or datetime.now()
+    # Round to the minute FIRST, then validate — the stored value is what gets registered, so
+    # checking the unrounded time could accept a schedule that is past-due once persisted.
+    when = when.replace(second=0, microsecond=0)
+    if when <= now:
+        return False, f"⚠️ {when.strftime('%Y-%m-%d %I:%M%p')} is already in the past — pick a future time."
+
+    machines = [{k: v for k, v in m.items() if k != "token"} for m in found]
+    entry = {
+        "id": sid,
+        "chat_id": SST_ALLOWED_CHAT_ID,
+        "when": when.isoformat(timespec="seconds"),
+        "maint": bool(session.get("maint")),
+        "test": bool(session.get("test")),
+        "action": action,
+        "machines": machines,
+        "created": now.isoformat(timespec="seconds"),
+        "created_by": created_by,
+    }
+    store_add(entry)
+    ok, note = register_entry(
+        entry, scheduler=scheduler, send_card=send_card, run_batch=run_batch, now=now
+    )
+    if not ok:
+        store_remove(sid)
+        return False, note
+
+    remind_at = when - timedelta(minutes=SST_REMINDER_LEAD_MIN)
+    remind_txt = (f" · reminder {remind_at.strftime('%I:%M%p')}" if remind_at > now
+                  else f" · reminder skipped (less than {SST_REMINDER_LEAD_MIN} min away)")
     return True, (
         f"✅ Scheduled **Set {_action_words(bool(session.get('maint')), bool(session.get('test')))}** "
-        f"on **{len(machines)}** machine(s) at **{when.strftime('%Y-%m-%d %I:%M%p')}**{remind_txt}."
+        f"on **{len(machines)}** machine(s) at **{when.strftime('%Y-%m-%d %I:%M%p')}**{remind_txt}.\n"
+        f"_Saved to `{STORE_PATH.name}` — survives a service restart._"
     )
+
+
+def restore_schedules(
+    *,
+    scheduler: Any,
+    send_card: Callable[[str, dict], Any],
+    run_batch: Callable[..., Any],
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """
+    Re-register every persisted schedule at boot (called from main's startup).
+
+    Entries whose time passed while the bot was down run immediately when within
+    ``SST_MISFIRE_GRACE_MIN``; older ones are dropped and reported so nobody assumes they ran.
+    """
+    now = now or datetime.now()
+    restored: list[str] = []
+    missed: list[dict] = []
+    for entry in store_list():
+        ok, note = register_entry(
+            entry, scheduler=scheduler, send_card=send_card, run_batch=run_batch,
+            now=now, catch_up=True,
+        )
+        label = f"{entry.get('when')} · {entry.get('action')} · {len(entry.get('machines') or [])} machine(s)"
+        if ok:
+            restored.append(f"{label} ({note})")
+        else:
+            missed.append({"entry": entry, "note": note})
+            store_remove(str(entry.get("id") or ""))
+    print(f"[sst] restore: {len(restored)} re-armed, {len(missed)} missed", flush=True)
+    for r in restored:
+        print(f"[sst]   re-armed {r}", flush=True)
+    for m in missed:
+        print(f"[sst]   MISSED {m['entry'].get('when')} — {m['note']}", flush=True)
+    if missed:
+        try:
+            send_card(SST_ALLOWED_CHAT_ID, build_missed_card(missed))
+        except Exception as e:  # noqa: BLE001
+            print(f"[sst] missed-card failed: {e!r}", flush=True)
+    return {"restored": restored, "missed": missed}
+
+
+def build_missed_card(missed: list[dict]) -> dict:
+    lines = ["These scheduled set maintenance/test runs were **missed** while the bot was "
+             "restarting and were **NOT executed**:", ""]
+    for m in missed[:20]:
+        e = m["entry"]
+        w = _entry_when(e)
+        when_txt = w.strftime("%Y-%m-%d %I:%M%p") if w else str(e.get("when"))
+        lines.append(
+            f"• **{when_txt}** — Set {_action_words(bool(e.get('maint')), bool(e.get('test')))} "
+            f"on {len(e.get('machines') or [])} machine(s) — _{m['note']}_"
+        )
+    lines.append("")
+    lines.append("Re-schedule with `/sst` if these still need to run.")
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "width_mode": "fill"},
+        "header": {"template": "red",
+                   "title": {"tag": "plain_text", "content": "⚠️ Missed scheduled set maintenance/test"}},
+        "body": {"elements": [{"tag": "div", "text": {"tag": "lark_md",
+                               "content": "\n".join(lines)[:4000]}}]},
+    }
+
+
+# ---------------------------------------------------------------------------
+# /sstlist — pending schedules, each with a Delete button
+# ---------------------------------------------------------------------------
+def build_list_card() -> dict:
+    items = store_list()
+    if not items:
+        return {
+            "schema": "2.0",
+            "config": {"update_multi": True, "width_mode": "fill"},
+            "header": {"template": "grey",
+                       "title": {"tag": "plain_text", "content": "🗓 Scheduled Set Maintenance / Test"}},
+            "body": {"elements": [{"tag": "div", "text": {"tag": "lark_md",
+                                   "content": "No scheduled set maintenance/test.\nSend `/sst` to add one."}}]},
+        }
+
+    elements: list[dict] = [
+        {"tag": "div", "text": {"tag": "lark_md",
+         "content": f"**{len(items)}** scheduled run(s) · saved in `{STORE_PATH.name}`"}},
+    ]
+    for e in items:
+        w = _entry_when(e)
+        when_txt = w.strftime("%Y-%m-%d %I:%M%p") if w else str(e.get("when"))
+        machines = [m for m in (e.get("machines") or []) if isinstance(m, dict)]
+        names = ", ".join(str(m.get("machine") or "") for m in machines[:6])
+        if len(machines) > 6:
+            names += f", … (+{len(machines) - 6})"
+        body = (
+            f"**{when_txt}**\n"
+            f"Set {_action_words(bool(e.get('maint')), bool(e.get('test')))} · "
+            f"**{len(machines)}** machine(s)\n"
+            f"`{names}`"
+        )
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": body[:1500]},
+            "extra": {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "Delete"},
+                "type": "danger",
+                "behaviors": [{"type": "callback",
+                               "value": {"k": SST_CARD_KEY, "a": "del", "i": str(e.get("id") or "")}}],
+            },
+        })
+
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "width_mode": "fill"},
+        "header": {"template": "blue",
+                   "title": {"tag": "plain_text", "content": "🗓 Scheduled Set Maintenance / Test"}},
+        "body": {"elements": elements},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +799,18 @@ def handle_card_callback(
 
     if not chat_allowed(chat_id):
         return _toast("error", "/sst is only available in the designated group.")
+
+    # Delete from /sstlist — operates on the persisted store, not a live form session.
+    if act == "del":
+        sched_id = str(parsed.get("i") or "").strip()
+        gone = store_remove(sched_id)
+        cancel_jobs(scheduler, sched_id)
+        if gone is None:
+            return _toast("error", "That schedule is already gone.")
+        w = _entry_when(gone)
+        when_txt = w.strftime("%Y-%m-%d %I:%M%p") if w else str(gone.get("when"))
+        print(f"[sst] deleted schedule {sched_id} ({when_txt})", flush=True)
+        return _card_reply(build_list_card())
 
     session = get_session(sid)
     if not session:

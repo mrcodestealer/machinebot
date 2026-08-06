@@ -2495,6 +2495,7 @@ _HELP_TEXT = (
     "• `set maintenance NWR2008` / `unset test TBP8609 …` — PROD batch set/unset (confirm card)\n"
     "• `/sm` — set-machine wizard (env → action → machines)\n"
     "• `/sst` — scheduled set maintenance/test form (date + time, auto-runs; one group only)\n"
+    "• `/sstlist` — pending scheduled runs, with a Delete button each\n"
     "• `/stresstest <paste announcement>` — one-time reminder 10 min before the set time\n"
     "• paste a maintenance schedule (with @bot) — auto reminder 10 min before\n"
     "• `machine status NWR2008` — read-only status from the live scrape\n"
@@ -2539,20 +2540,33 @@ _ENCODER_TYPE_CMDS: dict[str, "set[str] | None"] = {
 }
 
 
-def _sst_run_batch(chat_id: str, action: str, machines: list) -> None:
-    """Fire a scheduled ``/sst`` run through the normal prod-batch job path."""
+def _sst_run_batch(
+    chat_id: str, action: str, machines: list, *, thread_root: Optional[str] = None
+) -> None:
+    """
+    Fire a scheduled ``/sst`` run through the normal prod-batch job path.
+
+    ``thread_root`` is the "Now will start …" card's message_id, so the job's own progress
+    messages **and** the EGM screenshots post inside that card's thread.
+    """
     import smmachine as _sm
 
+    root = (thread_root or "").strip() or None
+    if root:
+        _set_prod_batch_thread_root(chat_id, root)
     _sm.start_prod_batch_job_direct(
         chat_id=chat_id,
         action=action,
         machines=machines,
-        send_message=send_message,
+        send_message=make_prod_batch_thread_send(chat_id, thread_root=root),
+        thread_root_message_id=root,
     )
 
 
-def _sst_send_card(chat_id: str, card: dict) -> Any:
-    return send_message(chat_id, json.dumps(card), msg_type="interactive")
+def _sst_send_card(chat_id: str, card: dict) -> str:
+    """Post a card and return its message_id (used as the thread root)."""
+    resp = send_message(chat_id, json.dumps(card), msg_type="interactive")
+    return _extract_lark_message_id(resp)
 
 # (prefix, module, function, card title, usage text) — mirrored from osedutybot's ladder.
 _MACHINE_LOOKUPS = (
@@ -2682,6 +2696,25 @@ def _handle_machine_message(
             print(f"❌ sst: {_sst_err!r}", flush=True)
             try:
                 send_message(chat_id, f"❌ /sst failed: {_sst_err}")
+            except Exception:
+                pass
+        return
+
+    # ---- /sstlist — pending scheduled runs, each with a Delete button ----
+    if cmd in ("/sstlist", "/sstls"):
+        try:
+            import sst as _sst_mod
+
+            if not _sst_mod.chat_allowed(chat_id):
+                send_message(chat_id, "🚫 `/sstlist` is only available in the designated group.")
+                return
+            send_message(
+                chat_id, json.dumps(_sst_mod.build_list_card()), msg_type="interactive"
+            )
+        except Exception as _sl_err:
+            print(f"❌ sstlist: {_sl_err!r}", flush=True)
+            try:
+                send_message(chat_id, f"❌ /sstlist failed: {_sl_err}")
             except Exception:
                 pass
         return
@@ -3719,6 +3752,19 @@ def _run_main_entry() -> int:
                 atexit.register(lambda: scheduler.shutdown(wait=False))
         except Exception as _sched_err:
             print(f"⚠️ scheduler start failed: {_sched_err!r}", flush=True)
+
+        # Re-arm /sst schedules persisted in scheduledSetMachine.json — without this a restart
+        # (or /deploy) silently forgets every pending set maintenance/test.
+        try:
+            import sst as _boot_sst
+
+            _boot_sst.restore_schedules(
+                scheduler=scheduler,
+                send_card=_sst_send_card,
+                run_batch=_sst_run_batch,
+            )
+        except Exception as _boot_sst_err:
+            print(f"[sst] schedule restore failed: {_boot_sst_err!r}", flush=True)
 
         _mount_webmachine_dashboard()
 
