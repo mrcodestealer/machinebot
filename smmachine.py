@@ -1370,6 +1370,39 @@ def _find_row_for_target(
     return rows.nth(matched_indices[0])
 
 
+def _toggle_row_checkbox(page, target, inp, *, settle, timeout_ms: int, err: str) -> None:
+    """
+    Click a row checkbox, surviving an Element UI modal that steals pointer events.
+
+    Same failure as pagination: a leftover ``Warning`` box covers the table and every click burns
+    its full timeout ("Locator.click: Timeout 30000ms exceeded" on the row locator). Short attempts
+    with a modal dismissal in between, then force / DOM click as the last resort — selecting a row
+    changes nothing on the backend, so bypassing the overlay here is safe.
+    """
+    per_try = max(5_000, min(10_000, timeout_ms))
+    for _ in range(2):
+        if not _dismiss_intercepting_modal(page, timeout_ms=timeout_ms):
+            break  # overlay we must not touch — go straight to the fallbacks
+        try:
+            target.click(timeout=per_try)
+        except Exception:
+            continue
+        if settle(page, inp, total_ms=8_000):
+            return
+    for attempt in (
+        lambda: target.click(force=True, timeout=per_try),
+        lambda: target.evaluate("el => el.click()"),
+        lambda: inp.evaluate("el => el.click()"),
+    ):
+        try:
+            attempt()
+        except Exception:
+            continue
+        if settle(page, inp, total_ms=8_000):
+            return
+    raise RuntimeError(err)
+
+
 def _ensure_row_checkbox_checked(page, row, *, timeout_ms: int) -> None:
     try:
         row.scroll_into_view_if_needed(timeout=min(15_000, timeout_ms))
@@ -1381,16 +1414,15 @@ def _ensure_row_checkbox_checked(page, row, *, timeout_ms: int) -> None:
     inp.wait_for(state="attached", timeout=min(15_000, timeout_ms))
     if _read_dom_checked(inp, timeout_ms=3_000):
         return
-    lab = row.locator(".el-checkbox").first
-    if lab.count():
-        lab.click(timeout=min(30_000, timeout_ms))
-    else:
-        inp.click(timeout=min(30_000, timeout_ms))
-    if _wait_until_checked(page, inp, total_ms=12_000):
-        return
-    inp.click(force=True, timeout=min(30_000, timeout_ms))
-    if not _wait_until_checked(page, inp, total_ms=12_000):
-        raise RuntimeError("Could not tick checkbox after click (still unchecked after ~12s polls).")
+    target = row.locator(".el-checkbox").first
+    if target.count() == 0:
+        target = inp
+    _toggle_row_checkbox(
+        page, target, inp,
+        settle=_wait_until_checked,
+        timeout_ms=timeout_ms,
+        err="Could not tick checkbox after click (still unchecked after ~12s polls).",
+    )
 
 
 def _ensure_row_checkbox_unchecked(page, row, *, timeout_ms: int) -> None:
@@ -1405,16 +1437,15 @@ def _ensure_row_checkbox_unchecked(page, row, *, timeout_ms: int) -> None:
     inp.wait_for(state="attached", timeout=min(15_000, timeout_ms))
     if not _read_dom_checked(inp, timeout_ms=3_000):
         return
-    lab = row.locator(".el-checkbox").first
-    if lab.count():
-        lab.click(timeout=min(30_000, timeout_ms))
-    else:
-        inp.click(timeout=min(30_000, timeout_ms))
-    if _wait_until_unchecked(page, inp, total_ms=12_000):
-        return
-    inp.click(force=True, timeout=min(30_000, timeout_ms))
-    if not _wait_until_unchecked(page, inp, total_ms=12_000):
-        raise RuntimeError("Could not clear checkbox after click (still checked after ~12s polls).")
+    target = row.locator(".el-checkbox").first
+    if target.count() == 0:
+        target = inp
+    _toggle_row_checkbox(
+        page, target, inp,
+        settle=_wait_until_unchecked,
+        timeout_ms=timeout_ms,
+        err="Could not clear checkbox after click (still checked after ~12s polls).",
+    )
 
 
 def _verify_row_checkbox_checked(page, row, *, timeout_ms: int) -> bool:
@@ -3932,10 +3963,21 @@ def _prod_batch_send_lark_md(
         {"tag": "div", "text": {"tag": "lark_md", "content": body_md[:4000]}},
     ]
     if job_id and _prod_batch_job_is_running(job_id):
+        # Schema 2.0 dropped the 1.0 ``{"tag": "action", "actions": [...]}`` wrapper — using it
+        # made Lark reject the whole card ("unsupported tag action"), so every retry/progress
+        # update silently vanished while the job kept running. Buttons live in a column_set now.
         elements.append(
             {
-                "tag": "action",
-                "actions": [_prod_batch_cancel_button(job_id)],
+                "tag": "column_set",
+                "flex_mode": "none",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 1,
+                        "elements": [_prod_batch_cancel_button(job_id)],
+                    }
+                ],
             }
         )
     card = {

@@ -146,11 +146,18 @@ def _initial_time_index(current: str) -> int:
 def _toggle_button(label: str, *, on: bool, sid: str, which: str) -> dict:
     # ``name`` is REQUIRED for every interactive component inside a form container — without it
     # Lark rejects the whole card (and the send failure used to be silent).
+    #
+    # ``form_action_type: submit`` matters: a plain button does not carry the form's current values,
+    # so toggling used to re-render the card with an empty date/time/machine box. Submitting hands
+    # us ``form_value``, which we fold back into the session before re-rendering. The fields are
+    # deliberately NOT ``required`` — otherwise Lark would block the toggle until the whole form is
+    # filled; the real validation happens on Confirm instead.
     return {
         "tag": "button",
         "name": f"sst_toggle_{which}",
         "text": {"tag": "plain_text", "content": ("✅ " if on else "") + label},
         "type": "primary" if on else "default",
+        "form_action_type": "submit",
         "behaviors": [{"type": "callback", "value": {"k": SST_CARD_KEY, "a": "toggle",
                                                      "s": sid, "w": which}}],
     }
@@ -167,7 +174,7 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
         "tag": "date_picker",
         "name": "sst_date",
         "placeholder": {"tag": "plain_text", "content": "Pick the date"},
-        "required": True,
+        "required": False,
     }
     if date_v:
         date_el["initial_date"] = date_v
@@ -183,7 +190,9 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
         "label": {"tag": "plain_text", "content": "Machines (one per line)"},
         "label_position": "top",
         "placeholder": {"tag": "plain_text", "content": "NWR2205\nNWR2206\nNWR2207"},
-        "required": True,
+        # Not ``required``: the toggle buttons submit this form, and Lark would refuse the submit
+        # (blocking the toggle) while the box is still empty. Confirm validates it instead.
+        "required": False,
         # Lark hard-caps form input max_length at 1000 — anything larger is rejected with
         # "max_length exceed the default maximum 1000" and the whole card fails to render.
         "max_length": 1000,
@@ -200,7 +209,7 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
             "name": "sst_time",
             "placeholder": {"tag": "plain_text", "content": "Select time"},
             "options": _time_options(),
-            "required": True,
+            "required": False,
             "initial_index": _initial_time_index(time_v),
         },
         {"tag": "div", "text": {"tag": "lark_md", "content": "**What to set** — tap to select:"}},
@@ -311,6 +320,33 @@ def resolve_machines(tokens: list[str]) -> tuple[list[dict], list[str], list[dic
 # ---------------------------------------------------------------------------
 # review card
 # ---------------------------------------------------------------------------
+def normalize_date_value(raw: Any) -> str:
+    """
+    Lark's ``date_picker`` returns a **millisecond timestamp**, not ``YYYY-MM-DD``.
+
+    Storing it raw broke two things: ``initial_date`` rejected it (so the picker reset to empty on
+    every re-render) and ``parse_when`` could not read it. Normalise to ``YYYY-MM-DD`` here.
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if re.fullmatch(r"\d{10,13}", s):
+        ts = int(s)
+        if ts > 10 ** 11:  # milliseconds
+            ts //= 1000
+        try:
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        except (OverflowError, OSError, ValueError):
+            return ""
+    m = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})", s)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    m2 = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})", s)
+    if m2:
+        return f"{m2.group(3)}-{int(m2.group(2)):02d}-{int(m2.group(1)):02d}"
+    return ""
+
+
 def parse_when(date_s: str, time_s: str) -> datetime | None:
     """``2026-08-05`` + ``9:30PM`` → datetime (local)."""
     d = (date_s or "").strip()
@@ -645,8 +681,7 @@ def schedule_session(
                   else f" · reminder skipped (less than {SST_REMINDER_LEAD_MIN} min away)")
     return True, (
         f"✅ Scheduled **Set {_action_words(bool(session.get('maint')), bool(session.get('test')))}** "
-        f"on **{len(machines)}** machine(s) at **{when.strftime('%Y-%m-%d %I:%M%p')}**{remind_txt}.\n"
-        f"_Saved to `{STORE_PATH.name}` — survives a service restart._"
+        f"on **{len(machines)}** machine(s) at **{when.strftime('%Y-%m-%d %I:%M%p')}**{remind_txt}."
     )
 
 
@@ -728,10 +763,7 @@ def build_list_card() -> dict:
                                    "content": "No scheduled set maintenance/test.\nSend `/sst` to add one."}}]},
         }
 
-    elements: list[dict] = [
-        {"tag": "div", "text": {"tag": "lark_md",
-         "content": f"**{len(items)}** scheduled run(s) · saved in `{STORE_PATH.name}`"}},
-    ]
+    elements: list[dict] = []
     for e in items:
         w = _entry_when(e)
         when_txt = w.strftime("%Y-%m-%d %I:%M%p") if w else str(e.get("when"))
@@ -745,7 +777,8 @@ def build_list_card() -> dict:
             f"**{len(machines)}** machine(s)\n"
             f"`{names}`"
         )
-        elements.append({"tag": "hr"})
+        if elements:  # separator between entries only — no leading rule
+            elements.append({"tag": "hr"})
         elements.append({
             "tag": "div",
             "text": {"tag": "lark_md", "content": body[:1500]},
@@ -821,9 +854,11 @@ def handle_card_callback(
     fv = form_value if isinstance(form_value, dict) else {}
     patch: dict[str, Any] = {}
     if fv.get("sst_date"):
-        patch["date"] = str(fv.get("sst_date"))
+        norm_date = normalize_date_value(fv.get("sst_date"))
+        if norm_date:
+            patch["date"] = norm_date
     if fv.get("sst_time"):
-        patch["time"] = str(fv.get("sst_time"))
+        patch["time"] = str(fv.get("sst_time")).strip()
     if fv.get("sst_machines") is not None:
         patch["machines_text"] = str(fv.get("sst_machines") or "")
     if patch:
