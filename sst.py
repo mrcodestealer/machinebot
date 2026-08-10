@@ -74,6 +74,10 @@ def new_session(chat_id: str, *, thread_root: str | None = None) -> str:
             "test": False,
             "date": "",
             "time": "",
+            # target selection: "" (not chosen) | "game" | "machines"
+            "mode": "",
+            "env_code": "",
+            "game_type": "",
             "machines_text": "",
             "ts": time.time(),
         }
@@ -123,6 +127,75 @@ def selection_action(maint: bool, test: bool) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# environment / game-type catalogue (from webmachine_data.json)
+# ---------------------------------------------------------------------------
+SST_ENV_CODES: tuple[str, ...] = ("NWR", "NCH", "TBR", "TBP", "MDR", "DHS", "CP", "WF")
+
+
+def _norm_key(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def _prod_rows() -> list[dict]:
+    from maintenancemachineagent import load_webmachine_rows
+
+    return [r for r in load_webmachine_rows()
+            if str(r.get("environment") or "PROD").strip().upper() == "PROD"]
+
+
+def _env_rows(env_code: str) -> list[dict]:
+    """Rows for one environment (handles NWR being stored as ``belongs=NP``)."""
+    from maintenancemachineagent import _row_matches_env
+
+    return [r for r in _prod_rows() if _row_matches_env(r, (env_code or "").strip().upper())]
+
+
+def list_game_types(env_code: str) -> list[tuple[str, int]]:
+    """``[(game_type, machine_count)]`` for one environment, most machines first."""
+    counts: dict[str, int] = {}
+    for r in _env_rows(env_code):
+        gt = str(r.get("game_type") or "").strip()
+        if gt:
+            counts[gt] = counts.get(gt, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0].lower()))
+
+
+def _row_to_machine(row: dict) -> dict:
+    return {
+        "belongs": str(row.get("belongs") or "").strip(),
+        "machine": str(row.get("name") or row.get("machine") or "").strip(),
+        "status": str(row.get("status") or "").strip(),
+        "online": str(row.get("online") or "").strip(),
+        "is_test": bool(row.get("is_test")),
+    }
+
+
+def machines_for_game_type(env_code: str, game_type: str) -> list[dict]:
+    """
+    Machines of one environment + game type.
+
+    Matched on a normalised key so ``Rising Rockets`` finds ``RISINGROCKETS``. Unlike the
+    free-text group flow this never falls back to "all machines in the environment" — an
+    unmatched game type returns an empty list so the caller reports it instead of widening.
+    """
+    want = _norm_key(game_type)
+    if not want:
+        return []
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for r in _env_rows(env_code):
+        if _norm_key(str(r.get("game_type") or "")) != want:
+            continue
+        m = _row_to_machine(r)
+        key = (m["belongs"].upper(), m["machine"])
+        if not m["machine"] or key in seen:
+            continue
+        seen.add(key)
+        out.append(m)
+    return sorted(out, key=lambda x: x["machine"].lower())
+
+
+# ---------------------------------------------------------------------------
 # form card
 # ---------------------------------------------------------------------------
 def _time_options() -> list[dict]:
@@ -161,6 +234,58 @@ def _toggle_button(label: str, *, on: bool, sid: str, which: str) -> dict:
         "behaviors": [{"type": "callback", "value": {"k": SST_CARD_KEY, "a": "toggle",
                                                      "s": sid, "w": which}}],
     }
+
+
+def _form_button(label: str, name: str, value: dict, *, kind: str = "default") -> dict:
+    """A form button that submits (so the form's current values reach us) and calls back."""
+    return {
+        "tag": "button",
+        "name": name,
+        "text": {"tag": "plain_text", "content": label[:60]},
+        "type": kind,
+        "form_action_type": "submit",
+        "behaviors": [{"type": "callback", "value": {"k": SST_CARD_KEY, **value}}],
+    }
+
+
+def _btn_row(buttons: list[dict]) -> dict:
+    return {
+        "tag": "column_set",
+        "flex_mode": "bisect",
+        "columns": [
+            {"tag": "column", "width": "weighted", "weight": 1, "elements": [b]}
+            for b in buttons
+        ],
+    }
+
+
+def _back_row(sid: str) -> dict:
+    return _btn_row([
+        _form_button("◀ Change target", "sst_back", {"a": "back", "s": sid}),
+        {
+            "tag": "button",
+            "name": "sst_cancel",
+            "text": {"tag": "plain_text", "content": "Cancel"},
+            "type": "danger",
+            "behaviors": [{"type": "callback",
+                           "value": {"k": SST_CARD_KEY, "a": "cancel", "s": sid}}],
+        },
+    ])
+
+
+def _confirm_row(sid: str, *, with_back: bool = False) -> dict:
+    buttons = [_form_button("Confirm", "sst_confirm", {"a": "confirm", "s": sid}, kind="primary")]
+    if with_back:
+        buttons.append(_form_button("◀ Change target", "sst_back", {"a": "back", "s": sid}))
+    buttons.append({
+        "tag": "button",
+        "name": "sst_cancel",
+        "text": {"tag": "plain_text", "content": "Cancel"},
+        "type": "danger",
+        "behaviors": [{"type": "callback",
+                       "value": {"k": SST_CARD_KEY, "a": "cancel", "s": sid}}],
+    })
+    return _btn_row(buttons)
 
 
 def build_form_card(sid: str, session: dict[str, Any]) -> dict:
@@ -224,31 +349,70 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
             ],
         },
         {"tag": "div", "text": {"tag": "lark_md", "content": selection_text(maint, test)}},
-        machines_el,
-        {
-            "tag": "column_set",
-            "flex_mode": "bisect",
-            "columns": [
-                {"tag": "column", "width": "weighted", "weight": 1, "elements": [{
-                    "tag": "button",
-                    "name": "sst_confirm",
-                    "text": {"tag": "plain_text", "content": "Confirm"},
-                    "type": "primary",
-                    "form_action_type": "submit",
-                    "behaviors": [{"type": "callback",
-                                   "value": {"k": SST_CARD_KEY, "a": "confirm", "s": sid}}],
-                }]},
-                {"tag": "column", "width": "weighted", "weight": 1, "elements": [{
-                    "tag": "button",
-                    "name": "sst_cancel",
-                    "text": {"tag": "plain_text", "content": "Cancel"},
-                    "type": "danger",
-                    "behaviors": [{"type": "callback",
-                                   "value": {"k": SST_CARD_KEY, "a": "cancel", "s": sid}}],
-                }]},
-            ],
-        },
     ]
+
+    # ---- target section: Game Type wizard or the machines textarea -------------------
+    mode = str(session.get("mode") or "")
+    env_code = str(session.get("env_code") or "").strip().upper()
+    game_type = str(session.get("game_type") or "").strip()
+    hint = "Pick **date** and **time**, choose **Maintenance** / **Test**, then choose a target."
+
+    if not mode:
+        form_elements += [
+            {"tag": "div", "text": {"tag": "lark_md", "content": "**Target** — choose one:"}},
+            _btn_row([
+                _form_button("Game Type", "sst_mode_game", {"a": "mode", "s": sid, "m": "game"},
+                             kind="primary"),
+                _form_button("Machines", "sst_mode_machines", {"a": "mode", "s": sid, "m": "machines"},
+                             kind="primary"),
+            ]),
+        ]
+    elif mode == "machines":
+        hint = "Paste the machines (one per line), then tap **Confirm**."
+        form_elements += [
+            {"tag": "div", "text": {"tag": "lark_md", "content": "**Target:** Machines"}},
+            machines_el,
+            _confirm_row(sid, with_back=True),
+        ]
+    elif not env_code:
+        hint = "Select the **environment** for the game type."
+        rows = [SST_ENV_CODES[i:i + 4] for i in range(0, len(SST_ENV_CODES), 4)]
+        form_elements.append({"tag": "div", "text": {"tag": "lark_md",
+                              "content": "**Target:** Game Type — select environment:"}})
+        for chunk in rows:
+            form_elements.append(_btn_row([
+                _form_button(code, f"sst_env_{code}", {"a": "env", "s": sid, "e": code})
+                for code in chunk
+            ]))
+        form_elements.append(_back_row(sid))
+    elif not game_type:
+        hint = f"Select the **game type** in **{env_code}**."
+        gts = list_game_types(env_code)
+        form_elements.append({"tag": "div", "text": {"tag": "lark_md",
+                              "content": f"**Environment:** {env_code} — select game type:"}})
+        if not gts:
+            form_elements.append({"tag": "div", "text": {"tag": "lark_md",
+                                  "content": f"_No game types found for {env_code}._"}})
+        for i in range(0, len(gts[:30]), 2):
+            chunk = gts[i:i + 2]
+            form_elements.append(_btn_row([
+                _form_button(f"{gt} ({n})", f"sst_gt_{i + j}",
+                             {"a": "gt", "s": sid, "g": gt})
+                for j, (gt, n) in enumerate(chunk)
+            ]))
+        form_elements.append(_back_row(sid))
+    else:
+        machines = machines_for_game_type(env_code, game_type)
+        hint = "Review the machines, then tap **Confirm**."
+        names = "\n".join(f"• `{m['machine']}`" for m in machines[:25])
+        more = f"\n… and {len(machines) - 25} more" if len(machines) > 25 else ""
+        body = (f"**Environment:** {env_code}\n**Game type:** {game_type}\n"
+                f"**Machines:** {len(machines)}\n\n{names}{more}")
+        if not machines:
+            body = (f"**Environment:** {env_code}\n**Game type:** {game_type}\n\n"
+                    f"⚠️ No machines found for this game type.")
+        form_elements.append({"tag": "div", "text": {"tag": "lark_md", "content": body[:2500]}})
+        form_elements.append(_confirm_row(sid, with_back=True))
 
     return {
         "schema": "2.0",
@@ -256,9 +420,7 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
         "header": {"template": "orange",
                    "title": {"tag": "plain_text", "content": "🧪 Scheduled Set Maintenance / Test"}},
         "body": {"elements": [
-            {"tag": "div", "text": {"tag": "lark_md",
-             "content": "Pick the **date** and **time**, choose **Maintenance** and/or **Test**, "
-                        "then paste the machines (one per line) and tap **Confirm**."}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": hint}},
             {"tag": "form", "name": "sst_form", "elements": form_elements},
         ]},
     }
@@ -377,6 +539,10 @@ def build_review_card(sid: str, session: dict[str, Any], found: list[dict], when
     lines = [
         f"**When:** {when.strftime('%Y-%m-%d %I:%M%p')}",
         f"**Action:** Set {_action_words(maint, test)}",
+    ]
+    if session.get("game_type"):
+        lines.append(f"**Game type:** {session.get('env_code')} · {session.get('game_type')}")
+    lines += [
         f"**Reminder:** {SST_REMINDER_LEAD_MIN} min before "
         f"({(when - timedelta(minutes=SST_REMINDER_LEAD_MIN)).strftime('%I:%M%p')})",
         f"**Machines:** {len(found)}",
@@ -803,6 +969,38 @@ def build_list_card() -> dict:
 # ---------------------------------------------------------------------------
 # card-callback handling (answers inside Lark's 3 s window)
 # ---------------------------------------------------------------------------
+def resolve_session_target(session: dict[str, Any]) -> tuple[list[dict], str]:
+    """
+    Resolve the session's target to machines. Returns ``(found, error_message)``.
+
+    Game-type mode never widens to the whole environment — an unmatched game type is an error,
+    not "all machines of that site".
+    """
+    mode = str(session.get("mode") or "")
+    if mode == "game":
+        env_code = str(session.get("env_code") or "").strip().upper()
+        game_type = str(session.get("game_type") or "").strip()
+        if not (env_code and game_type):
+            return [], "Kindly select the environment and game type."
+        found = machines_for_game_type(env_code, game_type)
+        if not found:
+            return [], f"{game_type} is not detected in {env_code}. Try again."
+        return found, ""
+
+    tokens = parse_machine_lines(str(session.get("machines_text") or ""))
+    if not tokens:
+        return [], "Kindly type at least one machine (one per line)."
+    found, missing, ambiguous = resolve_machines(tokens)
+    if missing:
+        return [], f"{missing[0]} is not detected. Try again."
+    if ambiguous:
+        names = ", ".join(c["machine"] for c in ambiguous[0]["candidates"][:4])
+        return [], f"{ambiguous[0]['token']} matches several machines ({names}). Be more specific."
+    if not found:
+        return [], "No machines resolved. Try again."
+    return found, ""
+
+
 def _toast(kind: str, content: str) -> dict:
     return {"toast": {"type": kind, "content": content[:180]}}
 
@@ -882,6 +1080,31 @@ def handle_card_callback(
             session = update_session(sid, **{which: not bool(session.get(which))}) or session
         return _card_reply(build_form_card(sid, session))
 
+    if act == "mode":
+        m = str(parsed.get("m") or "").strip().lower()
+        if m not in ("game", "machines"):
+            return _toast("error", "Unknown target type.")
+        session = update_session(sid, mode=m, env_code="", game_type="") or session
+        return _card_reply(build_form_card(sid, session))
+
+    if act == "back":
+        session = update_session(sid, mode="", env_code="", game_type="") or session
+        return _card_reply(build_form_card(sid, session))
+
+    if act == "env":
+        code = str(parsed.get("e") or "").strip().upper()
+        if code not in SST_ENV_CODES:
+            return _toast("error", f"Unknown environment: {code}")
+        session = update_session(sid, env_code=code, game_type="") or session
+        return _card_reply(build_form_card(sid, session))
+
+    if act == "gt":
+        gt = str(parsed.get("g") or "").strip()
+        if not gt:
+            return _toast("error", "Unknown game type.")
+        session = update_session(sid, game_type=gt) or session
+        return _card_reply(build_form_card(sid, session))
+
     if act == "confirm":
         maint, test = bool(session.get("maint")), bool(session.get("test"))
         if not (maint or test):
@@ -889,28 +1112,19 @@ def handle_card_callback(
         when = parse_when(str(session.get("date") or ""), str(session.get("time") or ""))
         if when is None:
             return _toast("error", "Kindly pick both the date and the time.")
-        tokens = parse_machine_lines(str(session.get("machines_text") or ""))
-        if not tokens:
-            return _toast("error", "Kindly type at least one machine (one per line).")
 
-        found, missing, ambiguous = resolve_machines(tokens)
-        if missing:
-            return _toast("error", f"{missing[0]} is not detected. Try again.")
-        if ambiguous:
-            names = ", ".join(c["machine"] for c in ambiguous[0]["candidates"][:4])
-            return _toast("error", f"{ambiguous[0]['token']} matches several machines ({names}). Be more specific.")
-        if not found:
-            return _toast("error", "No machines resolved. Try again.")
+        found, err = resolve_session_target(session)
+        if err:
+            return _toast("error", err)
         return _card_reply(build_review_card(sid, session, found, when))
 
     if act == "schedule":
         when = parse_when(str(session.get("date") or ""), str(session.get("time") or ""))
         if when is None:
             return _toast("error", "Kindly pick both the date and the time.")
-        tokens = parse_machine_lines(str(session.get("machines_text") or ""))
-        found, missing, _amb = resolve_machines(tokens)
-        if missing:
-            return _toast("error", f"{missing[0]} is not detected. Try again.")
+        found, err = resolve_session_target(session)
+        if err:
+            return _toast("error", err)
         ok, msg = schedule_session(
             sid, session, found, when,
             scheduler=scheduler, send_card=send_card, run_batch=run_batch,
