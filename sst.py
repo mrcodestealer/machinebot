@@ -177,6 +177,37 @@ def _row_to_machine(row: dict) -> dict:
     }
 
 
+def machine_lines(machines: list[dict], *, detail: bool = False, max_chars: int = 12_000) -> str:
+    """
+    Render **every** machine as its own bullet.
+
+    A long list costs no extra elements against Lark's 200-element cap (it is one text element),
+    so the only real bound is the 30 KB message body — hence the generous ``max_chars`` guard,
+    which only bites for lists far larger than any single game type in the data.
+    """
+    lines = []
+    for m in machines:
+        name = str(m.get("machine") or "")
+        if not name:
+            continue
+        if detail:
+            bits = " · ".join(str(m.get(k) or "") for k in ("belongs", "status", "online") if m.get(k))
+            lines.append(f"• `{name}`" + (f"  — {bits}" if bits else ""))
+        else:
+            lines.append(f"• `{name}`")
+    txt = "\n".join(lines)
+    if len(txt) <= max_chars:
+        return txt
+    kept: list[str] = []
+    used = 0
+    for ln in lines:
+        if used + len(ln) + 1 > max_chars:
+            break
+        kept.append(ln)
+        used += len(ln) + 1
+    return "\n".join(kept) + f"\n… {len(lines) - len(kept)} more not shown (message size limit)"
+
+
 def machines_for_game_type(env_code: str, game_type: str) -> list[dict]:
     """
     Machines of one environment + game type.
@@ -382,25 +413,35 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
     form_elements: list[dict] = [
         {"tag": "div", "text": {"tag": "plain_text", "content": "Date"}},
         date_el,
-        {"tag": "div", "text": {"tag": "plain_text", "content": "Time (hour : minute)"}},
-        _btn_row([
-            {
-                "tag": "select_static",
-                "name": "sst_hour",
-                "placeholder": {"tag": "plain_text", "content": "Hour"},
-                "options": _hour_options(),
-                "required": False,
-                "initial_index": _initial_index(_hour_options(), hour_v, "9AM"),
-            },
-            {
-                "tag": "select_static",
-                "name": "sst_min",
-                "placeholder": {"tag": "plain_text", "content": "Min"},
-                "options": _minute_options(),
-                "required": False,
-                "initial_index": _initial_index(_minute_options(), min_v, "30"),
-            },
-        ]),
+        {"tag": "div", "text": {"tag": "plain_text", "content": "Time"}},
+        # {hour dropdown} : {minute dropdown} — a narrow middle column holds the ":" separator.
+        {
+            "tag": "column_set",
+            "flex_mode": "none",
+            "horizontal_spacing": "8px",
+            "columns": [
+                {"tag": "column", "width": "weighted", "weight": 5, "vertical_align": "center",
+                 "elements": [{
+                     "tag": "select_static",
+                     "name": "sst_hour",
+                     "placeholder": {"tag": "plain_text", "content": "Hour"},
+                     "options": _hour_options(),
+                     "required": False,
+                     "initial_index": _initial_index(_hour_options(), hour_v, "9AM"),
+                 }]},
+                {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center",
+                 "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": ":"}}]},
+                {"tag": "column", "width": "weighted", "weight": 5, "vertical_align": "center",
+                 "elements": [{
+                     "tag": "select_static",
+                     "name": "sst_min",
+                     "placeholder": {"tag": "plain_text", "content": "Minutes"},
+                     "options": _minute_options(),
+                     "required": False,
+                     "initial_index": _initial_index(_minute_options(), min_v, "30"),
+                 }]},
+            ],
+        },
         {"tag": "div", "text": {"tag": "lark_md", "content": "**What to set** — tap to select:"}},
         _btn_row([
             _toggle_button("Maintenance", on=maint, sid=sid, which="maint"),
@@ -460,14 +501,12 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
     else:
         machines = machines_for_game_type(env_code, game_type)
         hint = "Review the machines, then tap **Confirm**."
-        names = "\n".join(f"• `{m['machine']}`" for m in machines[:25])
-        more = f"\n… and {len(machines) - 25} more" if len(machines) > 25 else ""
         body = (f"**Environment:** {env_code}\n**Game type:** {game_type}\n"
-                f"**Machines:** {len(machines)}\n\n{names}{more}")
+                f"**Machines:** {len(machines)}\n\n{machine_lines(machines)}")
         if not machines:
             body = (f"**Environment:** {env_code}\n**Game type:** {game_type}\n\n"
                     f"⚠️ No machines found for this game type.")
-        form_elements.append({"tag": "div", "text": {"tag": "lark_md", "content": body[:2500]}})
+        form_elements.append({"tag": "div", "text": {"tag": "lark_md", "content": body}})
         form_elements += _confirm_rows(sid, with_back=True)
 
     return {
@@ -604,11 +643,7 @@ def build_review_card(sid: str, session: dict[str, Any], found: list[dict], when
         f"**Machines:** {len(found)}",
         "",
     ]
-    for f in found[:60]:
-        bits = " · ".join(str(f.get(k) or "") for k in ("belongs", "status", "online") if f.get(k))
-        lines.append(f"• `{f.get('machine')}`" + (f"  — {bits}" if bits else ""))
-    if len(found) > 60:
-        lines.append(f"… and {len(found) - 60} more")
+    lines.append(machine_lines(found, detail=True))
 
     return {
         "schema": "2.0",
@@ -616,7 +651,7 @@ def build_review_card(sid: str, session: dict[str, Any], found: list[dict], when
         "header": {"template": "orange",
                    "title": {"tag": "plain_text", "content": "🧪 Confirm scheduled Set Maintenance / Test"}},
         "body": {"elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)[:4000]}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}},
             {"tag": "div", "text": {"tag": "lark_md",
              "content": "_All machines were found. Confirm to schedule._"}},
             {"tag": "column_set", "flex_mode": "none", "columns": [
@@ -657,11 +692,8 @@ def _details_md(session: dict[str, Any], found: list[dict], when: datetime) -> s
         f"**When:** {when.strftime('%Y-%m-%d %I:%M%p')}",
         f"**Action:** Set {_action_words(maint, test)}",
         f"**Machines ({len(found)}):**",
+        machine_lines(found),
     ]
-    for f in found[:60]:
-        lines.append(f"• `{f.get('machine')}`")
-    if len(found) > 60:
-        lines.append(f"… and {len(found) - 60} more")
     return "\n".join(lines)
 
 
@@ -680,8 +712,10 @@ def build_start_card(session: dict[str, Any], found: list[dict], when: datetime)
             "title": {"tag": "plain_text",
                       "content": f"▶️ Now will start set {_action_words(maint, test)}"},
         },
+        # No slicing: machine_lines() already bounds the list, and truncating here would cut the
+        # "Kindly monitor any issue happened." line off the end.
         "body": {"elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": body[:4000]}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": body}},
         ]},
     }
 
@@ -1209,7 +1243,7 @@ def handle_card_callback(
             "body": {"elements": [
                 {"tag": "div", "text": {"tag": "lark_md", "content": msg}},
                 {"tag": "div", "text": {"tag": "lark_md",
-                 "content": _details_md(session, found, when)[:3000]}},
+                 "content": _details_md(session, found, when)}},
             ]},
         })
 
