@@ -37,14 +37,21 @@ SST_REMINDER_LEAD_MIN = 10
 # must not be drivable from arbitrary chats. Override with ``SST_ALLOWED_CHAT_ID``.
 import os as _os  # noqa: E402  (kept local to this constant)
 
-SST_ALLOWED_CHAT_ID = (
-    _os.environ.get("SST_ALLOWED_CHAT_ID", "").strip()
-    or "oc_51b6fbf2636525acfb4ead3afa3c93ce"
+_DEFAULT_ALLOWED_CHATS = (
+    "oc_51b6fbf2636525acfb4ead3afa3c93ce",
+    "oc_ad9b5bdbb2826ba2ee9730920ef25432",
 )
+
+SST_ALLOWED_CHAT_IDS: tuple[str, ...] = tuple(
+    c for c in re.split(r"[,\s;]+", _os.environ.get("SST_ALLOWED_CHAT_IDS", "").strip()) if c
+) or _DEFAULT_ALLOWED_CHATS
+
+# Fallback target when a stored schedule predates per-chat tracking.
+SST_ALLOWED_CHAT_ID = SST_ALLOWED_CHAT_IDS[0]
 
 
 def chat_allowed(chat_id: str) -> bool:
-    return (chat_id or "").strip() == SST_ALLOWED_CHAT_ID
+    return (chat_id or "").strip() in SST_ALLOWED_CHAT_IDS
 
 _SESSIONS: dict[str, dict[str, Any]] = {}
 _SESSIONS_LOCK = threading.Lock()
@@ -266,6 +273,15 @@ def _btn_row(buttons: list[dict]) -> dict:
     }
 
 
+def _btn_rows(buttons: list[dict], per_row: int = 2) -> list[dict]:
+    """Chunk buttons into rows of at most ``per_row``.
+
+    Kept at 2 deliberately: every card state this bot renders successfully uses 2-column rows, and
+    the wider rows are the only structural difference in the state Lark rejected.
+    """
+    return [_btn_row(buttons[i:i + per_row]) for i in range(0, len(buttons), per_row)]
+
+
 def _back_row(sid: str) -> dict:
     return _btn_row([
         _form_button("◀ Change target", "sst_back", {"a": "back", "s": sid}),
@@ -280,7 +296,7 @@ def _back_row(sid: str) -> dict:
     ])
 
 
-def _confirm_row(sid: str, *, with_back: bool = False) -> dict:
+def _confirm_rows(sid: str, *, with_back: bool = False) -> list[dict]:
     buttons = [_form_button("Confirm", "sst_confirm", {"a": "confirm", "s": sid}, kind="primary")]
     if with_back:
         buttons.append(_form_button("◀ Change target", "sst_back", {"a": "back", "s": sid}))
@@ -292,7 +308,7 @@ def _confirm_row(sid: str, *, with_back: bool = False) -> dict:
         "behaviors": [{"type": "callback",
                        "value": {"k": SST_CARD_KEY, "a": "cancel", "s": sid}}],
     })
-    return _btn_row(buttons)
+    return _btn_rows(buttons)
 
 
 def build_form_card(sid: str, session: dict[str, Any]) -> dict:
@@ -373,18 +389,16 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
         form_elements += [
             {"tag": "div", "text": {"tag": "lark_md", "content": "**Target:** Machines"}},
             machines_el,
-            _confirm_row(sid, with_back=True),
+            *_confirm_rows(sid, with_back=True),
         ]
     elif not env_code:
         hint = "Select the **environment** for the game type."
-        rows = [SST_ENV_CODES[i:i + 4] for i in range(0, len(SST_ENV_CODES), 4)]
         form_elements.append({"tag": "div", "text": {"tag": "lark_md",
                               "content": "**Target:** Game Type — select environment:"}})
-        for chunk in rows:
-            form_elements.append(_btn_row([
-                _form_button(code, f"sst_env_{code}", {"a": "env", "s": sid, "e": code})
-                for code in chunk
-            ]))
+        form_elements += _btn_rows([
+            _form_button(code, f"sst_env_{code}", {"a": "env", "s": sid, "e": code})
+            for code in SST_ENV_CODES
+        ])
         form_elements.append(_back_row(sid))
     elif not game_type:
         hint = f"Select the **game type** in **{env_code}**."
@@ -413,7 +427,7 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
             body = (f"**Environment:** {env_code}\n**Game type:** {game_type}\n\n"
                     f"⚠️ No machines found for this game type.")
         form_elements.append({"tag": "div", "text": {"tag": "lark_md", "content": body[:2500]}})
-        form_elements.append(_confirm_row(sid, with_back=True))
+        form_elements += _confirm_rows(sid, with_back=True)
 
     return {
         "schema": "2.0",
@@ -826,7 +840,8 @@ def schedule_session(
     machines = [{k: v for k, v in m.items() if k != "token"} for m in found]
     entry = {
         "id": sid,
-        "chat_id": SST_ALLOWED_CHAT_ID,
+        # Post the reminder / start card back to the group the schedule was created in.
+        "chat_id": str(session.get("chat_id") or "").strip() or SST_ALLOWED_CHAT_ID,
         "when": when.isoformat(timespec="seconds"),
         "maint": bool(session.get("maint")),
         "test": bool(session.get("test")),
@@ -884,11 +899,16 @@ def restore_schedules(
         print(f"[sst]   re-armed {r}", flush=True)
     for m in missed:
         print(f"[sst]   MISSED {m['entry'].get('when')} — {m['note']}", flush=True)
-    if missed:
+    # Report missed runs to whichever group each schedule belonged to.
+    by_chat: dict[str, list[dict]] = {}
+    for m in missed:
+        cid = str(m["entry"].get("chat_id") or SST_ALLOWED_CHAT_ID)
+        by_chat.setdefault(cid, []).append(m)
+    for cid, items in by_chat.items():
         try:
-            send_card(SST_ALLOWED_CHAT_ID, build_missed_card(missed))
+            send_card(cid, build_missed_card(items))
         except Exception as e:  # noqa: BLE001
-            print(f"[sst] missed-card failed: {e!r}", flush=True)
+            print(f"[sst] missed-card failed for {cid}: {e!r}", flush=True)
     return {"restored": restored, "missed": missed}
 
 
