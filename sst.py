@@ -241,12 +241,9 @@ def machines_for_game_type(env_code: str, game_type: str) -> list[dict]:
 # wizard states (which add ~25 more elements) exceed the cap, so Lark rejected the card (200673).
 # Splitting into hour + minute keeps 10-minute granularity for 30 options instead of 144.
 def _hour_options() -> list[dict]:
-    out: list[dict] = []
-    for hh in range(24):
-        ap = "AM" if hh < 12 else "PM"
-        v = f"{hh % 12 or 12}{ap}"
-        out.append({"text": {"tag": "plain_text", "content": v}, "value": v})
-    return out
+    """1–12 — the AM/PM half is its own dropdown."""
+    return [{"text": {"tag": "plain_text", "content": str(h)}, "value": str(h)}
+            for h in range(1, 13)]
 
 
 def _minute_options() -> list[dict]:
@@ -254,26 +251,29 @@ def _minute_options() -> list[dict]:
             for m in range(0, 60, 10)]
 
 
-_HOUR_RE = re.compile(r"^(\d{1,2})(AM|PM)$", re.I)
+def _ampm_options() -> list[dict]:
+    return [{"text": {"tag": "plain_text", "content": v}, "value": v} for v in ("AM", "PM")]
 
 
-def combine_time(hour_v: str, minute_v: str) -> str:
-    """``("9PM", "30")`` → ``"9:30PM"`` (the format :func:`parse_when` already understands)."""
-    m = _HOUR_RE.match((hour_v or "").strip())
-    if not m:
-        return ""
+def combine_time(hour_v: str, minute_v: str, ampm_v: str) -> str:
+    """``("9", "30", "PM")`` → ``"9:30PM"`` (the format :func:`parse_when` understands)."""
+    hh = re.sub(r"\D", "", hour_v or "")
     mm = re.sub(r"\D", "", minute_v or "")
-    if mm == "":
+    ap = (ampm_v or "").strip().upper()
+    if not hh or mm == "" or ap not in ("AM", "PM"):
         return ""
-    return f"{int(m.group(1))}:{int(mm):02d}{m.group(2).upper()}"
+    h = int(hh)
+    if not 1 <= h <= 12:
+        return ""
+    return f"{h}:{int(mm):02d}{ap}"
 
 
-def split_time(time_v: str) -> tuple[str, str]:
-    """``"9:30PM"`` → ``("9PM", "30")`` so the two dropdowns can be pre-selected."""
+def split_time(time_v: str) -> tuple[str, str, str]:
+    """``"9:30PM"`` → ``("9", "30", "PM")`` so the three dropdowns can be pre-selected."""
     m = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)$", (time_v or "").strip(), re.I)
     if not m:
-        return "", ""
-    return f"{int(m.group(1))}{m.group(3).upper()}", m.group(2)
+        return "", "", ""
+    return str(int(m.group(1))), m.group(2), m.group(3).upper()
 
 
 def _initial_index(options: list[dict], want: str, default: str) -> int:
@@ -377,7 +377,7 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
     test = bool(session.get("test"))
     date_v = str(session.get("date") or "").strip()
     time_v = str(session.get("time") or "").strip()
-    hour_v, min_v = split_time(time_v)
+    hour_v, min_v, ampm_v = split_time(time_v)
     machines_v = str(session.get("machines_text") or "")
 
     date_el: dict[str, Any] = {
@@ -414,24 +414,24 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
         {"tag": "div", "text": {"tag": "plain_text", "content": "Date"}},
         date_el,
         {"tag": "div", "text": {"tag": "plain_text", "content": "Time"}},
-        # {hour dropdown} : {minute dropdown} — a narrow middle column holds the ":" separator.
+        # {hour} : {minutes} {AM/PM} — narrow middle column holds the ":" separator.
         {
             "tag": "column_set",
             "flex_mode": "none",
             "horizontal_spacing": "8px",
             "columns": [
-                {"tag": "column", "width": "weighted", "weight": 5, "vertical_align": "center",
+                {"tag": "column", "width": "weighted", "weight": 4, "vertical_align": "center",
                  "elements": [{
                      "tag": "select_static",
                      "name": "sst_hour",
                      "placeholder": {"tag": "plain_text", "content": "Hour"},
                      "options": _hour_options(),
                      "required": False,
-                     "initial_index": _initial_index(_hour_options(), hour_v, "9AM"),
+                     "initial_index": _initial_index(_hour_options(), hour_v, "9"),
                  }]},
                 {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center",
                  "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": ":"}}]},
-                {"tag": "column", "width": "weighted", "weight": 5, "vertical_align": "center",
+                {"tag": "column", "width": "weighted", "weight": 4, "vertical_align": "center",
                  "elements": [{
                      "tag": "select_static",
                      "name": "sst_min",
@@ -439,6 +439,15 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
                      "options": _minute_options(),
                      "required": False,
                      "initial_index": _initial_index(_minute_options(), min_v, "30"),
+                 }]},
+                {"tag": "column", "width": "weighted", "weight": 4, "vertical_align": "center",
+                 "elements": [{
+                     "tag": "select_static",
+                     "name": "sst_ampm",
+                     "placeholder": {"tag": "plain_text", "content": "AM/PM"},
+                     "options": _ampm_options(),
+                     "required": False,
+                     "initial_index": _initial_index(_ampm_options(), ampm_v, "AM"),
                  }]},
             ],
         },
@@ -1153,11 +1162,12 @@ def handle_card_callback(
             patch["date"] = norm_date
     if fv.get("sst_time"):  # legacy single-dropdown payload
         patch["time"] = str(fv.get("sst_time")).strip()
-    if fv.get("sst_hour") or fv.get("sst_min"):
-        cur_h, cur_m = split_time(str(session.get("time") or ""))
+    if fv.get("sst_hour") or fv.get("sst_min") or fv.get("sst_ampm"):
+        cur_h, cur_m, cur_ap = split_time(str(session.get("time") or ""))
         combined = combine_time(
-            str(fv.get("sst_hour") or cur_h or "9AM"),
+            str(fv.get("sst_hour") or cur_h or "9"),
             str(fv.get("sst_min") or cur_m or "30"),
+            str(fv.get("sst_ampm") or cur_ap or "AM"),
         )
         if combined:
             patch["time"] = combined
