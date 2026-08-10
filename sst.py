@@ -205,22 +205,49 @@ def machines_for_game_type(env_code: str, game_type: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 # form card
 # ---------------------------------------------------------------------------
-def _time_options() -> list[dict]:
-    """Every 10 minutes, 12-hour labels — same granularity as the reminder form."""
+# A single 10-minute dropdown needs 144 options, and Lark counts every option's text element
+# against its **200-element-per-card** limit — that alone consumed 144 of the budget and made the
+# wizard states (which add ~25 more elements) exceed the cap, so Lark rejected the card (200673).
+# Splitting into hour + minute keeps 10-minute granularity for 30 options instead of 144.
+def _hour_options() -> list[dict]:
     out: list[dict] = []
     for hh in range(24):
-        for mm in range(0, 60, 10):
-            ap = "AM" if hh < 12 else "PM"
-            hh12 = hh % 12 or 12
-            v = f"{hh12}:{mm:02d}{ap}"
-            out.append({"text": {"tag": "plain_text", "content": v}, "value": v})
+        ap = "AM" if hh < 12 else "PM"
+        v = f"{hh % 12 or 12}{ap}"
+        out.append({"text": {"tag": "plain_text", "content": v}, "value": v})
     return out
 
 
-def _initial_time_index(current: str) -> int:
-    opts = _time_options()
-    want = (current or "").strip() or "9:30AM"
-    return next((i + 1 for i, o in enumerate(opts) if o.get("value") == want), 1)
+def _minute_options() -> list[dict]:
+    return [{"text": {"tag": "plain_text", "content": f"{m:02d}"}, "value": f"{m:02d}"}
+            for m in range(0, 60, 10)]
+
+
+_HOUR_RE = re.compile(r"^(\d{1,2})(AM|PM)$", re.I)
+
+
+def combine_time(hour_v: str, minute_v: str) -> str:
+    """``("9PM", "30")`` → ``"9:30PM"`` (the format :func:`parse_when` already understands)."""
+    m = _HOUR_RE.match((hour_v or "").strip())
+    if not m:
+        return ""
+    mm = re.sub(r"\D", "", minute_v or "")
+    if mm == "":
+        return ""
+    return f"{int(m.group(1))}:{int(mm):02d}{m.group(2).upper()}"
+
+
+def split_time(time_v: str) -> tuple[str, str]:
+    """``"9:30PM"`` → ``("9PM", "30")`` so the two dropdowns can be pre-selected."""
+    m = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)$", (time_v or "").strip(), re.I)
+    if not m:
+        return "", ""
+    return f"{int(m.group(1))}{m.group(3).upper()}", m.group(2)
+
+
+def _initial_index(options: list[dict], want: str, default: str) -> int:
+    target = (want or "").strip() or default
+    return next((i + 1 for i, o in enumerate(options) if o.get("value") == target), 1)
 
 
 def _toggle_button(label: str, *, on: bool, sid: str, which: str) -> dict:
@@ -290,6 +317,9 @@ def _back_row(sid: str) -> dict:
             "name": "sst_cancel",
             "text": {"tag": "plain_text", "content": "Cancel"},
             "type": "danger",
+            # Required for any button inside a form container (submit|reset). The values are
+            # discarded on cancel, but omitting it is a documented spec violation.
+            "form_action_type": "submit",
             "behaviors": [{"type": "callback",
                            "value": {"k": SST_CARD_KEY, "a": "cancel", "s": sid}}],
         },
@@ -316,6 +346,7 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
     test = bool(session.get("test"))
     date_v = str(session.get("date") or "").strip()
     time_v = str(session.get("time") or "").strip()
+    hour_v, min_v = split_time(time_v)
     machines_v = str(session.get("machines_text") or "")
 
     date_el: dict[str, Any] = {
@@ -351,15 +382,25 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
     form_elements: list[dict] = [
         {"tag": "div", "text": {"tag": "plain_text", "content": "Date"}},
         date_el,
-        {"tag": "div", "text": {"tag": "plain_text", "content": "Time (every 10 minutes)"}},
-        {
-            "tag": "select_static",
-            "name": "sst_time",
-            "placeholder": {"tag": "plain_text", "content": "Select time"},
-            "options": _time_options(),
-            "required": False,
-            "initial_index": _initial_time_index(time_v),
-        },
+        {"tag": "div", "text": {"tag": "plain_text", "content": "Time (hour : minute)"}},
+        _btn_row([
+            {
+                "tag": "select_static",
+                "name": "sst_hour",
+                "placeholder": {"tag": "plain_text", "content": "Hour"},
+                "options": _hour_options(),
+                "required": False,
+                "initial_index": _initial_index(_hour_options(), hour_v, "9AM"),
+            },
+            {
+                "tag": "select_static",
+                "name": "sst_min",
+                "placeholder": {"tag": "plain_text", "content": "Min"},
+                "options": _minute_options(),
+                "required": False,
+                "initial_index": _initial_index(_minute_options(), min_v, "30"),
+            },
+        ]),
         {"tag": "div", "text": {"tag": "lark_md", "content": "**What to set** — tap to select:"}},
         _btn_row([
             _toggle_button("Maintenance", on=maint, sid=sid, which="maint"),
@@ -1076,8 +1117,16 @@ def handle_card_callback(
         norm_date = normalize_date_value(fv.get("sst_date"))
         if norm_date:
             patch["date"] = norm_date
-    if fv.get("sst_time"):
+    if fv.get("sst_time"):  # legacy single-dropdown payload
         patch["time"] = str(fv.get("sst_time")).strip()
+    if fv.get("sst_hour") or fv.get("sst_min"):
+        cur_h, cur_m = split_time(str(session.get("time") or ""))
+        combined = combine_time(
+            str(fv.get("sst_hour") or cur_h or "9AM"),
+            str(fv.get("sst_min") or cur_m or "30"),
+        )
+        if combined:
+            patch["time"] = combined
     if fv.get("sst_machines") is not None:
         patch["machines_text"] = str(fv.get("sst_machines") or "")
     if patch:

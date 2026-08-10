@@ -22,3 +22,8 @@ wm_warm_profile_*/
 prod_batch_egm_row_*.png
 *.log
 .tmp/
+
+# /sst runtime state (scheduled set maintenance/test jobs)
+scheduledSetMachine.json
+scheduledSetMachine.tmp
+scheduledSetMachine.test.json
