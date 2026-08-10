@@ -249,9 +249,16 @@ def _form_button(label: str, name: str, value: dict, *, kind: str = "default") -
 
 
 def _btn_row(buttons: list[dict]) -> dict:
+    """
+    One row of buttons.
+
+    ``flex_mode`` must NOT be ``bisect`` here — bisect means *exactly two* equal columns, so a row
+    of 3 (Confirm/Back/Cancel) or 4 (environments) made Lark reject the card. ``none`` + weighted
+    columns lays out any count, and is the pattern the prod-batch confirm card already uses.
+    """
     return {
         "tag": "column_set",
-        "flex_mode": "bisect",
+        "flex_mode": "none",
         "columns": [
             {"tag": "column", "width": "weighted", "weight": 1, "elements": [b]}
             for b in buttons
@@ -338,16 +345,10 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
             "initial_index": _initial_time_index(time_v),
         },
         {"tag": "div", "text": {"tag": "lark_md", "content": "**What to set** — tap to select:"}},
-        {
-            "tag": "column_set",
-            "flex_mode": "bisect",
-            "columns": [
-                {"tag": "column", "width": "weighted", "weight": 1,
-                 "elements": [_toggle_button("Maintenance", on=maint, sid=sid, which="maint")]},
-                {"tag": "column", "width": "weighted", "weight": 1,
-                 "elements": [_toggle_button("Test", on=test, sid=sid, which="test")]},
-            ],
-        },
+        _btn_row([
+            _toggle_button("Maintenance", on=maint, sid=sid, which="maint"),
+            _toggle_button("Test", on=test, sid=sid, which="test"),
+        ]),
         {"tag": "div", "text": {"tag": "lark_md", "content": selection_text(maint, test)}},
     ]
 
@@ -563,7 +564,7 @@ def build_review_card(sid: str, session: dict[str, Any], found: list[dict], when
             {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)[:4000]}},
             {"tag": "div", "text": {"tag": "lark_md",
              "content": "_All machines were found. Confirm to schedule._"}},
-            {"tag": "column_set", "flex_mode": "bisect", "columns": [
+            {"tag": "column_set", "flex_mode": "none", "columns": [
                 {"tag": "column", "width": "weighted", "weight": 1, "elements": [{
                     "tag": "button",
                     "text": {"tag": "plain_text", "content": "Confirm"},
