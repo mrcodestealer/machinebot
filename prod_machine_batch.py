@@ -488,12 +488,18 @@ def _ensure_env_egm_page(page, belongs: str, *, timeout_ms: int, max_pages: int)
 
 
 def _find_all_rows_for_target(page, kind: str, key: str, *, timeout_ms: int):
+    """
+    Rows on the **current** page matching ``key``, as a list holding at most the first match.
+
+    Every caller uses only ``rows[0]``, and each row costs ~6 Playwright round trips to read
+    (:func:`smmachine._row_match_text_for_target`), so scanning past the match was pure cost —
+    the sibling :func:`smmachine._find_row_for_target` already returns on first hit.
+    """
     rows = _table_body_rows(page)
     try:
         rows.first.wait_for(state="visible", timeout=min(15_000, timeout_ms))
     except Exception:
         pass
-    matched = []
     n = rows.count()
     for i in range(n):
         row = rows.nth(i)
@@ -501,8 +507,8 @@ def _find_all_rows_for_target(page, kind: str, key: str, *, timeout_ms: int):
         if not txt:
             continue
         if _row_text_matches(kind, key, txt):
-            matched.append(row)
-    return matched
+            return [row]
+    return []
 
 
 def _machine_lookup_specs(machines: list[dict]) -> list[tuple[str, dict, str, str]]:
@@ -748,6 +754,7 @@ def _row_state_indicates_maintenance(
     *,
     timeout_ms: int,
     check_toolbar: bool = False,
+    toolbar_wait_ms: int = 8_000,
 ) -> bool:
     """True when the EGM row is in maintenance (status text, row HTML, or toolbar buttons)."""
     _mn, _is_test, _gt, status, _online = _row_report_fields(row, timeout_ms=timeout_ms)
@@ -768,23 +775,56 @@ def _row_state_indicates_maintenance(
     except Exception:
         pass
     if check_toolbar:
-        return _toolbar_row_in_maintenance(page, row, timeout_ms=timeout_ms)
+        return _toolbar_row_in_maintenance(
+            page, row, timeout_ms=timeout_ms, toolbar_wait_ms=toolbar_wait_ms
+        )
     return False
 
 
-def _toolbar_row_in_maintenance(page, row, *, timeout_ms: int) -> bool:
+def _toolbar_row_in_maintenance(
+    page, row, *, timeout_ms: int, toolbar_wait_ms: int = 8_000
+) -> bool:
     """
     With the row selected: BatchStart Using enabled and BatchMaintenance disabled
     means maintenance mode is active even when the Status pill still reads ``occupy``.
+
+    Polls both buttons together and exits as soon as either outcome is decided, instead of
+    always waiting out the full budget for ``BatchStart Using`` to enable — on a row that is
+    NOT in maintenance (the retry-when-running case) that wait could never succeed, so it
+    burned its whole budget on every poll iteration. The verdict at the deadline is the same
+    expression as before.
+
+    Selecting the row is a side effect of this probe, so the tick is always cleared again: a
+    leftover tick is invisible to :func:`_clear_table_row_selection` once the table paginates
+    and would be consumed by the next batch click — applying maintenance to a machine nobody
+    asked for.
     """
     _ensure_row_checkbox_checked(page, row, timeout_ms=timeout_ms)
-    _wait_batch_toolbar_ready(page, "BatchStart Using", timeout_ms=timeout_ms, wait_ms=8_000)
-    start_btn = _locate_batch_toolbar_button(page, "BatchStart Using")
-    maint_btn = _locate_batch_toolbar_button(page, "BatchMaintenance")
-    return (
-        _batch_toolbar_button_actionable(start_btn)
-        and not _batch_toolbar_button_actionable(maint_btn)
-    )
+    try:
+        deadline = time.monotonic() + min(
+            toolbar_wait_ms / 1000.0, timeout_ms / 1000.0
+        )
+        while True:
+            start_ok = _batch_toolbar_button_actionable(
+                _locate_batch_toolbar_button(page, "BatchStart Using")
+            )
+            maint_ok = _batch_toolbar_button_actionable(
+                _locate_batch_toolbar_button(page, "BatchMaintenance")
+            )
+            if start_ok and not maint_ok:
+                return True
+            if maint_ok and not start_ok:
+                # BatchMaintenance still clickable ⇒ the row is not in maintenance. Decisive:
+                # nothing to wait for, and the deadline verdict would be False anyway.
+                return False
+            if time.monotonic() >= deadline:
+                return start_ok and not maint_ok
+            page.wait_for_timeout(_fast_ms(250))
+    finally:
+        try:
+            _ensure_row_checkbox_unchecked(page, row, timeout_ms=timeout_ms)
+        except Exception:
+            pass
 
 
 _ROW_MAINT_BTN_PAT = re.compile(r"Maintenance|维护", re.I)
@@ -987,9 +1027,20 @@ def _verify_set_maint_applied(
             page, machine_name, timeout_ms=timeout_ms, max_pages=max_pages
         )
         if row is not None and _row_state_indicates_maintenance(
-            page, row, timeout_ms=timeout_ms, check_toolbar=True
+            page,
+            row,
+            timeout_ms=timeout_ms,
+            check_toolbar=True,
+            # The toolbar signal lands within a tick of the checkbox tick that
+            # _ensure_row_checkbox_checked already waited for; a long budget only ever
+            # pays off on a row that will never enable BatchStart Using.
+            toolbar_wait_ms=1_500,
         ):
             return True
+        # The deadline is only tested at the top of the loop, so without this a blown budget
+        # still paid for a settle + refresh + a second full pagination walk.
+        if time.monotonic() >= deadline:
+            return False
         _page_pause(page, 1200)
         _refresh_egm_table(page, timeout_ms=timeout_ms, max_pages=max_pages)
         live = _read_live_row_state(
@@ -1237,10 +1288,64 @@ def _dismiss_batch_confirm_cancel(page, *, timeout_ms: int) -> bool:
     return False
 
 
+_ROW_CHECKED_FLAGS_JS = """els => els.map(el => {
+  for (const s of [
+    'td.el-table-column--selection input.el-checkbox__original',
+    'td.el-table-column--selection input[type="checkbox"]',
+    'input.el-checkbox__original',
+    '.el-checkbox input[type="checkbox"]'
+  ]) {
+    const i = el.querySelector(s);
+    if (i) return !!i.checked;
+  }
+  return false;
+})"""
+
+
+def _row_checked_flags(page, rows, expected: int) -> list[bool] | None:
+    """
+    Per-row checkbox state in ONE round trip, or ``None`` if it could not be read cleanly.
+
+    Reads the ``checked`` **property** (like :func:`smmachine._read_dom_checked`) — Element UI
+    has no ``.checked`` CSS class, so a selector-based test would silently report nothing
+    selected and let stale ticks ride into the next batch click.
+    """
+    try:
+        flags = rows.evaluate_all(_ROW_CHECKED_FLAGS_JS)
+    except Exception:
+        return None
+    if not isinstance(flags, list) or len(flags) != expected:
+        return None
+    return [bool(f) for f in flags]
+
+
 def _clear_table_row_selection(page, *, timeout_ms: int) -> None:
-    """Uncheck every visible row checkbox on the current page."""
+    """
+    Uncheck every visible row checkbox on the current page.
+
+    The per-row probe is expensive (scroll_into_view + attach wait + DOM read on every row,
+    even when nothing is ticked), so ask the page which rows are actually checked first and
+    only touch those. Falls back to the exhaustive sweep whenever that read is not trustworthy
+    or does not fully clear — never the other way round, so a stale tick cannot survive.
+    """
     rows = _table_body_rows(page)
     n = rows.count()
+    if not n:
+        return
+
+    flags = _row_checked_flags(page, rows, n)
+    if flags is not None:
+        for i in (idx for idx, f in enumerate(flags) if f):
+            try:
+                _ensure_row_checkbox_unchecked(page, rows.nth(i), timeout_ms=timeout_ms)
+            except Exception:
+                flags = None
+                break
+    if flags is not None:
+        after = _row_checked_flags(page, rows, n)
+        if after is not None and not any(after):
+            return
+
     for i in range(n):
         try:
             _ensure_row_checkbox_unchecked(page, rows.nth(i), timeout_ms=timeout_ms)
@@ -1814,9 +1919,9 @@ def _process_env_batch(
     if cancel_check() or manual_stop_check() or not selected:
         return ok_list, fail_list
 
-    for btn in buttons:
-        _wait_batch_toolbar_ready(page, btn, timeout_ms=timeout_ms)
-
+    # No pre-wait loop here: _submit_batch_action waits for the same button itself, so this
+    # was a strict duplicate whose return value was discarded — and it paid a second full 12s
+    # budget on every attempt whenever the button stayed disabled.
     for btn in buttons:
         if cancel_check() or manual_stop_check():
             break
@@ -2100,7 +2205,14 @@ def _run_phased_env(
             continue
         live = final_states.get(name)
         verified = bool(live and _verify_live_state(live, parent_action))
-        if not verified and parent_action == "set_maint":
+        # `parent_action` here is always a PHASED_STEPS key (set_both / unset_both), so the old
+        # `== "set_maint"` gate was unreachable and the toolbar rescue never ran: an occupy row
+        # whose maintenance WAS applied still reads `occupy` in the Status pill, so a set_both
+        # that fully succeeded got reported as "final EGM check failed" and re-run by hand.
+        # Only set_both may escalate — for unset_both a missing maintenance half means the machine
+        # is STILL in maintenance, and _verify_set_maint_applied returns True exactly then, which
+        # would report a failed unset as success.
+        if not verified and parent_action == "set_both" and live and live.get("test"):
             verified = _verify_set_maint_applied(
                 page,
                 name,
@@ -2111,7 +2223,7 @@ def _run_phased_env(
         if verified:
             all_ok.append({"belongs": m.get("belongs", belongs), "machine": name})
         else:
-            if parent_action == "set_maint" and live and _status_is_occupy(str(live.get("status") or "")):
+            if parent_action in ("set_maint", "set_both") and live and _status_is_occupy(str(live.get("status") or "")):
                 err = "game currently running"
             else:
                 detail = ""
@@ -2344,8 +2456,10 @@ class _ProdEnvWarm:
             box["fail"] = fail
             shots: list[dict[str, Any]] = []
             shot_errs: list[dict[str, Any]] = []
-            if task["want_shots"] and task["machines"] and not task["cancel_check"]() \
-                    and not _prod_batch_fast_mode():
+            # Not gated on fast mode: skipping the in-run capture does not save the work, it
+            # moves it to smmachine's background fallback, which launches a SECOND Chromium and
+            # re-logs-in to the same backend. Capturing here reuses this warm, logged-in page.
+            if task["want_shots"] and task["machines"] and not task["cancel_check"]():
                 try:
                     shots, shot_errs = _capture_prod_batch_screenshots_on_page(
                         self._page, task["machines"], timeout_ms=timeout_ms, max_pages=max_pages
@@ -2655,7 +2769,9 @@ def run_prod_batch_job(
                 all_ok.extend(ok)
                 all_fail.extend(fail)
 
-            if want_shots and machines and not cancel_check() and not _prod_batch_fast_mode():
+            # See the warm-path note above: gating this on fast mode pushed the capture onto a
+            # second cold Chromium + login instead of reusing this already-logged-in page.
+            if want_shots and machines and not cancel_check():
                 try:
                     shot_list, shot_errs = _capture_prod_batch_screenshots_on_page(
                         page, machines, timeout_ms=timeout_ms, max_pages=max_pages
