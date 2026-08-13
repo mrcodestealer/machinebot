@@ -61,7 +61,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import requests
@@ -1405,8 +1405,16 @@ def run_checkcredit_finderror(
     mode: str = "default",
     navigator_logic_log_basename: Optional[str] = None,
     thread_root_message_id: Optional[str] = None,
+    prev_day_fallback: bool = False,
 ):
-    """Background: same as checkcredit + `--date`. Uses OSS HTTP by default (see checkcredit_use_oss_source)."""
+    """
+    Background: same as checkcredit + `--date`. Uses OSS HTTP by default (see checkcredit_use_oss_source).
+
+    ``prev_day_fallback`` retries the previous day's log when today's has no player with a
+    credit time (the ``last credit n/a @ n/a`` card, whose buttons cannot be actioned). Only
+    set it when the caller did NOT pin a date — an explicit ``/checkcredit <m> YYYY-MM-DD``
+    asked about that day, so silently answering about a different one would be wrong.
+    """
     thread_root = (thread_root_message_id or _get_checkcredit_thread_root(chat_id) or "").strip() or None
     if thread_root:
         _set_checkcredit_thread_root(chat_id, thread_root)
@@ -1441,6 +1449,52 @@ def run_checkcredit_finderror(
             source="oss" if use_oss else "navigator",
             navigator_logic_log_basename=navigator_logic_log_basename,
         )
+        # No player with a credit time today → the card would list user IDs as
+        # `last credit n/a @ n/a` and every button on it would dead-end (the Third Http window
+        # needs time_short). Look at the previous day's log instead. Skipped for error_only:
+        # "no player hit an error today" is a real answer there, not a missing-data case.
+        fallback_note = ""
+        is_error_only = str(mode or "").strip().lower() == "error_only"
+        if (
+            prev_day_fallback
+            and not is_error_only
+            and callable(getattr(checkcredit, "np_choices_actionable", None))
+            and not checkcredit.np_choices_actionable(out.get("np_followup"), mode=mode)
+        ):
+            prev_td = td - timedelta(days=1)
+            _cc_send(
+                f"ℹ️ No player with a credit time in the `{td.isoformat()}` log for "
+                f"`{machine_query}` — checking the previous day `{prev_td.isoformat()}` …"
+            )
+            try:
+                prev_out = checkcredit.run_finderror(
+                    str(machine_query).strip(),
+                    target_date=prev_td,
+                    timeout_ms=max(15_000, 90_000),
+                    base=_cc_base,
+                    user=checkcredit.DEFAULT_USER,
+                    pw=checkcredit.DEFAULT_PASS,
+                    source="oss" if use_oss else "navigator",
+                    # A same-day alternate logic log does not carry over to another date.
+                    navigator_logic_log_basename=None,
+                )
+            except Exception as ex:
+                prev_out = None
+                print(f"[checkcredit] previous-day fallback failed: {ex!r}", flush=True)
+            if isinstance(prev_out, dict) and checkcredit.np_choices_actionable(
+                prev_out.get("np_followup"), mode=mode
+            ):
+                out = prev_out
+                td = prev_td
+                fallback_note = (
+                    f"⚠️ Nothing in today's log — this is the **previous day** "
+                    f"(`{prev_td.isoformat()}`)."
+                )
+            else:
+                _cc_send(
+                    f"ℹ️ `{prev_td.isoformat()}` has no player with a credit time either — "
+                    f"showing the `{td.isoformat()}` result below."
+                )
         text = (out.get("text") or "").strip()
         np = out.get("np_followup")
         preview_img_path = None
@@ -1515,6 +1569,10 @@ def run_checkcredit_finderror(
                                         machineerror_fb.append(chunk)
                     else:
                         intro_line = str(np.get("np_choice_intro") or "").strip()
+                    if fallback_note:
+                        intro_line = (
+                            f"{fallback_note}\n\n{intro_line}" if intro_line else fallback_note
+                        )
                     same_last_line = ""
                     if str(mode or "").strip().lower() != "error_only":
                         same_last_line = str(np.get("same_last_line") or "")
@@ -2959,6 +3017,9 @@ def _handle_machine_message(
         cmd_cc = (m_cc.group(1) or "").strip().lower()
         machine_q = m_cc.group(2).strip()
         date_arg = (m_cc.group(3) or "").strip()
+        # Only an implicit (defaulted-to-today) date may fall back to the previous day —
+        # an explicit date is a question about that day.
+        date_explicit = bool(date_arg)
         if not date_arg:
             date_arg = datetime.now().strftime("%Y-%m-%d")
         try:
@@ -2991,6 +3052,7 @@ def _handle_machine_message(
             "error_only" if cmd_cc == "machineerror" else "default",
             None,
             thread_root,
+            prev_day_fallback=not date_explicit,
         )
         return
 

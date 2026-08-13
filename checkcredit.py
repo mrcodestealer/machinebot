@@ -1648,6 +1648,36 @@ def _np_lark_v2_button_row(buttons: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def np_choices_actionable(
+    np_followup: dict[str, Any] | list[dict[str, Any]] | None,
+    *,
+    mode: str = "default",
+) -> bool:
+    """
+    True when at least one offered player can actually drive a Third Http Detail screenshot.
+
+    A row is only usable if the log gave it a credit time: the Third Http date window is built
+    from ``time_short`` (:func:`_np_combine_date_and_credit_time` raises without it), and the
+    CLI picker refuses such rows too. So a card listing user IDs as
+    ``last credit n/a @ n/a`` has players but no *actionable* player — "has choices" and "has a
+    usable player" are different questions, and callers deciding whether to look at another
+    day's log need the second one.
+    """
+    if isinstance(np_followup, dict):
+        key = (
+            "np_choices_error_only"
+            if (mode or "").strip().lower() == "error_only"
+            else "np_choices"
+        )
+        choices = np_followup.get(key) or []
+    else:
+        choices = np_followup or []
+    for ch in choices:
+        if isinstance(ch, dict) and str(ch.get("time_short") or "").strip():
+            return True
+    return False
+
+
 def build_np_choice_lark_card(
     np_choices: list[dict[str, Any]],
     *,
