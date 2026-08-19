@@ -1051,6 +1051,38 @@ def _verify_set_maint_applied(
     return False
 
 
+def _live_state_is_usable(state: dict[str, Any] | None, machine_name: str = "") -> bool:
+    """
+    True only when a row read carries real evidence about the machine's state.
+
+    :func:`smmachine._row_report_fields` never raises: every failure mode (cells.count()
+    raising, a fixed-column clone row with only the selection cell, an unreadable cell) returns
+    ``("", False, "", "", "(unknown)")``. That blank tuple is stored as a **truthy** dict, and
+    :func:`_verify_live_state` then reads it as "not in maintenance, not in test" — so every
+    ``unset_*`` action verifies as already-done on no evidence at all. Guard the mutation
+    decisions with this instead of trusting a non-None dict.
+
+    When ``machine_name`` is given the read must also be about the machine we asked for: nothing
+    else cross-checks row identity, and matching is fuzzy enough (asset-digit fallback in
+    :func:`smmachine._row_text_matches`) to land on a different row.
+    """
+    if not isinstance(state, dict):
+        return False
+    name = str(state.get("name") or "").strip()
+    status = str(state.get("status") or "").strip()
+    if not name or not status:
+        return False
+    want = (machine_name or "").strip()
+    if want:
+        try:
+            kind, key = _machine_target(want)
+            if not _row_text_matches(kind, key, name):
+                return False
+        except Exception:
+            return False
+    return True
+
+
 def _verify_live_state(state: dict[str, Any], action: str) -> bool:
     is_maint = _status_is_maintenance(state.get("status", ""))
     is_test = bool(state.get("test"))
@@ -1066,7 +1098,8 @@ def _verify_live_state(state: dict[str, Any], action: str) -> bool:
         return not is_test
     if action == "unset_both":
         return not is_maint and not is_test
-    return True
+    # Unknown action: never claim the live page confirms it.
+    return False
 
 
 def _verify_machine_live(
@@ -1865,9 +1898,18 @@ def _process_env_batch(
         if not name:
             continue
         live = live_states.get(name)
-        if live and _verify_live_state(live, verify_action):
+        # Must be a READABLE read of THIS machine. A blank read used to satisfy every
+        # `unset_*` here, banking the machine as done and dropping it from `still_need` — so
+        # when every machine read blank the function returned below without ever clicking a
+        # toolbar button, and the summary said success while the backend was untouched.
+        if _live_state_is_usable(live, name) and _verify_live_state(live, verify_action):
             ok_list.append({"belongs": m.get("belongs", belongs), "machine": name})
         else:
+            if live is not None and not _live_state_is_usable(live, name):
+                logger.warning(
+                    "prod-set: %s unreadable row state for %s (%r) — treating as needs action",
+                    belongs, name, live,
+                )
             still_need.append(m)
 
     if cancel_check() or manual_stop_check() or not still_need:
@@ -1970,7 +2012,9 @@ def _process_env_batch(
         if not name:
             continue
         live = post_states.get(name)
-        verified = bool(live and _verify_live_state(live, verify_action))
+        verified = bool(
+            _live_state_is_usable(live, name) and _verify_live_state(live, verify_action)
+        )
         if not verified and verify_action == "set_maint":
             verified = _verify_set_maint_applied(
                 page,
@@ -2204,7 +2248,9 @@ def _run_phased_env(
         if not name:
             continue
         live = final_states.get(name)
-        verified = bool(live and _verify_live_state(live, parent_action))
+        verified = bool(
+            _live_state_is_usable(live, name) and _verify_live_state(live, parent_action)
+        )
         # `parent_action` here is always a PHASED_STEPS key (set_both / unset_both), so the old
         # `== "set_maint"` gate was unreachable and the toolbar rescue never ran: an occupy row
         # whose maintenance WAS applied still reads `occupy` in the Status pill, so a set_both
