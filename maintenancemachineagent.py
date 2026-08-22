@@ -115,7 +115,7 @@ _MONTHS: dict[str, int] = {
 }
 
 # Env prefixes used to recognise pasted machine names + "ALL <ENV> MACHINES …" phrases.
-_ENV_PREFIXES = ("NWR", "MDR", "NCH", "TBR", "TBP", "DHS", "CP", "OSM", "WF", "WINFORD")
+_ENV_PREFIXES = ("NWR", "MDR", "NCH", "TBR", "TBP", "DHS", "CP", "OSM", "WF", "WINFORD", "DYB")
 
 # "5 Dragons-WF8145", "Pure Diamonds-WF8147", "NWR2113", "Echo-TBP8671" …
 _MACHINE_LINE_RE = re.compile(
@@ -195,7 +195,7 @@ def _strip_mentions(text: str, mention_keys: Sequence[str]) -> str:
 
 
 _ENV_TOKEN_RE = re.compile(
-    r"(NWR|MDR|NCH|TBR|TBP|DHS|OSM|CP|WF|WINFORD)\s*-?\s*\d",
+    r"(NWR|MDR|NCH|TBR|TBP|DHS|OSM|CP|WF|WINFORD|DYB)\s*-?\s*\d",
     re.I,
 )
 
@@ -218,6 +218,9 @@ def _env_from_machine_name(machine_name: str) -> str | None:
             return "WF"
         if env == "OSM":
             return "CP"
+        if env == "DYB":
+            # DYB cabinets are rows on the NCH backend, not their own environment.
+            return "NCH"
         return env
     if re.search(r"winford", raw, re.I):
         return "WF"
@@ -790,6 +793,8 @@ def _norm(s: str) -> str:
 # Spoken env words → env code (word-level, matched anywhere in the message).
 _ENV_WORDS: dict[str, str] = {
     "nwr": "NWR", "np": "NWR",
+    # DYB cabinets live on the NCH backend — same alias shape as osm -> CP.
+    "dyb": "NCH",
     "newport": "NWR",
     "nch": "NCH", "nc": "NCH",
     "tbr": "TBR", "tbp": "TBP",

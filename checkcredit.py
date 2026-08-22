@@ -2922,7 +2922,13 @@ def _np_use_dhs_log_backend(machine_display: str | None) -> bool:
 
 
 def _np_use_nch_log_backend(machine_display: str | None) -> bool:
-    """NCH cabinet — folder / last path segment starts with ``NCH`` (e.g. ``NCH1171``)."""
+    """
+    NCH cabinet — folder / last path segment starts with ``NCH`` (e.g. ``NCH1171``).
+
+    ``DYB`` cabinets (``Blue Festival-DYB0001``) are rows on the SAME backend-nc host, so they
+    route here too. DYB is matched anywhere in the label, not just at the start, because these
+    always arrive as full display names with the game name in front.
+    """
     raw = (machine_display or "").strip()
     if not raw:
         return False
@@ -2930,7 +2936,9 @@ def _np_use_nch_log_backend(machine_display: str | None) -> bool:
     if seg and re.match(r"(?i)NCH", seg):
         return True
     alnum = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
-    return bool(alnum.startswith("NCH"))
+    if alnum.startswith("NCH"):
+        return True
+    return bool(re.search(r"DYB[0-9]", alnum))
 
 
 def _np_use_cp_log_backend(machine_display: str | None) -> bool:

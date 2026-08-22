@@ -107,6 +107,7 @@ _SITE_ALIAS_BELONGS: dict[str, str] = {
     "nch": "NCH",
     "nc": "NCH",
     "new": "NCH",
+    "dyb": "NCH",
     "tbr": "TBR",
     "tbp": "TBP",
     "mdr": "MDR",

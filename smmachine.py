@@ -240,6 +240,7 @@ def _site_synthetic_machine(site: str) -> str:
         "nch": "NCH0001",
         "nc": "NCH0001",
         "new": "NCH0001",
+        "dyb": "NCH0001",
         "tbr": "TBR0001",
         "tbp": "TBP0001",
         "mdr": "MDR0001",
@@ -296,6 +297,7 @@ def _site_belongs_label(site_key: str) -> str:
         "nch": "NCH",
         "nc": "NCH",
         "new": "NCH",
+        "dyb": "NCH",
         "tbr": "TBR",
         "tbp": "TBP",
         "mdr": "MDR",
@@ -2520,6 +2522,9 @@ def _prod_batch_machine_env_from_name(machine_name: str) -> str | None:
     if re.match(r"^DHS", seg, re.I) or alnum.startswith("DHS"):
         return "DHS"
     if re.match(r"^NCH", seg, re.I) or alnum.startswith("NCH"):
+        return "NCH"
+    # DYB cabinets are on the NCH backend, so they resolve to the NCH environment.
+    if re.match(r"^DYB", seg, re.I) or alnum.startswith("DYB") or re.search(r"DYB[0-9]", alnum):
         return "NCH"
     if re.match(r"^OSM", seg, re.I) or alnum.startswith("OSM"):
         return "CP"
