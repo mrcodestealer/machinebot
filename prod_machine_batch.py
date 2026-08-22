@@ -1112,19 +1112,46 @@ def _verify_machine_live(
     return _verify_live_state(state, action)
 
 
-def _refresh_egm_table(page, *, timeout_ms: int, max_pages: int) -> None:
-    """Reload table data on the page we already have (stay on EGM list, do not use webapp API)."""
+def _refresh_egm_table(page, *, timeout_ms: int, max_pages: int) -> bool:
+    """Refetch table data on the page we already have (stay on EGM list, not the webapp API).
+
+    Returns True only when a refetch actually happened, because every freshness guarantee in
+    this module rests on that. The Refresh click is the only step here that reloads data, it is
+    found by an anchored ``^refresh$`` accessible-name match, and its failure used to be
+    swallowed — while neither ``_go_first_page`` nor ``_wait_table_idle`` can refetch a table
+    that is already on page 1 (the first returns immediately when there is no previous page).
+    A missing or unclickable button therefore left this function silently refreshing nothing,
+    and a caller could verify against the very DOM it meant to replace."""
+    refetched = False
     scope = page.locator(".filter-container, .app-container").first
     refresh = scope.get_by_role("button", name=re.compile(r"^refresh$", re.I))
-    if refresh.count():
+    try:
+        present = refresh.count() > 0
+    except Exception:
+        present = False
+    if present:
         try:
             refresh.first.click(timeout=min(30_000, timeout_ms))
             _wait_table_idle(page, timeout_ms)
+            refetched = True
         except Exception:
-            pass
+            logger.warning("prod-set: EGM Refresh click failed — falling back to a page reload")
+    if not refetched:
+        try:
+            page.reload(wait_until="domcontentloaded")
+            _wait_table_idle(page, timeout_ms)
+            refetched = True
+        except Exception:
+            logger.warning(
+                "prod-set: EGM table could not be refetched — readings may be stale"
+            )
     limit = _resolve_collect_page_limit(max_pages)
-    _go_first_page(page, timeout_ms=timeout_ms, max_steps=limit)
-    _wait_table_idle(page, timeout_ms)
+    try:
+        _go_first_page(page, timeout_ms=timeout_ms, max_steps=limit)
+        _wait_table_idle(page, timeout_ms)
+    except Exception:
+        logger.warning("prod-set: could not return the EGM table to page 1 after refresh")
+    return refetched
 
 
 def _batch_button_match_pattern(label: str) -> re.Pattern[str]:
@@ -1198,6 +1225,12 @@ def _click_batch_button(page, label: str, *, timeout_ms: int, force: bool = Fals
         _page_pause(page, 400)
         return True, ""
     except Exception:
+        # Checked BEFORE the force retry, not after. `force=True` skips Playwright's
+        # actionability checks, so on a disabled control it dispatches events the widget
+        # ignores and returns without raising — reporting a no-op as a successful click and
+        # making the "disabled" result below unreachable for a button that is present.
+        if not _batch_toolbar_button_actionable(btn):
+            return False, "disabled"
         if force:
             try:
                 btn.click(force=True, timeout=min(30_000, timeout_ms))
@@ -1219,7 +1252,11 @@ def _submit_batch_action(page, label: str, remark: str, *, timeout_ms: int) -> t
     """Click batch toolbar button and Save when confirm dialog opens."""
     _wait_batch_toolbar_ready(page, label, timeout_ms=timeout_ms)
     clicked, why = _click_batch_button(page, label, timeout_ms=timeout_ms)
-    if not clicked and why in ("disabled", "click failed"):
+    # "disabled" is deliberately NOT retried. The retry re-enters the same non-force click and
+    # burns its full 30s timeout before hitting the actionability guard and returning "disabled"
+    # again, so the force path was unreachable anyway — at ten retries that is five wasted
+    # minutes per environment. A genuinely disabled button is a real answer, not a transient.
+    if not clicked and why == "click failed":
         clicked, why = _click_batch_button(page, label, timeout_ms=timeout_ms, force=True)
     if not clicked:
         return False, why
@@ -1892,6 +1929,7 @@ def _process_env_batch(
     # Skip machines already in the desired state (e.g. on a retry); a failed state read is treated
     # as "needs action" since the row was found and selected — the post-click verify decides.
     still_need: list[dict] = []
+    banked: list[dict] = []
     for m in selected:
         if cancel_check() or manual_stop_check():
             break
@@ -1904,7 +1942,14 @@ def _process_env_batch(
         # when every machine read blank the function returned below without ever clicking a
         # toolbar button, and the summary said success while the backend was untouched.
         if _live_state_is_usable(live, name) and _verify_live_state(live, verify_action):
-            ok_list.append({"belongs": m.get("belongs", belongs), "machine": name})
+            # Logged because this is the only decision that can cancel the mutation, and it
+            # used to be silent: a run that clicked nothing left no record of the strings that
+            # justified it, which is why the incident could not be settled from the logs.
+            logger.info(
+                "prod-set: %s %s skip %s — reads as already done (live=%r)",
+                belongs, verify_action, name, live,
+            )
+            banked.append({"belongs": m.get("belongs", belongs), "machine": name})
         else:
             if live is not None and not _live_state_is_usable(live, name):
                 logger.warning(
@@ -1912,6 +1957,90 @@ def _process_env_batch(
                     belongs, name, live,
                 )
             still_need.append(m)
+
+    # A machine that "reads as already done" cancels its own mutation, and the read behind that
+    # verdict is not necessarily fresh: nothing refetches the table before it — a warm page is
+    # handed back without a reload — so a stale DOM reports rows in their pre-maintenance state
+    # and the summary claims success over an untouched backend. Every banked machine is
+    # therefore re-read against a refetched table before it is accepted. This deliberately runs
+    # whenever ANYTHING was banked: gating it on "nothing needs action" left the original
+    # incident fully intact for any batch where a single machine happened to differ, since the
+    # post-click verify below only ever re-reads the machines that were clicked.
+    if banked and not (cancel_check() or manual_stop_check()):
+        by_name = {}
+        for m in selected:
+            nm = _machine_display_name(m)
+            if nm:
+                by_name[nm] = m
+        banked_machines = [
+            by_name[str(e.get("machine") or "")]
+            for e in banked
+            if str(e.get("machine") or "") in by_name
+        ]
+        fresh = False
+        recheck: dict[str, dict[str, Any] | None] = {}
+        try:
+            fresh = _refresh_egm_table(page, timeout_ms=timeout_ms, max_pages=max_pages)
+            recheck = _batch_read_live_states(
+                page, banked_machines, timeout_ms=timeout_ms, max_pages=max_pages
+            )
+        except Exception as exc:
+            # Send them through the click path rather than banking them or letting this escape:
+            # a propagating exception here would unwind past the retry loop in
+            # _run_step_with_retries and fail the whole environment, and banking them anyway
+            # would restore the exact bug this block exists to close.
+            logger.warning(
+                "prod-set: %s recheck of skipped machines failed (%s) — clicking instead",
+                belongs, re.sub(r"\s+", " ", str(exc))[:160],
+            )
+            still_need.extend(banked_machines)
+            banked = []
+        else:
+            live_states.update(recheck)
+
+        reconfirmed: list[dict] = []
+        for entry in banked:
+            name = str(entry.get("machine") or "")
+            m = by_name.get(name)
+            if m is None:
+                continue
+            live = recheck.get(name)
+            if not fresh:
+                fail_list.append(
+                    {
+                        "belongs": m.get("belongs", belongs),
+                        "machine": name,
+                        "error": "could not confirm on a refreshed EGM table",
+                        "live": live,
+                    }
+                )
+                continue
+            if not _live_state_is_usable(live, name):
+                # No evidence either way. Do NOT fall through to a click: for an unset the
+                # toolbar button is enabled only when the row IS in the state being cleared, so
+                # clicking blind would hard-fail a machine that may be perfectly fine. Report it
+                # unverified instead — visible, and never a false success.
+                fail_list.append(
+                    {
+                        "belongs": m.get("belongs", belongs),
+                        "machine": name,
+                        "error": "state unreadable on refreshed EGM page",
+                        "live": live,
+                    }
+                )
+                continue
+            if _verify_live_state(live, verify_action):
+                reconfirmed.append(entry)
+            else:
+                logger.warning(
+                    "prod-set: %s %s stale skip for %s — refreshed read still needs the "
+                    "action (live=%r)",
+                    belongs, verify_action, name, live,
+                )
+                still_need.append(m)
+        banked = reconfirmed
+
+    ok_list.extend(banked)
 
     if cancel_check() or manual_stop_check() or not still_need:
         return ok_list, fail_list
@@ -2150,14 +2279,26 @@ def _run_single_action_env(
         max_pages=max_pages,
         on_phase_retry=on_phase_retry,
     )
-    if not passed:
-        return done_ok, still_fail
-
-    return [
-        {"belongs": m.get("belongs", belongs), "machine": _machine_display_name(m)}
+    # `passed` only means no failure was RECORDED. Several exits from _process_env_batch leave
+    # with an empty fail list and an incomplete ok list (cancel/manual-stop breaks, nothing
+    # selected, an empty display name), so re-emitting `targets` here printed a checkmark for
+    # machines that were never touched or never verified. Report the verified list, and
+    # surface anything unaccounted for rather than dropping it silently — on both branches, so
+    # a machine can never fall out of the summary entirely.
+    verified = {str(entry.get("machine") or "") for entry in done_ok}
+    unaccounted = [
+        {
+            "belongs": m.get("belongs", belongs),
+            "machine": _machine_display_name(m),
+            "error": "not verified on EGM page (no confirming read)",
+        }
         for m in targets
-        if _machine_display_name(m)
-    ], []
+        if _machine_display_name(m) and _machine_display_name(m) not in verified
+    ]
+    if not passed:
+        known = {str(f.get("machine") or "") for f in still_fail}
+        return done_ok, still_fail + [u for u in unaccounted if u["machine"] not in known]
+    return done_ok, unaccounted
 
 
 def _run_phased_env(
@@ -2533,12 +2674,16 @@ class _ProdEnvWarm:
             self._teardown()
         finally:
             self._last_active = time.monotonic()
+            # Released before the rewarm, not after: `box` is fully populated by now, and this
+            # env's worker thread serves its queue serially, so the next job still waits for the
+            # refetch on its own thread. The freshness is preserved; the 1-3s it costs is simply
+            # no longer charged to the bot's reply.
+            task["done"].set()
             if self._healthy():
                 try:
                     self._rewarm(timeout_ms)
                 except Exception:
                     self._teardown()
-            task["done"].set()
 
     def _keepalive_loop(self) -> None:
         while True:
@@ -2593,11 +2738,17 @@ class _ProdEnvWarm:
         )
 
     def _rewarm(self, timeout_ms: int) -> None:
-        # Return to a clean first page of the EGM list so the next job starts ready.
+        # Refetch the EGM list so the next job starts from fresh data, then sit on page 1.
+        # `_go_first_page` alone did neither: it returns immediately when there is no previous
+        # page — exactly where a rewarmed page already sits — so the keepalive refreshed
+        # nothing and a warm session could serve a startup-time snapshot indefinitely, which
+        # is what the comment on _PROD_WARM_KEEPALIVE_SEC always claimed it prevented.
         try:
-            limit = _resolve_collect_page_limit(None)
-            _go_first_page(self._page, timeout_ms=timeout_ms, max_steps=limit)
-            _wait_table_idle(self._page, timeout_ms)
+            if not _refresh_egm_table(self._page, timeout_ms=timeout_ms, max_pages=None):
+                logger.warning(
+                    "prod-warm: %s keepalive refetched nothing — page may be serving stale rows",
+                    self.env,
+                )
         except Exception:
             pass
 
@@ -2914,7 +3065,7 @@ def live_verify_prod_machines(
                             }
                         )
                         continue
-                    if _verify_live_state(state, action):
+                    if _live_state_is_usable(state, name) and _verify_live_state(state, action):
                         success.append(
                             {
                                 "belongs": m.get("belongs", belongs),
@@ -2923,9 +3074,15 @@ def live_verify_prod_machines(
                             }
                         )
                     else:
-                        detail = (
-                            f"live status={state.get('status')!r}, test={state.get('test')}"
-                        )
+                        # A row that was found but read blank is not evidence of anything, and
+                        # for every unset_* action _verify_live_state would have read it as
+                        # "already done" — a checkmark on a machine nobody confirmed.
+                        if not _live_state_is_usable(state, name):
+                            detail = "live row read returned no usable status"
+                        else:
+                            detail = (
+                                f"live status={state.get('status')!r}, test={state.get('test')}"
+                            )
                         failed.append(
                             {
                                 "belongs": m.get("belongs", belongs),
