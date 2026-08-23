@@ -641,6 +641,38 @@ def _query_asset_digits_from_key(key_alnum: str) -> str | None:
     return m2.group(1) if m2 else None
 
 
+# Site aliases that denote the SAME backend/table, so a prefix difference between them is not a
+# different machine. Everything else is: NWR2205 and NCH2205 are two distinct cabinets.
+_ENV_PREFIX_ALIASES = {"NP": "NWR", "NC": "NCH", "NEW": "NCH", "OSM": "CP", "WINFORD": "WF"}
+_ENV_PREFIX_RE = re.compile(
+    r"(WINFORD|NWR|NCH|TBR|TBP|MDR|DHS|OSM|WF|NP|NC|CP)(\d+)", re.I
+)
+
+
+def _machine_env_prefix(name: str) -> str | None:
+    """
+    Canonical environment prefix of a machine label or token (``5 Dragons-NWR2205`` -> ``NWR``).
+
+    Used to reject a cross-site match: NWR and NP live in ONE backend table, so an asset-digit
+    match alone let ``NP8671`` resolve to ``NWR8671`` — ticking, mutating and then "verifying" a
+    machine nobody asked for.
+    """
+    alnum = _machine_name_alnum_upper(name)
+    if not alnum:
+        return None
+    matches = list(_ENV_PREFIX_RE.finditer(alnum))
+    if not matches:
+        return None
+    pref = matches[-1].group(1).upper()
+    return _ENV_PREFIX_ALIASES.get(pref, pref)
+
+
+def _env_prefixes_conflict(a: str, b: str) -> bool:
+    """True when both names carry a KNOWN and DIFFERENT environment prefix."""
+    pa, pb = _machine_env_prefix(a), _machine_env_prefix(b)
+    return bool(pa and pb and pa != pb)
+
+
 def _row_text_matches(kind: str, key: str, row_text: str) -> bool:
     """
     Match a scraped EGM row to a user token.
@@ -667,9 +699,83 @@ def _row_text_matches(kind: str, key: str, row_text: str) -> bool:
     q_digits = _query_asset_digits_from_key(key_alnum)
     r_digits = _machine_asset_digits_from_name(row_text)
     if q_digits and r_digits and q_digits == r_digits:
+        # Same asset digits are NOT enough on a shared table: NWR and NP are one backend, so
+        # `NP8671` would otherwise match row `NWR8671` and we would mutate the wrong cabinet.
+        if _env_prefixes_conflict(key, row_text):
+            return False
         return True
 
     return False
+
+
+# Report fields for EVERY row on the current page in ONE Playwright round trip.
+# `_row_report_fields` costs ~6 IPC calls per row and the scan loops call it once per target
+# machine per page, so a 10-machine walk over a 300-row table paid ~10k round trips (~2 min).
+# Mirrors _row_report_fields / _machine_name_cell_test_mode_and_display exactly, and carries the
+# status-cell HTML probe so an `occupy` row that IS in maintenance is settled without a re-walk.
+_ROW_FIELDS_BULK_JS = r"""els => els.map(el => {
+  const tds = el.querySelectorAll('td.el-table__cell');
+  const n = tds.length;
+  const one = (i) => (tds[i] ? (tds[i].textContent || '') : '').replace(/\s+/g, ' ').trim();
+  const nameTxt = n >= 2 ? one(1) : '';
+  const literal = /\(TEST\)/i.test(nameTxt);
+  let spanTest = false;
+  if (n >= 2) {
+    const mk = tds[1].querySelector('span.test');
+    if (mk) {
+      const st = getComputedStyle(mk);
+      const r = mk.getBoundingClientRect();
+      spanTest = st.display !== 'none' && st.visibility !== 'hidden'
+                 && (r.width > 0 || r.height > 0 || !!mk.textContent);
+    }
+  }
+  const isTest = literal || spanTest;
+  let name = nameTxt;
+  if (isTest && spanTest && !literal) name = nameTxt ? nameTxt + '(TEST)' : '(TEST)';
+  const onlineRaw = n >= 8 ? one(7) : '';
+  const ol = onlineRaw.toLowerCase();
+  const statusHtml = n >= 7 ? (tds[6].innerHTML || '').toLowerCase() : '';
+  return {
+    cells: n,
+    name: name,
+    test: isTest,
+    game: n >= 3 ? one(2) : '',
+    status: n >= 7 ? one(6) : '',
+    online: ol.includes('offline') ? 'offline'
+          : ol.includes('online') ? 'online' : (onlineRaw || '(unknown)'),
+    rowText: (el.textContent || '').replace(/\s+/g, ' ').trim(),
+    maint_html: /maintain|metercheck/.test(statusHtml),
+  };
+})"""
+
+
+def _bulk_row_read_enabled() -> bool:
+    """``PROD_BATCH_BULK_ROWS=0`` forces the old per-row locator path."""
+    return (os.environ.get("PROD_BATCH_BULK_ROWS", "1") or "").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def read_page_rows_bulk(page, *, timeout_ms: int) -> list[dict] | None:
+    """
+    All rows of the current page in one round trip, or ``None`` when the read cannot be trusted
+    (count mismatch / evaluate failure) so callers fall back to the per-row path unchanged.
+    """
+    if not _bulk_row_read_enabled():
+        return None
+    rows = _table_body_rows(page)
+    try:
+        rows.first.wait_for(state="visible", timeout=min(15_000, timeout_ms))
+    except Exception:
+        pass
+    try:
+        n = rows.count()
+        data = rows.evaluate_all(_ROW_FIELDS_BULK_JS)
+    except Exception:
+        return None
+    if not isinstance(data, list) or len(data) != n or n == 0:
+        return None
+    return data
 
 
 def _wait_table_idle(page, timeout_ms: int) -> None:
@@ -862,6 +968,23 @@ def _click_pagination_next(page, *, timeout_ms: int) -> None:
 
 
 def _go_first_page(page, *, timeout_ms: int, max_steps: int) -> None:
+    """
+    Return to page 1. Tries the pager's ``1`` button first — walking back one page at a time cost
+    ~900ms per page (12s+ on a 15-page table), and this runs several times per retry attempt.
+    """
+    if not _can_pagination_prev(page):
+        return
+    try:
+        first = _pagination_root(page).locator("li.number").filter(has_text=re.compile(r"^1$")).first
+        if first.count():
+            _dismiss_intercepting_modal(page, timeout_ms=timeout_ms)
+            first.click(timeout=min(10_000, timeout_ms))
+            page.wait_for_timeout(600)
+            _wait_table_idle(page, timeout_ms)
+            if not _can_pagination_prev(page):
+                return
+    except Exception:
+        pass
     for _ in range(max_steps + 5):
         if not _can_pagination_prev(page):
             return
@@ -1000,7 +1123,15 @@ def _machine_name_cell_test_mode_and_display(cell, *, timeout_ms: int) -> tuple[
     literal = bool(re.search(r"\(TEST\)", name_line or "", re.I))
     span_test = False
     try:
-        span_test = cell.locator("span.test").first.count() > 0
+        # Presence alone is not evidence: a template that renders the marker always and hides it
+        # with v-show / a class would make EVERY row read as test mode, and `set_test` would then
+        # bank every machine as "already done" without ever clicking. Require it to be visible.
+        marker = cell.locator("span.test").first
+        if marker.count():
+            try:
+                span_test = bool(marker.is_visible(timeout=min(2_000, timeout_ms)))
+            except Exception:
+                span_test = True  # visibility unknown -> fall back to presence
     except Exception:
         span_test = False
     is_test = literal or span_test
@@ -2940,6 +3071,11 @@ def _prod_batch_sm_action_form_card(
                     "elements": [
                         {
                             "tag": "button",
+                            # `name` is REQUIRED (and must be unique card-wide) for every
+                            # interactive component inside a form container — Lark's docs are
+                            # explicit that data otherwise fails to send. These six were the only
+                            # in-form buttons in the codebase missing it.
+                            "name": f"sm_act_{act}",
                             "text": {"tag": "plain_text", "content": label[:40]},
                             "type": "primary" if act.startswith("set_") else "default",
                             "form_action_type": "submit",
@@ -4215,10 +4351,18 @@ def _run_prod_batch_bot_job_thread(
             f"**SUMMARY — {ACTION_LABELS.get(action, action)}**",
             f"Success: {ok_n}",
             f"Failed: {fail_n}",
-            "",
         ]
+        # Show the requested total whenever it does not equal ok+failed, so a machine that fell
+        # out of both lists is visible instead of silently rendering as a clean success.
+        req_n = int(summary.get("requested") or 0)
+        unaccounted = req_n - (ok_n + fail_n) if req_n else 0
+        if unaccounted:
+            lines.append(f"Requested: {req_n}  ⚠️ **{unaccounted} unaccounted**")
+        lines.append("")
         for m in (summary.get("success") or [])[:30]:
             lines.append(f"✓ {m.get('belongs')} — {m.get('machine')}")
+        if ok_n > 30:
+            lines.append(f"... and {ok_n - 30} more done")
         if fail_n:
             lines.append("")
             lines.append("**Still failed:**")
@@ -4228,7 +4372,7 @@ def _run_prod_batch_bot_job_thread(
             lines.append(f"✗ {m.get('belongs')} — {m.get('machine')}{suffix}")
         if fail_n > 30:
             lines.append(f"... and {fail_n - 30} more failed")
-        tpl = "red" if fail_n else "green"
+        tpl = "red" if (fail_n or unaccounted) else "green"
         title = (
             f"Failed — {ACTION_LABELS.get(action, action)}"
             if fail_n

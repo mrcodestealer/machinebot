@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 from urllib.parse import quote
 
 from smmachine import (
+    read_page_rows_bulk,
     _blocking_modal_present,
     _can_pagination_next,
     _click_pagination_next,
@@ -385,8 +386,26 @@ def _login_egm_backend(page, base: str, user: str, pw: str, *, timeout_ms: int) 
     login_url = f"{base.rstrip('/')}{login}?redirect={quote(path, safe='')}"
     list_url = f"{base.rstrip('/')}{path}"
 
-    page.goto(login_url, wait_until="domcontentloaded")
+    resp = page.goto(login_url, wait_until="domcontentloaded", timeout=min(60_000, timeout_ms))
     _page_pause(page, 900)
+
+    # A Cloudflare/WAF block returns a normal HTML page with no login form, so without this the
+    # failure surfaced as "password field not visible" and was retried 3x pointlessly. Name it.
+    try:
+        status = resp.status if resp is not None else 0
+    except Exception:
+        status = 0
+    if status in (403, 429, 503):
+        body = ""
+        try:
+            body = (page.locator("body").inner_text(timeout=3_000) or "")[:300].lower()
+        except Exception:
+            pass
+        if status in (403, 429) or "cloudflare" in body or "you have been blocked" in body:
+            raise RuntimeError(
+                f"blocked by Cloudflare/WAF (HTTP {status}) at {page.url} — not a login problem; "
+                f"allowlist this server's IP for the EGM backend"
+            )
 
     pwd_box = page.locator('input[type="password"]').first
     pwd_box.wait_for(state="visible", timeout=min(30_000, timeout_ms))
@@ -523,6 +542,28 @@ def _machine_lookup_specs(machines: list[dict]) -> list[tuple[str, dict, str, st
     return specs
 
 
+def _resolve_specs_on_page(page, specs, *, timeout_ms):
+    """
+    ``{spec: (row_locator, fields)}`` for the specs present on the CURRENT page, in one round trip.
+
+    Returns ``None`` when the bulk read is untrustworthy so callers keep the per-row path. Match
+    order mirrors the old code: machine-name column first, whole-row text as fallback.
+    """
+    bulk = read_page_rows_bulk(page, timeout_ms=timeout_ms)
+    if bulk is None:
+        return None
+    rows = _table_body_rows(page)
+    out: dict = {}
+    for spec in specs:
+        _name, _m, kind, key = spec
+        for i, f in enumerate(bulk):
+            txt = str(f.get("name") or "").strip() or str(f.get("rowText") or "")
+            if txt and _row_text_matches(kind, key, txt):
+                out[spec] = (rows.nth(i), f)
+                break
+    return out
+
+
 def _batch_select_machines_on_live_page(
     page,
     machines: list[dict],
@@ -560,9 +601,17 @@ def _batch_select_machines_on_live_page(
             break
 
         resolved: list[tuple[str, dict, str, str]] = []
+        # One page.evaluate for the whole page instead of len(pending) x rows x 6 IPC calls.
+        hits = _resolve_specs_on_page(page, list(pending), timeout_ms=timeout_ms)
         for spec in list(pending):
             name, m, kind, key = spec
-            rows = _find_all_rows_for_target(page, kind, key, timeout_ms=timeout_ms)
+            if hits is not None:
+                hit = hits.get(spec)
+                rows = [hit[0]] if hit else []
+                fields = hit[1] if hit else None
+            else:
+                rows = _find_all_rows_for_target(page, kind, key, timeout_ms=timeout_ms)
+                fields = None
             if not rows:
                 continue
             dedupe = (str(m.get("belongs") or "").upper(), name)
@@ -570,14 +619,23 @@ def _batch_select_machines_on_live_page(
                 try:
                     if read_states:
                         try:
-                            mn, is_test, _gt, status, online = _row_report_fields(
-                                rows[0], timeout_ms=timeout_ms
-                            )
+                            if fields is not None:
+                                mn = str(fields.get("name") or "")
+                                is_test = bool(fields.get("test"))
+                                status = str(fields.get("status") or "")
+                                online = str(fields.get("online") or "")
+                            else:
+                                mn, is_test, _gt, status, online = _row_report_fields(
+                                    rows[0], timeout_ms=timeout_ms
+                                )
                             states[name] = {
                                 "name": mn,
                                 "test": bool(is_test),
                                 "status": (status or "").strip(),
                                 "online": (online or "").strip(),
+                                "maint_html": (
+                                    bool(fields.get("maint_html")) if fields is not None else None
+                                ),
                             }
                         except Exception:
                             states[name] = None
@@ -641,18 +699,32 @@ def _batch_read_live_states(
             break
 
         resolved: list[tuple[str, dict, str, str]] = []
+        hits = _resolve_specs_on_page(page, list(pending), timeout_ms=timeout_ms)
         for spec in list(pending):
             name, _m, kind, key = spec
-            rows = _find_all_rows_for_target(page, kind, key, timeout_ms=timeout_ms)
+            if hits is not None:
+                hit = hits.get(spec)
+                rows = [hit[0]] if hit else []
+                fields = hit[1] if hit else None
+            else:
+                rows = _find_all_rows_for_target(page, kind, key, timeout_ms=timeout_ms)
+                fields = None
             if not rows:
                 continue
             try:
-                mn, is_test, _gt, status, online = _row_report_fields(rows[0], timeout_ms=timeout_ms)
+                if fields is not None:
+                    mn = str(fields.get("name") or "")
+                    is_test = bool(fields.get("test"))
+                    status = str(fields.get("status") or "")
+                    online = str(fields.get("online") or "")
+                else:
+                    mn, is_test, _gt, status, online = _row_report_fields(rows[0], timeout_ms=timeout_ms)
                 out[name] = {
                     "name": mn,
                     "test": bool(is_test),
                     "status": (status or "").strip(),
                     "online": (online or "").strip(),
+                    "maint_html": bool(fields.get("maint_html")) if fields is not None else None,
                 }
             except Exception:
                 out[name] = None
@@ -782,6 +854,62 @@ def _row_state_indicates_maintenance(
     return False
 
 
+def _clear_all_table_selection(page) -> bool:
+    """
+    Clear the el-table's ENTIRE selection, including rows on other pages.
+
+    ``_clear_table_row_selection`` only unticks the rows currently rendered, so ticks left on
+    page 2+ stay active and are consumed by the next batch click. Element UI exposes
+    ``clearSelection()`` on the table component, which clears every page at once.
+    """
+    try:
+        if page.evaluate(
+            """() => {
+              let done = false;
+              for (const el of document.querySelectorAll('.el-table')) {
+                const v = el.__vue__;
+                if (v && typeof v.clearSelection === 'function') { v.clearSelection(); done = true; }
+              }
+              return done;
+            }"""
+        ):
+            page.wait_for_timeout(120)
+            return True
+    except Exception:
+        pass
+    try:  # fallback: toggle the header select-all on, then off
+        hdr = page.locator("th.el-table-column--selection .el-checkbox").first
+        if hdr.count():
+            hdr.click(timeout=5_000)
+            page.wait_for_timeout(120)
+            hdr.click(timeout=5_000)
+            page.wait_for_timeout(120)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _selected_row_count(page) -> int:
+    """Number of ticked data rows across the table (-1 when it cannot be determined)."""
+    try:
+        return int(
+            page.evaluate(
+                """() => {
+                  const t = document.querySelector('.el-table');
+                  const v = t && t.__vue__;
+                  if (v && v.store && v.store.states && v.store.states.selection)
+                    return v.store.states.selection.length;
+                  return document.querySelectorAll(
+                    'div.el-table__body-wrapper > table.el-table__body > tbody >'
+                    + ' tr.el-table__row td.el-table-column--selection input:checked').length;
+                }"""
+            )
+        )
+    except Exception:
+        return -1
+
+
 def _toolbar_row_in_maintenance(
     page, row, *, timeout_ms: int, toolbar_wait_ms: int = 8_000
 ) -> bool:
@@ -800,7 +928,24 @@ def _toolbar_row_in_maintenance(
     and would be consumed by the next batch click — applying maintenance to a machine nobody
     asked for.
     """
+    # The toolbar reflects the WHOLE table's selection. With other rows still ticked (leftovers
+    # from the batch click, which survive the Refresh-button refetch and are invisible to the
+    # page-local clear) BatchStart Using can read "enabled" because of THOSE rows -- turning a
+    # machine that never entered maintenance into a reported Success. Probe only ever runs
+    # against a selection of exactly one: this row.
+    _clear_all_table_selection(page)
     _ensure_row_checkbox_checked(page, row, timeout_ms=timeout_ms)
+    n_sel = _selected_row_count(page)
+    if n_sel != 1:
+        logger.warning(
+            "prod-set: toolbar maintenance probe skipped -- %s row(s) selected, expected exactly 1",
+            n_sel,
+        )
+        try:
+            _ensure_row_checkbox_unchecked(page, row, timeout_ms=timeout_ms)
+        except Exception:
+            pass
+        return False
     try:
         deadline = time.monotonic() + min(
             toolbar_wait_ms / 1000.0, timeout_ms / 1000.0
@@ -961,7 +1106,9 @@ def _process_timeout_set_maint_rows(
         if not name:
             continue
         live = live_states.get(name)
-        if live and _verify_live_state(live, verify_action):
+        # Guarded like every other "already in the desired state" decision: an unreadable row
+        # read is a truthy dict of blanks, which _verify_live_state happily reports as done.
+        if _live_state_is_usable(live, name) and _verify_live_state(live, verify_action):
             ok_list.append({"belongs": m.get("belongs", belongs), "machine": name})
             continue
         row = _find_machine_row_live(page, name, timeout_ms=timeout_ms, max_pages=max_pages)
@@ -2146,13 +2293,16 @@ def _process_env_batch(
             _live_state_is_usable(live, name) and _verify_live_state(live, verify_action)
         )
         if not verified and verify_action == "set_maint":
-            verified = _verify_set_maint_applied(
-                page,
-                name,
-                live,
-                timeout_ms=timeout_ms,
-                max_pages=max_pages,
-            )
+            # The status-cell HTML probe rides along in the same bulk read that produced
+            # `post_states`, so an `occupy` row whose maintenance DID apply is settled here.
+            # _verify_set_maint_applied re-finds the row with a full paginated walk from page 1
+            # (~30s per machine) -- only worth paying when the probe said nothing.
+            if live and live.get("maint_html") is True:
+                verified = True
+            elif not (live and live.get("maint_html") is False):
+                verified = _verify_set_maint_applied(
+                    page, name, live, timeout_ms=timeout_ms, max_pages=max_pages
+                )
         if verified:
             ok_list.append({"belongs": m.get("belongs", belongs), "machine": name})
         else:
@@ -2173,6 +2323,36 @@ def _process_env_batch(
             )
 
     return ok_list, fail_list
+
+
+# Failures no amount of retrying can change. "game currently running" is deliberately EXCLUDED:
+# a player can finish, so it stays retryable -- but there the sleep is the only useful part of a
+# retry, which is why _retry_backoff_sec exists.
+_PERMANENT_FAIL_PAT = re.compile(
+    r"offline"
+    r"|blocked by Cloudflare"
+    r"|not found"
+    r"|missing backend credentials"
+    r"|unknown site"
+    r"|login/table load failed",
+    re.I,
+)
+
+
+def _failure_is_permanent(entry: dict[str, Any]) -> bool:
+    err = str(entry.get("error") or "")
+    if _failure_is_game_running(err, entry.get("live")):
+        return False
+    return bool(_PERMANENT_FAIL_PAT.search(err))
+
+
+def _retry_backoff_sec(attempt: int) -> float:
+    """Sleep before the next retry pass. ``PROD_SET_RETRY_BACKOFF_SEC=0`` disables it."""
+    try:
+        base = float((os.environ.get("PROD_SET_RETRY_BACKOFF_SEC") or "3").strip())
+    except ValueError:
+        base = 3.0
+    return max(0.0, min(30.0, base * max(1, attempt)))
 
 
 def _run_step_with_retries(
@@ -2198,6 +2378,7 @@ def _run_step_with_retries(
     pending = list(targets)
     max_r = _max_phase_retries()
     done_so_far: list[dict] = []
+    blocked: list[dict] = []
 
     ok_login, login_err = _ensure_env_egm_page(
         page, belongs, timeout_ms=timeout_ms, max_pages=max_pages
@@ -2218,21 +2399,35 @@ def _run_step_with_retries(
 
         ok_part: list[dict] = []
         fail_part: list[dict] = []
-        ok_part, fail_part = _process_env_batch(
-            page,
-            belongs,
-            pending,
-            parent_action,
-            remark,
-            step_buttons,
-            step_verify,
-            cancel_check,
-            manual_stop_check,
-            timeout_ms=timeout_ms,
-            max_pages=max_pages,
-            ok_list=ok_part,
-            fail_list=fail_part,
-        )
+        # `ok_part`/`fail_part` are the same list objects the callee mutates, so an exception
+        # mid-verify (e.g. pagination blocked by a modal it must not touch) still leaves the
+        # machines it already verified in `ok_part`. Without this the whole environment was
+        # reported Failed even though the action HAD applied.
+        try:
+            ok_part, fail_part = _process_env_batch(
+                page,
+                belongs,
+                pending,
+                parent_action,
+                remark,
+                step_buttons,
+                step_verify,
+                cancel_check,
+                manual_stop_check,
+                timeout_ms=timeout_ms,
+                max_pages=max_pages,
+                ok_list=ok_part,
+                fail_list=fail_part,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("prod-set: %s attempt %d aborted", belongs, attempt)
+            verified = {str(x.get("machine") or "") for x in ok_part}
+            for m in pending:
+                nm = _machine_display_name(m)
+                if nm and nm not in verified:
+                    fail_part.append(
+                        {"belongs": m.get("belongs", belongs), "machine": nm, "error": str(exc)}
+                    )
         done_so_far.extend(ok_part)
         if not fail_part:
             return True, [], done_so_far
@@ -2241,9 +2436,24 @@ def _run_step_with_retries(
                 on_phase_retry(step_verify, attempt, fail_part, list(done_so_far))
             except Exception:
                 logger.exception("on_phase_retry callback failed for %s", belongs)
-        pending = fail_part
 
-    return False, pending, done_so_far
+        # A retry pass costs minutes on a big table -- spend it only where it can change the
+        # answer. Permanent failures are kept for the summary but never re-run.
+        retryable = [f for f in fail_part if not _failure_is_permanent(f)]
+        blocked.extend(f for f in fail_part if _failure_is_permanent(f))
+        if not retryable:
+            logger.info(
+                "prod-set: %s %s aborting after attempt %d -- all %d failure(s) permanent",
+                belongs, step_verify, attempt, len(blocked),
+            )
+            return False, blocked, done_so_far
+        if attempt < max_r:
+            delay = _retry_backoff_sec(attempt)
+            if delay:
+                time.sleep(delay)
+        pending = retryable
+
+    return False, pending + blocked, done_so_far
 
 
 def _run_single_action_env(
@@ -2401,13 +2611,14 @@ def _run_phased_env(
         # is STILL in maintenance, and _verify_set_maint_applied returns True exactly then, which
         # would report a failed unset as success.
         if not verified and parent_action == "set_both" and live and live.get("test"):
-            verified = _verify_set_maint_applied(
-                page,
-                name,
-                live,
-                timeout_ms=timeout_ms,
-                max_pages=max_pages,
-            )
+            # Same short-circuit as the single-action path: the bulk read already carries the
+            # status-cell maintenance probe, so skip the ~30s paginated re-walk when it decided.
+            if live.get("maint_html") is True:
+                verified = True
+            elif live.get("maint_html") is not False:
+                verified = _verify_set_maint_applied(
+                    page, name, live, timeout_ms=timeout_ms, max_pages=max_pages
+                )
         if verified:
             all_ok.append({"belongs": m.get("belongs", belongs), "machine": name})
         else:
@@ -2984,10 +3195,29 @@ def run_prod_batch_job(
                 pass
             browser.close()
 
+    # Reconcile against what was REQUESTED. Several paths can drop a machine from both lists
+    # (an env thread dying, a cancel mid-loop, an empty display name, an unreachable action) --
+    # and because the card colours itself green whenever `failed` is empty, a dropped machine
+    # used to render as an unqualified "Success". Never report a machine we cannot account for.
+    _accounted = {str(x.get("machine") or "").strip() for x in all_ok}
+    _accounted |= {str(x.get("machine") or "").strip() for x in all_fail}
+    for _m in machines:
+        _nm = _machine_display_name(_m)
+        if _nm and _nm not in _accounted:
+            all_fail.append(
+                {
+                    "belongs": _m.get("belongs", ""),
+                    "machine": _nm,
+                    "error": "not reported by any environment (unverified -- please re-check)",
+                }
+            )
+            _accounted.add(_nm)
+
     return {
         "action": action,
         "success": all_ok,
         "failed": all_fail,
+        "requested": len([m for m in machines if _machine_display_name(m)]),
         "ok": [f"{x['belongs']}::{x['machine']}" for x in all_ok],
         "failed_keys": [f"{x['belongs']}::{x['machine']}" for x in all_fail],
         "screenshots": shot_list,
