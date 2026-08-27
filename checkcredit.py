@@ -1831,13 +1831,6 @@ def _fmt_credit_display(raw: Any) -> str:
     return f"{v:,.2f}"
 
 
-_NP_SOURCE_LABEL = {
-    "latest_in_log": "latest in log",
-    "with_error": "has error",
-    "no_error": "no error",
-}
-
-
 def _np_choice_row_md(idx: int, ch: dict[str, Any]) -> str:
     """One player line: index, ID, credit, credit time, error count, why it is listed."""
     uid = str(ch.get("user_id") or "").strip() or "n/a"
@@ -1849,9 +1842,9 @@ def _np_choice_row_md(idx: int, ch: dict[str, Any]) -> str:
     errs = ch.get("errors_n")
     if isinstance(errs, int):
         bits.append(f"\u26a0\ufe0f `{errs}` err" if errs > 0 else "\u2705 no err")
-    label = _NP_SOURCE_LABEL.get(str(ch.get("source") or "").strip())
-    if label:
-        bits.append(f"_{label}_")
+    # "with_error"/"no_error" only repeat the counter above; the log-order pick does not.
+    if str(ch.get("source") or "").strip() == "latest_in_log":
+        bits.append("_latest in log_")
     line = "  \u00b7  ".join(bits)
     if not ts:
         line += "\n\u26d4 no credit time in the log \u2014 this one cannot open Third Http."
@@ -1954,24 +1947,13 @@ def build_np_choice_lark_card(
         if ex:
             _div(ex)
 
-    # --- the players ---
-    _hr()
-    if n:
-        _div("\n".join(_np_choice_row_md(i + 1, ch) for i, ch in enumerate(np_choices)))
-    else:
-        _div("_No players to list for this day._")
-
-    sll = (same_last_line or "").strip()
-    if sll:
-        _div(f"\u2139\ufe0f {sll}")
-
-    # --- how to pick ---
+    # --- how to pick (before the list, so the buttons below need no explaining) ---
     if n:
         _hr()
         hint = [
-            f"\U0001f449 **Tap a player ID** below \u2014 or type the ID (or **1**\u2013**{n}**) "
-            f"in chat, no **@** needed.",
-            f"\U0001f4f8 Screenshot window = the log date above + that player\u2019s credit time.",
+            f"\U0001f449 **Tap the player-ID button** under a player \u2014 or type the ID "
+            f"(or **1**\u2013**{n}**) in chat, no **@** needed.",
+            "\U0001f4f8 Screenshot window = the log date above + that player\u2019s credit time.",
         ]
         if actionable_n < n:
             hint.append(
@@ -1980,28 +1962,44 @@ def build_np_choice_lark_card(
             )
         _div("\n".join(hint))
 
-    buttons: list[dict[str, Any]] = []
+    # --- the players: each row followed by its own ID button ---
+    if not n:
+        _hr()
+        _div("_No players to list for this day._")
     for i, ch in enumerate(np_choices, start=1):
+        _hr()
+        _div(_np_choice_row_md(i, ch))
         uid = str(ch.get("user_id") or "").strip()
-        buttons.append(
-            _np_lark_v2_button(
-                uid or str(i),
-                "primary" if i == 1 else "default",
-                {"k": "np_pick", "i": i, "u": uid},
-                element_id=f"npcc{i}"[:20],
+        body_elements.append(
+            _np_lark_v2_button_row(
+                [
+                    _np_lark_v2_button(
+                        uid or str(i),
+                        "primary" if i == 1 else "default",
+                        {"k": "np_pick", "i": i, "u": uid},
+                        element_id=f"npcc{i}"[:20],
+                    )
+                ]
             )
         )
+
+    sll = (same_last_line or "").strip()
+    if sll:
+        _div(f"\u2139\ufe0f {sll}")
+
     if navigator_same_day_multi_log or len(files_all) >= 2:
-        buttons.append(
-            _np_lark_v2_button(
-                "\U0001f5c2\ufe0f open one log file",
-                "default",
-                {"k": "np_check_alt_logs"},
-                element_id="npcc_altlog",
+        body_elements.append(
+            _np_lark_v2_button_row(
+                [
+                    _np_lark_v2_button(
+                        "\U0001f5c2\ufe0f open one log file",
+                        "default",
+                        {"k": "np_check_alt_logs"},
+                        element_id="npcc_altlog",
+                    )
+                ]
             )
         )
-    if buttons:
-        body_elements.append(_np_lark_v2_button_row(buttons))
 
     title = "Choose a player"
     if md:
