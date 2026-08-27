@@ -160,6 +160,8 @@ def _temp_png_path(prefix: str) -> str:
 
 DEFAULT_USER = os.environ.get("CHECKCREDIT_USER", "osm")
 DEFAULT_PASS = os.environ.get("CHECKCREDIT_PASSWORD", "osm123")
+# LogNavigator base URL (source="navigator" only; OSS HTTP is the default source).
+DEFAULT_BASE = os.environ.get("CHECKCREDIT_BASE", "").rstrip("/")
 
 DEFAULT_OSS_TEMPLATE = os.environ.get(
     "OSM_LOG_OSS_TEMPLATE",
@@ -337,6 +339,97 @@ def fetch_log_via_oss(
     return text, meta
 
 
+def load_logic_log_for_date_oss(
+    machine_query: str,
+    td: date,
+    *,
+    timeout_sec: float = 120.0,
+    want_basename: str | None = None,
+) -> dict[str, Any]:
+    """
+    Read one day's logic log from OSS — **every same-day segment, merged in play order**.
+
+    Reading only one segment (e.g. the file with the newest last-activity line) silently drops
+    every player who played in the other segments: a machine restarted at 09:51 makes the fresh
+    ``YYYY-MM-DD.log`` win on last-activity while all of the morning's players sit in the rotated
+    file, so an active day looks empty and the caller falls back to the previous day.
+
+    ``want_basename`` pins a single file (card *open one log file* drill-down / CLI
+    ``--logic-log``); merging is skipped then.
+
+    Returns ``{"body", "same_day", "merged", "chosen", "text_parts", "spans"}`` where ``chosen``
+    is the newest segment read (what "opened file" means for the drill-down) and ``spans`` is
+    ``[(basename, first_ts, last_ts), …]`` in read order.
+    """
+    date_str = td.isoformat()
+    text_parts: list[str] = []
+    same_day = list_oss_logic_log_basenames_for_date(
+        machine_query, td, timeout_sec=min(30.0, max(5.0, timeout_sec))
+    )
+    want = (want_basename or "").strip()
+    if want and same_day and want not in same_day:
+        text_parts.append(
+            f"⚠ Requested logic log `{want}` not listed for this day — using default selection."
+        )
+        want = ""
+    if not same_day:
+        same_day = [f"{date_str}.log"]
+
+    def _fetch(basename: str, *, quiet: bool = False) -> str:
+        body, oss_parts = fetch_log_via_oss(
+            machine_query,
+            td,
+            timeout_sec=timeout_sec,
+            logic_log_basename=basename,
+        )
+        if not quiet:
+            text_parts.extend(oss_parts)
+        return body
+
+    if want:
+        body = _fetch(want)
+        return {
+            "body": body,
+            "same_day": same_day,
+            "merged": [want],
+            "chosen": want,
+            "text_parts": text_parts,
+            "spans": [(want, _first_log_ts_in_body(body), _latest_log_ts_in_body(body))],
+        }
+
+    bodies: dict[str, str] = {}
+    quiet = len(same_day) >= 2
+    for fn in same_day:
+        try:
+            bodies[fn] = _fetch(fn, quiet=quiet)
+        except Exception as e:  # noqa: BLE001 - one unreadable segment must not lose the rest
+            text_parts.append(f"⚠ Could not fetch logic log {fn}: {e}")
+    if not bodies:
+        raise RuntimeError(
+            f"No readable logic log for {resolve_oss_machine_folder(machine_query)} on {date_str} "
+            f"(tried: {', '.join(same_day)})"
+        )
+    body, order = merge_logic_log_bodies(bodies)
+    spans = [
+        (fn, _first_log_ts_in_body(bodies[fn]), _latest_log_ts_in_body(bodies[fn]))
+        for fn in order
+    ]
+    if len(order) >= 2:
+        text_parts.append("→ Source: OSS (HTTP GET)")
+        text_parts.append(f"→ Machine folder: {resolve_oss_machine_folder(machine_query)}")
+        text_parts.append(f"→ Merged {len(order)} same-day logic logs (agent restarts):")
+        for fn, first_ts, last_ts in spans:
+            text_parts.append(f"   • {fn}  [{first_ts or 'n/a'} → {last_ts or 'n/a'}]")
+    return {
+        "body": body,
+        "same_day": same_day,
+        "merged": order,
+        "chosen": order[-1],
+        "text_parts": text_parts,
+        "spans": spans,
+    }
+
+
 def fetch_log_via_navigator(
     machine_query: str,
     td: date,
@@ -374,6 +467,7 @@ def fetch_log_via_navigator(
     nav_meta: dict[str, Any] = {
         "logic_same_day_log_files": [],
         "logic_same_day_multi": False,
+        "logic_merged_log_files": [],
         "opened_logic_log_basename": "",
     }
     headless = False if debug_headed else _playwright_headless()
@@ -426,25 +520,29 @@ def fetch_log_via_navigator(
                     chosen = want
                     log_body = _open_tail_read(chosen)
                 elif len(same_day) >= 2:
-                    # Multiple same-day logic files: open each and keep the one whose
-                    # content has the newest activity, so the latest player is the default
-                    # (no need to tap "check another logs").
-                    best_fn, best_body, best_ts = "", "", ""
+                    # An agent restart splits the day across several logic files: open them ALL
+                    # and merge in play order. Keeping only the newest-activity file dropped
+                    # every player from the earlier segments (see merge_logic_log_bodies).
+                    bodies: dict[str, str] = {}
                     for fn in same_day:
                         try:
-                            body = _open_tail_read(fn)
+                            bodies[fn] = _open_tail_read(fn)
                         except Exception as e:  # noqa: BLE001 - one bad file shouldn't abort
                             text_parts.append(f"⚠ Could not open logic log {fn}: {e}")
-                            continue
-                        ts = _latest_log_ts_in_body(body)
-                        text_parts.append(f"→ scanned {fn}: last activity {ts or 'n/a'}")
-                        if best_fn == "" or ts > best_ts:
-                            best_fn, best_body, best_ts = fn, body, ts
-                    if best_fn:
-                        chosen, log_body = best_fn, best_body
+                    if bodies:
+                        log_body, merged_order = merge_logic_log_bodies(bodies)
+                        for fn in merged_order:
+                            text_parts.append(
+                                f"→ merged {fn}: "
+                                f"{_first_log_ts_in_body(bodies[fn]) or 'n/a'} → "
+                                f"{_latest_log_ts_in_body(bodies[fn]) or 'n/a'}"
+                            )
+                        nav_meta["logic_merged_log_files"] = list(merged_order)
+                        chosen = merged_order[-1]
                     else:
                         chosen = date_primary if date_primary in same_day else same_day[0]
                         log_body = _open_tail_read(chosen)
+                        nav_meta["logic_merged_log_files"] = [chosen]
                 else:
                     chosen = date_primary if date_primary in same_day else same_day[0]
                     log_body = _open_tail_read(chosen)
@@ -455,7 +553,13 @@ def fetch_log_via_navigator(
                 log_body = _open_tail_read(None)
 
             nav_meta["opened_logic_log_basename"] = chosen
-            text_parts.append(f"→ Logic log file: {chosen}")
+            if not nav_meta["logic_merged_log_files"]:
+                nav_meta["logic_merged_log_files"] = [chosen] if chosen else []
+            _merged_n = len(nav_meta["logic_merged_log_files"])
+            text_parts.append(
+                f"→ Logic log file: {chosen}"
+                + (f" (+{_merged_n - 1} merged segment(s))" if _merged_n >= 2 else "")
+            )
             if nav_meta["logic_same_day_multi"]:
                 names = ", ".join(same_day)
                 text_parts.append(f"→ Same-day logic logs ({len(same_day)}): {names}")
@@ -1039,6 +1143,39 @@ def _latest_log_ts_in_body(body: str) -> str:
     return best
 
 
+def _first_log_ts_in_body(body: str) -> str:
+    """Smallest ``HH:MM:SS.mmm`` line-time prefix in a log body (``""`` when none).
+
+    Used to order the day's logic segments by when they *started*.
+    """
+    best = ""
+    for line in (body or "").splitlines():
+        tp = _line_time_prefix(line)
+        if tp and (best == "" or tp < best):
+            best = tp
+    return best
+
+
+def merge_logic_log_bodies(bodies: dict[str, str]) -> tuple[str, list[str]]:
+    """Concatenate same-day logic segments in play order → ``(merged_body, basenames_in_order)``.
+
+    A cabinet agent restart closes the primary ``YYYY-MM-DD.log`` under a rotated
+    ``YYYY-MM-DD.<created>_<seq>.log`` name and opens a fresh primary file, so one day is
+    routinely 2–3 files and the **primary file is the newest segment** — filename order is
+    backwards. Order by each segment's first line time instead.
+
+    The merged body must be parsed **once**: ``_sort_players_latest_credit_first`` ranks players
+    by ``line_idx``, and per-file indices are not comparable across files.
+    """
+    items: list[tuple[str, int, str, str]] = []
+    for i, fn in enumerate(bodies):
+        body = bodies[fn] or ""
+        # Segments with no timestamped line at all sort last; they contribute nothing anyway.
+        items.append((_first_log_ts_in_body(body) or "99:99:99.999", i, fn, body))
+    items.sort(key=lambda it: (it[0], it[1]))
+    return "\n".join(it[3] for it in items), [it[2] for it in items]
+
+
 def _parse_success_cur_coin(line: str) -> tuple[float, str] | None:
     """successJson line with cur_coin and error 0 — caller picks last match per block."""
     if "successJson" not in line:
@@ -1476,7 +1613,9 @@ def resolve_player_log_credit_snapshot(
     timeout_ms = max(15_000, int(timeout_sec * 1000))
     try:
         if checkcredit_use_oss_source():
-            log_body, _meta = fetch_log_via_oss(mq, target_date, timeout_sec=timeout_sec)
+            # Every same-day segment, not just the primary file — a player who left before
+            # the last agent restart lives in a rotated file.
+            log_body = load_logic_log_for_date_oss(mq, target_date, timeout_sec=timeout_sec)["body"]
             md = resolve_oss_machine_folder(mq)
         else:
             log_body, md_nav, _parts, _nav = fetch_log_via_navigator(
@@ -1503,7 +1642,7 @@ def resolve_player_log_credit_snapshot(
             lc if isinstance(lc, dict) else None,
             "Found this user in the log but could not parse a credit timestamp.",
         )
-    return md, None, f"No log block found for user `{pid}` on that file."
+    return md, None, f"No log block found for user `{pid}` in that day’s logic log(s)."
 
 
 def build_checkcredit_player_form_card() -> dict[str, Any]:
@@ -1678,6 +1817,47 @@ def np_choices_actionable(
     return False
 
 
+def _fmt_credit_display(raw: Any) -> str:
+    """``5044.0`` -> ``5,044``; ``1234.5`` -> ``1,234.50``; anything unparsable is passed through."""
+    s = str(raw if raw is not None else "").strip()
+    if not s or s.lower() == "n/a":
+        return "n/a"
+    try:
+        v = float(s)
+    except ValueError:
+        return s
+    if v == int(v):
+        return f"{int(v):,}"
+    return f"{v:,.2f}"
+
+
+_NP_SOURCE_LABEL = {
+    "latest_in_log": "latest in log",
+    "with_error": "has error",
+    "no_error": "no error",
+}
+
+
+def _np_choice_row_md(idx: int, ch: dict[str, Any]) -> str:
+    """One player line: index, ID, credit, credit time, error count, why it is listed."""
+    uid = str(ch.get("user_id") or "").strip() or "n/a"
+    ts = str(ch.get("time_short") or "").strip()
+    bits = [f"**{idx}**  \u00b7  **`{uid}`**"]
+    bits.append(f"\U0001f4b0 `{_fmt_credit_display(ch.get('credit'))}`")
+    if ts:
+        bits.append(f"\U0001f552 `{ts}`")
+    errs = ch.get("errors_n")
+    if isinstance(errs, int):
+        bits.append(f"\u26a0\ufe0f `{errs}` err" if errs > 0 else "\u2705 no err")
+    label = _NP_SOURCE_LABEL.get(str(ch.get("source") or "").strip())
+    if label:
+        bits.append(f"_{label}_")
+    line = "  \u00b7  ".join(bits)
+    if not ts:
+        line += "\n\u26d4 no credit time in the log \u2014 this one cannot open Third Http."
+    return line
+
+
 def build_np_choice_lark_card(
     np_choices: list[dict[str, Any]],
     *,
@@ -1690,48 +1870,64 @@ def build_np_choice_lark_card(
     extra_md: str = "",
     extra_error_images: list[dict[str, str]] | None = None,
     navigator_same_day_multi_log: bool = False,
+    logic_log_files: list[str] | None = None,
+    merged_log_files: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Lark card 2.0: log date + machine + players; buttons **1**..**N** (N = len(choices), max 4) or type digits in chat."""
-    lines: list[str] = []
+    """
+    Lark card 2.0 player picker.
+
+    Each button is labelled with the **player ID** (not 1/2/3); the callback payload still carries
+    the 1-based index plus the ID, so typing ``1``-``N`` — or the player ID itself — in chat keeps
+    working. Rows show credit, credit time, error count and why the player is listed, and rows
+    with no credit time are marked: those cannot drive a Third Http screenshot.
+
+    ``merged_log_files`` are the same-day logic segments actually read (an agent restart starts a
+    new file mid-day), shown so it is visible that the whole day was covered.
+    """
     td = (target_date_iso or "").strip()
     md = (machine_display or "").strip()
     be = (third_http_backend or "NP").strip().upper()
     if be not in ("NP", "WF", "DHS", "NCH", "CP", "OSM", "MDR", "TBR", "TBP"):
         be = "NP"
-    if td or md:
-        bits: list[str] = []
-        if td:
-            bits.append(f"Log date ({be} window): `{td}`")
-        if md:
-            bits.append(f"Machine: `{md}`")
-        lines.append(" · ".join(bits))
-        lines.append("Screenshot uses the log date above + each line's credit time.")
-        lines.append("")
-    il = (intro_line or "").strip()
-    if il:
-        lines.append(il)
-        lines.append("")
-    ex = (extra_md or "").strip()
-    if ex:
-        lines.append(ex)
-        lines.append("")
-    if navigator_same_day_multi_log:
-        lines.append("**found another logs today** · **本日 LogNavigator 下另有 logic 日志文件**")
-        lines.append("")
-    for i, ch in enumerate(np_choices):
-        uid = ch.get("user_id", "")
-        cr = ch.get("credit", "n/a")
-        ts = ch.get("time_short") or "n/a"
-        lines.append(f"{i + 1}) User ID `{uid}` — last credit `{cr}` @ `{ts}`")
-    sll = (same_last_line or "").strip()
-    if sll:
-        lines.append("")
-        lines.append(f"ℹ️ {sll}")
-    content = "\n".join(lines) if lines else "_No players._"
-    title = "Kindly choose one of the player"
+    files_all = [str(f).strip() for f in (logic_log_files or []) if str(f).strip()]
+    files_read = [str(f).strip() for f in (merged_log_files or []) if str(f).strip()]
+    n = len(np_choices)
+    actionable_n = sum(1 for ch in np_choices if str(ch.get("time_short") or "").strip())
+    any_error = any(
+        isinstance(ch.get("errors_n"), int) and ch["errors_n"] > 0 for ch in np_choices
+    )
+
     body_elements: list[dict[str, Any]] = []
+
+    def _div(text_md: str) -> None:
+        body_elements.append({"tag": "div", "text": {"tag": "lark_md", "content": text_md}})
+
+    def _hr() -> None:
+        body_elements.append({"tag": "hr"})
+
+    # --- context strip: machine / log date / backend, then which files were read ---
+    meta_bits: list[str] = []
+    if md:
+        meta_bits.append(f"\U0001f579\ufe0f **{md}**")
+    if td:
+        meta_bits.append(f"\U0001f4c5 **{td}**")
+    meta_bits.append(f"\U0001f50c `{be}`")
+    _div("  \u00b7  ".join(meta_bits))
+    if len(files_read) >= 2:
+        _div(
+            f"\U0001f5c2\ufe0f Read **all {len(files_read)}** logic logs of this day "
+            f"(agent restarts): " + ", ".join(f"`{f}`" for f in files_read)
+        )
+    elif files_read and len(files_all) >= 2:
+        _div(
+            f"\U0001f5c2\ufe0f Reading `{files_read[0]}` only \u2014 this day has "
+            f"**{len(files_all)}** logic logs."
+        )
+
+    # --- images first so clients do not hide them below the long markdown ---
     ik = (image_key or "").strip()
     if ik:
+        _hr()
         body_elements.append(
             {
                 "tag": "img",
@@ -1739,52 +1935,66 @@ def build_np_choice_lark_card(
                 "alt": {"tag": "plain_text", "content": "Machine control window"},
             }
         )
-    # Put error-context screenshots before the long markdown so clients do not hide them below the fold.
-    ex_imgs = extra_error_images or []
-    for it in ex_imgs:
+    for it in extra_error_images or []:
         ik2 = str(it.get("img_key") or "").strip()
         if not ik2:
             continue
         title2 = str(it.get("title") or "Error context screenshot").strip()
+        _div(f"\U0001f4f7 **{title2}**")
         body_elements.append(
-            {"tag": "div", "text": {"tag": "lark_md", "content": f"📷 **{title2}**"}}
+            {"tag": "img", "img_key": ik2, "alt": {"tag": "plain_text", "content": title2}}
         )
-        body_elements.append(
-            {
-                "tag": "img",
-                "img_key": ik2,
-                "alt": {"tag": "plain_text", "content": title2},
-            }
-        )
-    body_elements.append({"tag": "div", "text": {"tag": "lark_md", "content": content}})
-    n = len(np_choices)
-    if n > 0:
-        body_elements.append(
-            {
-                "tag": "div",
-                "text": {
-                    "tag": "lark_md",
-                    "content": f"**Tap** a number below, or type **1**–**{n}** in chat (no @).",
-                },
-            }
-        )
+
+    il = (intro_line or "").strip()
+    ex = (extra_md or "").strip()
+    if il or ex:
+        _hr()
+        if il:
+            _div(il)
+        if ex:
+            _div(ex)
+
+    # --- the players ---
+    _hr()
+    if n:
+        _div("\n".join(_np_choice_row_md(i + 1, ch) for i, ch in enumerate(np_choices)))
+    else:
+        _div("_No players to list for this day._")
+
+    sll = (same_last_line or "").strip()
+    if sll:
+        _div(f"\u2139\ufe0f {sll}")
+
+    # --- how to pick ---
+    if n:
+        _hr()
+        hint = [
+            f"\U0001f449 **Tap a player ID** below \u2014 or type the ID (or **1**\u2013**{n}**) "
+            f"in chat, no **@** needed.",
+            f"\U0001f4f8 Screenshot window = the log date above + that player\u2019s credit time.",
+        ]
+        if actionable_n < n:
+            hint.append(
+                f"\u26d4 **{n - actionable_n}** of **{n}** have no credit time in the log and "
+                f"cannot be screenshotted."
+            )
+        _div("\n".join(hint))
+
     buttons: list[dict[str, Any]] = []
-    if n > 0:
-        buttons.extend(
-            [
-                _np_lark_v2_button(
-                    str(i),
-                    "primary" if i == 1 else "default",
-                    {"k": "np_pick", "i": i},
-                    element_id=f"npcc{i}"[:20],
-                )
-                for i in range(1, n + 1)
-            ]
-        )
-    if navigator_same_day_multi_log:
+    for i, ch in enumerate(np_choices, start=1):
+        uid = str(ch.get("user_id") or "").strip()
         buttons.append(
             _np_lark_v2_button(
-                "check another logs",
+                uid or str(i),
+                "primary" if i == 1 else "default",
+                {"k": "np_pick", "i": i, "u": uid},
+                element_id=f"npcc{i}"[:20],
+            )
+        )
+    if navigator_same_day_multi_log or len(files_all) >= 2:
+        buttons.append(
+            _np_lark_v2_button(
+                "\U0001f5c2\ufe0f open one log file",
                 "default",
                 {"k": "np_check_alt_logs"},
                 element_id="npcc_altlog",
@@ -1792,11 +2002,17 @@ def build_np_choice_lark_card(
         )
     if buttons:
         body_elements.append(_np_lark_v2_button_row(buttons))
+
+    title = "Choose a player"
+    if md:
+        title = f"Choose a player \u00b7 {md}"
+        if td:
+            title = f"{title} \u00b7 {td}"
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "width_mode": "fill"},
         "header": {
-            "template": "blue",
+            "template": "orange" if any_error else "blue",
             "title": {"tag": "plain_text", "content": title},
         },
         "body": {"elements": body_elements},
@@ -1820,6 +2036,7 @@ def build_np_followup_payload(
     """
     def _row_choice(r: dict[str, Any], source: str) -> dict[str, Any]:
         lc = r.get("latest_credit") or {}
+        errs = r.get("errors") or []
         val = lc.get("value")
         credit_s = str(val) if val is not None else "n/a"
         credit_val: float | None = None
@@ -1834,6 +2051,7 @@ def build_np_followup_payload(
             "credit": credit_s,
             "credit_value": credit_val,
             "source": source,
+            "errors_n": len(errs),
         }
 
     merged = merged_players or []
@@ -2662,64 +2880,20 @@ def run_finderror(
     }
 
     if source == "oss":
-        date_str = td.isoformat()
         timeout_sec = max(30.0, timeout_ms / 1000.0)
-        same_day = list_oss_logic_log_basenames_for_date(
-            machine_query, td, timeout_sec=min(30.0, timeout_sec)
+        loaded = load_logic_log_for_date_oss(
+            machine_query,
+            td,
+            timeout_sec=timeout_sec,
+            want_basename=navigator_logic_log_basename,
         )
+        text_parts.extend(loaded["text_parts"])
+        same_day = list(loaded["same_day"])
+        log_body = loaded["body"]
         nav_meta["logic_same_day_log_files"] = same_day
         nav_meta["logic_same_day_multi"] = len(same_day) >= 2
-        want = (navigator_logic_log_basename or "").strip()
-        if want and same_day and want not in same_day:
-            text_parts.append(
-                f"⚠ Requested logic log `{want}` not listed for this day — using default selection."
-            )
-            want = ""
-
-        def _oss_fetch(basename: str) -> str:
-            body, oss_parts = fetch_log_via_oss(
-                machine_query,
-                td,
-                timeout_sec=timeout_sec,
-                logic_log_basename=basename,
-            )
-            text_parts.extend(oss_parts)
-            return body
-
-        chosen = ""
-        log_body = ""
-        if same_day:
-            if want:
-                chosen = want
-                log_body = _oss_fetch(chosen)
-            elif len(same_day) >= 2:
-                # Multiple same-day logic files: fetch each and keep the one whose content
-                # has the newest activity, so the latest player is the default.
-                best_fn, best_body, best_ts = "", "", ""
-                for fn in same_day:
-                    try:
-                        body = _oss_fetch(fn)
-                    except Exception as e:  # noqa: BLE001 - one bad file shouldn't abort
-                        text_parts.append(f"⚠ Could not fetch logic log {fn}: {e}")
-                        continue
-                    ts = _latest_log_ts_in_body(body)
-                    text_parts.append(f"→ scanned {fn}: last activity {ts or 'n/a'}")
-                    if best_fn == "" or ts > best_ts:
-                        best_fn, best_body, best_ts = fn, body, ts
-                if best_fn:
-                    chosen, log_body = best_fn, best_body
-                else:
-                    chosen = f"{date_str}.log" if f"{date_str}.log" in same_day else same_day[0]
-                    log_body = _oss_fetch(chosen)
-            else:
-                chosen = f"{date_str}.log" if f"{date_str}.log" in same_day else same_day[0]
-                log_body = _oss_fetch(chosen)
-        else:
-            chosen = f"{date_str}.log"
-            nav_meta["logic_same_day_log_files"] = [chosen]
-            nav_meta["logic_same_day_multi"] = False
-            log_body = _oss_fetch(chosen)
-        nav_meta["opened_logic_log_basename"] = chosen
+        nav_meta["logic_merged_log_files"] = list(loaded["merged"])
+        nav_meta["opened_logic_log_basename"] = str(loaded["chosen"] or "")
         if nav_meta["logic_same_day_multi"]:
             names = ", ".join(same_day)
             text_parts.append(f"→ Same-day logic logs ({len(same_day)}): {names}")
@@ -2756,6 +2930,7 @@ def run_finderror(
     )
     np_followup["navigator_same_day_multi_log"] = bool(nav_meta.get("logic_same_day_multi"))
     np_followup["navigator_logic_log_files"] = list(nav_meta.get("logic_same_day_log_files") or [])
+    np_followup["navigator_merged_log_files"] = list(nav_meta.get("logic_merged_log_files") or [])
     np_followup["navigator_opened_logic_log_basename"] = str(
         nav_meta.get("opened_logic_log_basename") or ""
     )
@@ -2849,6 +3024,8 @@ def run_finderror(
             machine_display=str(np_followup.get("machine_display") or ""),
             third_http_backend=str(np_followup.get("third_http_backend") or "NP"),
             navigator_same_day_multi_log=bool(np_followup.get("navigator_same_day_multi_log")),
+            logic_log_files=list(np_followup.get("navigator_logic_log_files") or []),
+            merged_log_files=list(np_followup.get("navigator_merged_log_files") or []),
         ),
         "lark_card_same_player": build_same_latest_players_card(
             machine_display=machine_display,

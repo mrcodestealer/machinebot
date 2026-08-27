@@ -653,49 +653,17 @@ def _fetch_logic_log_body(
     chosen = ""
 
     if source == "oss":
-        same_day = cc.list_oss_logic_log_basenames_for_date(
-            machine_query, td, timeout_sec=min(30.0, timeout_sec)
+        # Every same-day logic segment, merged in play order: an agent restart starts a new file
+        # mid-day, and reading only one of them hides the players from the other segments.
+        loaded = cc.load_logic_log_for_date_oss(
+            machine_query,
+            td,
+            timeout_sec=timeout_sec,
+            want_basename=logic_log_basename,
         )
-        want = (logic_log_basename or "").strip()
-
-        def _oss_fetch(basename: str) -> str:
-            body, oss_parts = cc.fetch_log_via_oss(
-                machine_query,
-                td,
-                timeout_sec=timeout_sec,
-                logic_log_basename=basename,
-            )
-            text_parts.extend(oss_parts)
-            return body
-
-        log_body = ""
-        if same_day:
-            if want and want in same_day:
-                chosen = want
-                log_body = _oss_fetch(chosen)
-            elif len(same_day) >= 2:
-                best_fn, best_body, best_ts = "", "", ""
-                for fn in same_day:
-                    try:
-                        body = _oss_fetch(fn)
-                    except Exception as e:
-                        text_parts.append(f"⚠ Could not fetch logic log {fn}: {e}")
-                        continue
-                    ts = cc._latest_log_ts_in_body(body)
-                    text_parts.append(f"→ scanned {fn}: last activity {ts or 'n/a'}")
-                    if best_fn == "" or ts > best_ts:
-                        best_fn, best_body, best_ts = fn, body, ts
-                if best_fn:
-                    chosen, log_body = best_fn, best_body
-                else:
-                    chosen = f"{date_str}.log" if f"{date_str}.log" in same_day else same_day[0]
-                    log_body = _oss_fetch(chosen)
-            else:
-                chosen = f"{date_str}.log" if f"{date_str}.log" in same_day else same_day[0]
-                log_body = _oss_fetch(chosen)
-        else:
-            chosen = f"{date_str}.log"
-            log_body = _oss_fetch(chosen)
+        text_parts.extend(loaded["text_parts"])
+        log_body = loaded["body"]
+        chosen = str(loaded["chosen"] or f"{date_str}.log")
         machine_display = cc.resolve_oss_machine_folder(machine_query)
     else:
         log_body, machine_display, nav_parts, nav_meta = cc.fetch_log_via_navigator(

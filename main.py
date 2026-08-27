@@ -668,6 +668,35 @@ def _get_checkcredit_np_pending(chat_id: str, max_age_sec: float = 3600.0):
     return ent["payload"]
 
 
+def _np_pick_index_from_uid(chat_id: str, user_id: str) -> Optional[int]:
+    """1-based index of ``user_id`` in the pending player list (``None`` when absent)."""
+    uid = str(user_id or "").strip()
+    if not uid:
+        return None
+    choices = (_get_checkcredit_np_pending(chat_id) or {}).get("np_choices") or []
+    for i, ch in enumerate(choices, start=1):
+        if str(ch.get("user_id") or "").strip() == uid:
+            return i
+    return None
+
+
+def _np_pick_index_from_text(chat_id: str, text: str) -> Optional[int]:
+    """
+    Resolve a typed reply to a pending player: the list position (``1``-``4``) **or** the player
+    ID itself. The card's buttons are labelled with player IDs, so typing an ID is the natural
+    reply; short positional digits stay supported.
+    """
+    s = str(text or "").strip()
+    if not s.isdigit():
+        return None
+    choices = (_get_checkcredit_np_pending(chat_id) or {}).get("np_choices") or []
+    if not choices:
+        return None
+    if s in ("1", "2", "3", "4") and int(s) <= len(choices):
+        return int(s)
+    return _np_pick_index_from_uid(chat_id, s)
+
+
 
 # ================= Machine lookup card helpers (/nch /nwr /wf /tbr /tbp /cp /dhs /mdr) =================
 def _send_machine_lookup_card(chat_id: str, text: str, *, title: str) -> None:
@@ -1463,8 +1492,9 @@ def run_checkcredit_finderror(
         ):
             prev_td = td - timedelta(days=1)
             _cc_send(
-                f"ℹ️ No player with a credit time in the `{td.isoformat()}` log for "
-                f"`{machine_query}` — checking the previous day `{prev_td.isoformat()}` …"
+                f"ℹ️ No player with a credit time in **any** of the "
+                f"`{td.isoformat()}` logic logs for `{machine_query}` — checking the previous "
+                f"day `{prev_td.isoformat()}` …"
             )
             try:
                 prev_out = checkcredit.run_finderror(
@@ -1485,11 +1515,11 @@ def run_checkcredit_finderror(
                 prev_out.get("np_followup"), mode=mode
             ):
                 out = prev_out
-                td = prev_td
                 fallback_note = (
-                    f"⚠️ Nothing in today's log — this is the **previous day** "
-                    f"(`{prev_td.isoformat()}`)."
+                    f"⚠️ No player with a credit time in any `{td.isoformat()}` logic "
+                    f"log — showing the **previous day** (`{prev_td.isoformat()}`)."
                 )
+                td = prev_td
             else:
                 _cc_send(
                     f"ℹ️ `{prev_td.isoformat()}` has no player with a credit time either — "
@@ -1588,6 +1618,8 @@ def run_checkcredit_finderror(
                         extra_md=extra_md,
                         extra_error_images=extra_error_images,
                         navigator_same_day_multi_log=bool(np.get("navigator_same_day_multi_log")),
+                        logic_log_files=list(np.get("navigator_logic_log_files") or []),
+                        merged_log_files=list(np.get("navigator_merged_log_files") or []),
                     )
             except Exception as e:
                 preview_img_err = str(e)
@@ -1746,7 +1778,8 @@ def run_check_machine_log_job(
 
 
 def run_checkcredit_navigator_next_log(chat_id: str) -> None:
-    """Open the next same-day logic log (card **check another logs**) — OSS or LogNavigator."""
+    """Open the next same-day logic log on its own (card **open one log file**) — OSS or
+    LogNavigator. The normal read merges every segment; this drills into one file."""
     pend = _get_checkcredit_np_pending(chat_id)
     files = (pend or {}).get("navigator_logic_log_files") or []
     opened = str((pend or {}).get("navigator_opened_logic_log_basename") or "").strip()
@@ -2016,7 +2049,8 @@ def run_np_third_http_by_choice(chat_id: str, choice_idx: int) -> None:
     if not pend or choice_idx < 1 or choice_idx > len(choices):
         _checkcredit_send(
             chat_id,
-            "❌ No active NP choice list — run `/checkcreditdate …` again, then reply **1**–**4**.",
+            "❌ No active player list — run `/checkcredit …` again, then tap a player ID "
+            "(or type the ID / **1**–**4**).",
         )
         return
     ch = choices[choice_idx - 1]
@@ -2394,7 +2428,7 @@ def _run_card_callback_worker(data: dict, resolved: tuple) -> None:
                 send_message(chat_id_ca, f"❌ Reminder delete failed: {e}")
             return
 
-        # Reply "check another logs" — open the next same-day logic log.
+        # Reply "open one log file" — read the next same-day logic log on its own.
         if isinstance(parsed_ca, dict) and str(parsed_ca.get("k") or "").strip().lower() == "np_check_alt_logs":
             threading.Thread(
                 target=run_checkcredit_navigator_next_log,
@@ -2405,12 +2439,16 @@ def _run_card_callback_worker(data: dict, resolved: tuple) -> None:
 
         # NP choice button (1–4) — Third Http Detail screenshot for the picked player.
         if isinstance(parsed_ca, dict) and str(parsed_ca.get("k") or "").strip().lower() == "np_pick":
-            try:
-                idx_np = int(parsed_ca.get("i"))
-            except (TypeError, ValueError):
-                return
             pend_np = _get_checkcredit_np_pending(chat_id_ca)
             choices_np = (pend_np or {}).get("np_choices") or []
+            # The button carries the player ID as well as its position: resolve by ID first, so a
+            # tap still lands on the intended player if the pending list was rebuilt meanwhile.
+            idx_np = _np_pick_index_from_uid(chat_id_ca, parsed_ca.get("u")) or 0
+            if not idx_np:
+                try:
+                    idx_np = int(parsed_ca.get("i"))
+                except (TypeError, ValueError):
+                    return
             if pend_np and 1 <= idx_np <= len(choices_np):
                 threading.Thread(
                     target=run_np_third_http_by_choice,
@@ -2706,9 +2744,12 @@ def _handle_machine_message(
         elif not handled and (chat_type == "p2p" or bot_mentioned):
             send_func(chat_id, _HELP_TEXT)
 
-    # ---- Reply 1–4 after an NP prompt (group works without @mention while a list is pending) ----
+    # ---- Reply with a player ID (or 1–4) after an NP prompt (group works without @mention
+    # while a list is pending) ----
     if is_np_reply:
-        idx_np = int(ct)
+        idx_np = _np_pick_index_from_text(chat_id, ct)
+        if idx_np is None:
+            return
         start_lark_background_thread(run_np_third_http_by_choice, chat_id, idx_np)
         return
 
@@ -3405,13 +3446,10 @@ def lark_webhook():
                     break
 
         stripped_choice = clean_text.strip()
-        pend_np = _get_checkcredit_np_pending(chat_id)
-        _np_choices = (pend_np or {}).get("np_choices") or []
-        # Only an IN-RANGE digit is an NP pick — an out-of-range "3"/"4" in a group without
-        # @mention is silently acked (not answered with an error), matching osedutybot.
-        is_np_reply = stripped_choice in ("1", "2", "3", "4") and 1 <= int(stripped_choice) <= len(
-            _np_choices
-        )
+        # Only a reply that resolves to a pending player is an NP pick — a list position
+        # ("1".."4", in range) or a listed player ID. Anything else in a group without @mention is
+        # silently acked (not answered with an error), matching osedutybot.
+        is_np_reply = _np_pick_index_from_text(chat_id, stripped_choice) is not None
 
         if chat_type != "p2p" and not bot_mentioned and not is_np_reply:
             return _lark_im_ack()
