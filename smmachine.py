@@ -713,15 +713,16 @@ def _row_text_matches(kind: str, key: str, row_text: str) -> bool:
 # machine per page, so a 10-machine walk over a 300-row table paid ~10k round trips (~2 min).
 # Mirrors _row_report_fields / _machine_name_cell_test_mode_and_display exactly, and carries the
 # status-cell HTML probe so an `occupy` row that IS in maintenance is settled without a re-walk.
-_ROW_FIELDS_BULK_JS = r"""els => els.map(el => {
+_ROW_FIELDS_BULK_JS = r"""(els, idx) => els.map(el => {
   const tds = el.querySelectorAll('td.el-table__cell');
   const n = tds.length;
   const one = (i) => (tds[i] ? (tds[i].textContent || '') : '').replace(/\s+/g, ' ').trim();
-  const nameTxt = n >= 2 ? one(1) : '';
+  const iName = idx.name, iGame = idx.game, iStatus = idx.status, iOnline = idx.online;
+  const nameTxt = n > iName ? one(iName) : '';
   const literal = /\(TEST\)/i.test(nameTxt);
   let spanTest = false;
-  if (n >= 2) {
-    const mk = tds[1].querySelector('span.test');
+  if (n > iName) {
+    const mk = tds[iName].querySelector('span.test');
     if (mk) {
       const st = getComputedStyle(mk);
       const r = mk.getBoundingClientRect();
@@ -732,15 +733,15 @@ _ROW_FIELDS_BULK_JS = r"""els => els.map(el => {
   const isTest = literal || spanTest;
   let name = nameTxt;
   if (isTest && spanTest && !literal) name = nameTxt ? nameTxt + '(TEST)' : '(TEST)';
-  const onlineRaw = n >= 8 ? one(7) : '';
+  const onlineRaw = n > iOnline ? one(iOnline) : '';
   const ol = onlineRaw.toLowerCase();
-  const statusHtml = n >= 7 ? (tds[6].innerHTML || '').toLowerCase() : '';
+  const statusHtml = n > iStatus ? (tds[iStatus].innerHTML || '').toLowerCase() : '';
   return {
     cells: n,
     name: name,
     test: isTest,
-    game: n >= 3 ? one(2) : '',
-    status: n >= 7 ? one(6) : '',
+    game: n > iGame ? one(iGame) : '',
+    status: n > iStatus ? one(iStatus) : '',
     online: ol.includes('offline') ? 'offline'
           : ol.includes('online') ? 'online' : (onlineRaw || '(unknown)'),
     rowText: (el.textContent || '').replace(/\s+/g, ' ').trim(),
@@ -807,7 +808,7 @@ def read_page_rows_bulk(page, *, timeout_ms: int) -> list[dict] | None:
         pass
     try:
         n = rows.count()
-        data = rows.evaluate_all(_ROW_FIELDS_BULK_JS)
+        data = rows.evaluate_all(_ROW_FIELDS_BULK_JS, _resolve_column_indices(page))
     except Exception:
         return None
     if not isinstance(data, list) or len(data) != n or n == 0:
@@ -1096,19 +1097,22 @@ def _norm_cell_upper(s: str) -> str:
 
 def _row_tick_eligibility(row, *, timeout_ms: int) -> tuple[bool, str]:
     """
-    Tick only when Status (cell index **6**) is **normal** or **occupy** and Online/Offline (index **7**) is **online**.
-    Reject maintenance, offline, or any other status.
+    Tick only when Status is **normal** or **occupy** and Online/Offline is **online**.
+    Reject maintenance, offline, or any other status. Column positions come from the header.
     """
     cells = row.locator("td.el-table__cell")
     try:
         n = cells.count()
     except Exception:
         n = 0
-    if n < 8:
-        return False, "fewer than 8 columns — cannot read Status / Online-Offline"
+    pg = _page_of(row)
+    idx = _resolve_column_indices(pg) if pg is not None else dict(_COL_FALLBACK)
+    i_status, i_online = idx.get("status", 6), idx.get("online", 7)
+    if n <= max(i_status, i_online):
+        return False, "too few columns — cannot read Status / Online-Offline"
 
-    status_raw = _cell_text_one_line(cells.nth(6), timeout_ms=timeout_ms)
-    online_raw = _cell_text_one_line(cells.nth(7), timeout_ms=timeout_ms)
+    status_raw = _cell_text_one_line(cells.nth(i_status), timeout_ms=timeout_ms)
+    online_raw = _cell_text_one_line(cells.nth(i_online), timeout_ms=timeout_ms)
     su = _norm_cell_upper(status_raw)
     ou = _norm_cell_upper(online_raw)
 
@@ -1196,22 +1200,96 @@ def _row_summary_label(row, *, timeout_ms: int) -> str:
         n = cells.count()
     except Exception:
         n = 0
+    pg = _page_of(row)
+    idx = _resolve_column_indices(pg) if pg is not None else dict(_COL_FALLBACK)
     parts: list[str] = []
-    if n >= 2:
-        _tm, t = _machine_name_cell_test_mode_and_display(cells.nth(1), timeout_ms=timeout_ms)
+    if n > idx.get("name", 1):
+        _tm, t = _machine_name_cell_test_mode_and_display(
+            cells.nth(idx.get("name", 1)), timeout_ms=timeout_ms
+        )
         if t:
             parts.append(t)
-    if n >= 3:
-        t = _cell_text_one_line(cells.nth(2), timeout_ms=timeout_ms)
+    if n > idx.get("game", 2):
+        t = _cell_text_one_line(cells.nth(idx.get("game", 2)), timeout_ms=timeout_ms)
         if t:
             parts.append(t)
-    if n >= 7:
-        t = _cell_text_one_line(cells.nth(6), timeout_ms=timeout_ms)
+    if n > idx.get("status", 6):
+        t = _cell_text_one_line(cells.nth(idx.get("status", 6)), timeout_ms=timeout_ms)
         if t:
             parts.append(t)
     if parts:
         return " ".join(parts)
     return _row_display_name(row)
+
+
+# ---------------------------------------------------------------------------
+# Column resolution by HEADER, not by fixed index.
+# ---------------------------------------------------------------------------
+# The EGM table's column order is not fixed: an extra column (e.g. "GCP") shifts Status and
+# Online by one, and the hard-coded indices (name=1, game=2, status=6, online=7) then read the
+# wrong cells -- Status came back as 'GCP' and Online as 'maintain', so a machine that WAS in
+# maintenance looked like it was not, and every set/unset verify failed. Resolve from the header
+# once per page and fall back to the historical indices only when the header cannot be read.
+_COL_PATTERNS = (
+    ("name", re.compile(r"machine\s*name|machine|^name$|机器|机台|機台", re.I)),
+    ("game", re.compile(r"game\s*type|game|类型|類型", re.I)),
+    ("status", re.compile(r"^\s*status\s*$|status|状态|狀態", re.I)),
+    ("online", re.compile(r"online|offline|在线|在線|连线|連線", re.I)),
+)
+_COL_FALLBACK = {"name": 1, "game": 2, "status": 6, "online": 7}
+
+_HEADER_JS = r"""() => {
+  const t = document.querySelector('div.el-table__header-wrapper table.el-table__header')
+         || document.querySelector('table.el-table__header');
+  if (!t) return null;
+  const ths = t.querySelectorAll('thead tr th');
+  return Array.from(ths).map(th => (th.textContent || '').replace(/\s+/g, ' ').trim());
+}"""
+
+
+def _resolve_column_indices(page) -> dict:
+    """``{'name': i, 'game': i, 'status': i, 'online': i}`` for the current table."""
+    cached = getattr(page, "_egm_col_idx", None)
+    if isinstance(cached, dict) and cached:
+        return cached
+    idx = dict(_COL_FALLBACK)
+    try:
+        labels = page.evaluate(_HEADER_JS)
+    except Exception:
+        labels = None
+    if labels:
+        found = {}
+        for key, pat in _COL_PATTERNS:
+            for i, lab in enumerate(labels):
+                if lab and pat.search(lab) and i not in found.values():
+                    found[key] = i
+                    break
+        # Only trust a header map that located the two columns the verify logic depends on.
+        if "status" in found and "online" in found:
+            idx.update(found)
+            if idx != _COL_FALLBACK:
+                print(
+                    f"[prod-batch] EGM columns resolved from header {labels!r} -> {idx}",
+                    flush=True,
+                )
+        else:
+            print(
+                f"[prod-batch] could not resolve Status/Online from header {labels!r}; "
+                f"using fallback indices {idx}",
+                flush=True,
+            )
+    try:
+        page._egm_col_idx = idx  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return idx
+
+
+def _page_of(locator):
+    try:
+        return locator.page
+    except Exception:
+        return None
 
 
 def _row_report_fields(row, *, timeout_ms: int) -> tuple[str, bool, str, str, str]:
@@ -1224,13 +1302,19 @@ def _row_report_fields(row, *, timeout_ms: int) -> tuple[str, bool, str, str, st
         n = cells.count()
     except Exception:
         n = 0
-    if n >= 2:
-        is_test, name = _machine_name_cell_test_mode_and_display(cells.nth(1), timeout_ms=timeout_ms)
+    pg = _page_of(row)
+    idx = _resolve_column_indices(pg) if pg is not None else dict(_COL_FALLBACK)
+    i_name, i_game = idx.get("name", 1), idx.get("game", 2)
+    i_status, i_online = idx.get("status", 6), idx.get("online", 7)
+    if n > i_name:
+        is_test, name = _machine_name_cell_test_mode_and_display(
+            cells.nth(i_name), timeout_ms=timeout_ms
+        )
     else:
         is_test, name = False, ""
-    game_type = _cell_text_one_line(cells.nth(2), timeout_ms=timeout_ms) if n >= 3 else ""
-    status = _cell_text_one_line(cells.nth(6), timeout_ms=timeout_ms) if n >= 7 else ""
-    online_raw = _cell_text_one_line(cells.nth(7), timeout_ms=timeout_ms) if n >= 8 else ""
+    game_type = _cell_text_one_line(cells.nth(i_game), timeout_ms=timeout_ms) if n > i_game else ""
+    status = _cell_text_one_line(cells.nth(i_status), timeout_ms=timeout_ms) if n > i_status else ""
+    online_raw = _cell_text_one_line(cells.nth(i_online), timeout_ms=timeout_ms) if n > i_online else ""
     ol = " ".join((online_raw or "").lower().split())
     if "offline" in ol:
         online_disp = "offline"
