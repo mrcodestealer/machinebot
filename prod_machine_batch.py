@@ -875,6 +875,21 @@ def _row_state_indicates_maintenance(
     return False
 
 
+# Wording for a machine that already satisfied the requested state, so nothing was clicked.
+SKIP_REASONS = {
+    "set_maint": "already in maintenance",
+    "set_test": "already in test",
+    "set_both": "already in maintenance and test",
+    "unset_maint": "already not in maintenance",
+    "unset_test": "already not in test",
+    "unset_both": "already not in maintenance and not in test",
+}
+
+
+def skip_reason_text(action: str) -> str:
+    return SKIP_REASONS.get(action, "already in the requested state")
+
+
 def _clear_all_table_selection(page) -> bool:
     """
     Clear the el-table's ENTIRE selection, including rows on other pages.
@@ -2117,7 +2132,16 @@ def _process_env_batch(
                 "prod-set: %s %s skip %s — reads as already done (live=%r)",
                 belongs, verify_action, name, live,
             )
-            banked.append({"belongs": m.get("belongs", belongs), "machine": name})
+            banked.append(
+                {
+                    "belongs": m.get("belongs", belongs),
+                    "machine": name,
+                    # Reported as a success (the requested state holds) but flagged so the
+                    # summary can say the bot did not have to touch this machine.
+                    "skipped": True,
+                    "skip_reason": skip_reason_text(verify_action),
+                }
+            )
         else:
             if live is not None and not _live_state_is_usable(live, name):
                 logger.warning(
@@ -2560,6 +2584,9 @@ def _run_phased_env(
     targets = list(machines)
     all_ok: list[dict] = []
     all_fail: list[dict] = []
+    # machine -> the phases that needed no click; only a machine skipped by EVERY phase was
+    # left completely untouched, and only that may be reported as skipped.
+    phase_skips: dict[str, list[str]] = {}
 
     for step_idx, (step_verify, step_buttons) in enumerate(steps):
         if cancel_check() or manual_stop_check():
@@ -2579,6 +2606,9 @@ def _run_phased_env(
             max_pages=max_pages,
             on_phase_retry=on_phase_retry,
         )
+        for _e in phase_done:
+            if _e.get("skipped"):
+                phase_skips.setdefault(str(_e.get("machine") or ""), []).append(step_verify)
         if not phase_passed:
             all_fail.extend(pending)
             if cancel_check() or manual_stop_check():
@@ -2641,7 +2671,12 @@ def _run_phased_env(
                     page, name, live, timeout_ms=timeout_ms, max_pages=max_pages
                 )
         if verified:
-            all_ok.append({"belongs": m.get("belongs", belongs), "machine": name})
+            entry = {"belongs": m.get("belongs", belongs), "machine": name}
+            reasons = phase_skips.get(name) or []
+            if len(reasons) == len(steps):  # untouched by every phase
+                entry["skipped"] = True
+                entry["skip_reason"] = skip_reason_text(parent_action)
+            all_ok.append(entry)
         else:
             if parent_action in ("set_maint", "set_both") and live and _status_is_occupy(str(live.get("status") or "")):
                 err = "game currently running"

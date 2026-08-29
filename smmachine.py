@@ -4503,7 +4503,15 @@ def _run_prod_batch_bot_job_thread(
             lines.append(f"Requested: {req_n}  ⚠️ **{unaccounted} unaccounted**")
         lines.append("")
         for m in (summary.get("success") or [])[:30]:
-            lines.append(f"✓ {m.get('belongs')} — {m.get('machine')}")
+            # A machine that already satisfied the request was never clicked — say so, rather
+            # than showing it identically to one the bot actually changed.
+            if m.get("skipped"):
+                why = str(m.get("skip_reason") or "already in the requested state")
+                lines.append(
+                    f"✓ {m.get('belongs')} — {m.get('machine')}  ({why}) will skip this machine"
+                )
+            else:
+                lines.append(f"✓ {m.get('belongs')} — {m.get('machine')}")
         if ok_n > 30:
             lines.append(f"... and {ok_n - 30} more done")
         if fail_n:
