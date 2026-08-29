@@ -544,24 +544,43 @@ def _machine_lookup_specs(machines: list[dict]) -> list[tuple[str, dict, str, st
 
 def _resolve_specs_on_page(page, specs, *, timeout_ms):
     """
-    ``{spec: (row_locator, fields)}`` for the specs present on the CURRENT page, in one round trip.
+    ``(row_locator, fields)`` per spec on the CURRENT page, in one round trip.
 
-    Returns ``None`` when the bulk read is untrustworthy so callers keep the per-row path. Match
-    order mirrors the old code: machine-name column first, whole-row text as fallback.
+    Returns a list PARALLEL to ``specs`` (``None`` per unmatched spec), or ``None`` overall when
+    the bulk read cannot be trusted so callers keep the per-row path. A spec is
+    ``(name, machine_dict, kind, key)`` — it contains a dict and is therefore **unhashable**, so
+    results are positional, never keyed by the spec itself.
     """
     bulk = read_page_rows_bulk(page, timeout_ms=timeout_ms)
     if bulk is None:
         return None
     rows = _table_body_rows(page)
-    out: dict = {}
+    out: list = []
     for spec in specs:
         _name, _m, kind, key = spec
+        hit = None
         for i, f in enumerate(bulk):
             txt = str(f.get("name") or "").strip() or str(f.get("rowText") or "")
             if txt and _row_text_matches(kind, key, txt):
-                out[spec] = (rows.nth(i), f)
+                hit = (rows.nth(i), f)
                 break
+        out.append(hit)
     return out
+
+
+def _safe_resolve_specs_on_page(page, specs, *, timeout_ms):
+    """
+    ``_resolve_specs_on_page`` that can never fail a batch.
+
+    The fast path is an optimisation: any error in it must degrade to the per-row locator walk,
+    not abort the run. (A bug here once surfaced as every machine failing with
+    "unhashable type: 'dict'".)
+    """
+    try:
+        return _resolve_specs_on_page(page, specs, timeout_ms=timeout_ms)
+    except Exception:
+        logger.exception("prod-set: bulk row read failed; falling back to per-row scan")
+        return None
 
 
 def _batch_select_machines_on_live_page(
@@ -602,11 +621,12 @@ def _batch_select_machines_on_live_page(
 
         resolved: list[tuple[str, dict, str, str]] = []
         # One page.evaluate for the whole page instead of len(pending) x rows x 6 IPC calls.
-        hits = _resolve_specs_on_page(page, list(pending), timeout_ms=timeout_ms)
-        for spec in list(pending):
+        spec_list = list(pending)
+        hits = _safe_resolve_specs_on_page(page, spec_list, timeout_ms=timeout_ms)
+        for _i, spec in enumerate(spec_list):
             name, m, kind, key = spec
             if hits is not None:
-                hit = hits.get(spec)
+                hit = hits[_i]
                 rows = [hit[0]] if hit else []
                 fields = hit[1] if hit else None
             else:
@@ -699,11 +719,12 @@ def _batch_read_live_states(
             break
 
         resolved: list[tuple[str, dict, str, str]] = []
-        hits = _resolve_specs_on_page(page, list(pending), timeout_ms=timeout_ms)
-        for spec in list(pending):
+        spec_list = list(pending)
+        hits = _safe_resolve_specs_on_page(page, spec_list, timeout_ms=timeout_ms)
+        for _i, spec in enumerate(spec_list):
             name, _m, kind, key = spec
             if hits is not None:
-                hit = hits.get(spec)
+                hit = hits[_i]
                 rows = [hit[0]] if hit else []
                 fields = hit[1] if hit else None
             else:

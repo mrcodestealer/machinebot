@@ -1604,8 +1604,12 @@ def run_checkcredit_finderror(
                             f"{fallback_note}\n\n{intro_line}" if intro_line else fallback_note
                         )
                     same_last_line = ""
+                    latest_any_uid = latest_err_uid = ""
                     if str(mode or "").strip().lower() != "error_only":
+                        # /machineerror states the same verdict in its context markdown already.
                         same_last_line = str(np.get("same_last_line") or "")
+                        latest_any_uid = str(np.get("latest_any_uid") or "")
+                        latest_err_uid = str(np.get("latest_err_uid") or "")
                     np["np_choices"] = np_choices
                     out["lark_card_candidates"] = checkcredit.build_np_choice_lark_card(
                         np_choices,
@@ -1620,6 +1624,8 @@ def run_checkcredit_finderror(
                         navigator_same_day_multi_log=bool(np.get("navigator_same_day_multi_log")),
                         logic_log_files=list(np.get("navigator_logic_log_files") or []),
                         merged_log_files=list(np.get("navigator_merged_log_files") or []),
+                        latest_any_uid=latest_any_uid,
+                        latest_err_uid=latest_err_uid,
                     )
             except Exception as e:
                 preview_img_err = str(e)

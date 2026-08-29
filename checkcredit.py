@@ -1865,6 +1865,8 @@ def build_np_choice_lark_card(
     navigator_same_day_multi_log: bool = False,
     logic_log_files: list[str] | None = None,
     merged_log_files: list[str] | None = None,
+    latest_any_uid: str = "",
+    latest_err_uid: str = "",
 ) -> dict[str, Any]:
     """
     Lark card 2.0 player picker.
@@ -1876,6 +1878,10 @@ def build_np_choice_lark_card(
 
     ``merged_log_files`` are the same-day logic segments actually read (an agent restart starts a
     new file mid-day), shown so it is visible that the whole day was covered.
+
+    ``latest_any_uid`` / ``latest_err_uid`` move the "same player / different player" note out of
+    the card footer and onto the player row(s) it is actually about. When only one of them is
+    known the note is not player-specific, so ``same_last_line`` is rendered at the end as before.
     """
     td = (target_date_iso or "").strip()
     md = (machine_display or "").strip()
@@ -1886,6 +1892,23 @@ def build_np_choice_lark_card(
     files_read = [str(f).strip() for f in (merged_log_files or []) if str(f).strip()]
     n = len(np_choices)
     actionable_n = sum(1 for ch in np_choices if str(ch.get("time_short") or "").strip())
+    la_uid = str(latest_any_uid or "").strip()
+    le_uid = str(latest_err_uid or "").strip()
+
+    def _row_note(uid: str) -> str:
+        """The footer's same/different verdict, said next to the player it describes."""
+        if not (uid and la_uid and le_uid):
+            return ""
+        if uid == la_uid == le_uid:
+            return (
+                "\u2139\ufe0f **Same player** \u2014 last activity in the log **and** the last "
+                "error line are this user ID."
+            )
+        if uid == la_uid:
+            return "\u2139\ufe0f **Last player in the log** \u2014 not the last one with an error."
+        if uid == le_uid:
+            return "\u2139\ufe0f **Last player with an error** \u2014 not the last one in the log."
+        return ""
     any_error = any(
         isinstance(ch.get("errors_n"), int) and ch["errors_n"] > 0 for ch in np_choices
     )
@@ -1966,10 +1989,15 @@ def build_np_choice_lark_card(
     if not n:
         _hr()
         _div("_No players to list for this day._")
+    noted = False
     for i, ch in enumerate(np_choices, start=1):
         _hr()
         _div(_np_choice_row_md(i, ch))
         uid = str(ch.get("user_id") or "").strip()
+        note = _row_note(uid)
+        if note:
+            _div(note)
+            noted = True
         body_elements.append(
             _np_lark_v2_button_row(
                 [
@@ -1983,8 +2011,9 @@ def build_np_choice_lark_card(
             )
         )
 
+    # Only a leftover: when the verdict was pinned to a row above, do not repeat it here.
     sll = (same_last_line or "").strip()
-    if sll:
+    if sll and not noted:
         _div(f"\u2139\ufe0f {sll}")
 
     if navigator_same_day_multi_log or len(files_all) >= 2:
@@ -3024,6 +3053,8 @@ def run_finderror(
             navigator_same_day_multi_log=bool(np_followup.get("navigator_same_day_multi_log")),
             logic_log_files=list(np_followup.get("navigator_logic_log_files") or []),
             merged_log_files=list(np_followup.get("navigator_merged_log_files") or []),
+            latest_any_uid=str(np_followup.get("latest_any_uid") or ""),
+            latest_err_uid=str(np_followup.get("latest_err_uid") or ""),
         ),
         "lark_card_same_player": build_same_latest_players_card(
             machine_display=machine_display,
