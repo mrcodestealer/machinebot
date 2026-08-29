@@ -1247,9 +1247,20 @@ _HEADER_JS = r"""() => {
 }"""
 
 
+# Resolving the header costs a page.evaluate, and the row readers call this for EVERY row --
+# setting an attribute on a Playwright Page is not reliable, so cache module-side keyed by the
+# page's identity. Without this the header lookup ran once per row, re-adding exactly the
+# per-row round-trip cost the bulk reader exists to remove.
+_COL_IDX_CACHE: dict[int, dict] = {}
+_COL_IDX_LOGGED: set[tuple] = set()
+
+
 def _resolve_column_indices(page) -> dict:
-    """``{'name': i, 'game': i, 'status': i, 'online': i}`` for the current table."""
-    cached = getattr(page, "_egm_col_idx", None)
+    """``{'name': i, 'game': i, 'status': i, 'online': i}`` for the current table (cached)."""
+    if page is None:
+        return dict(_COL_FALLBACK)
+    ckey = id(page)
+    cached = _COL_IDX_CACHE.get(ckey)
     if isinstance(cached, dict) and cached:
         return cached
     idx = dict(_COL_FALLBACK)
@@ -1267,21 +1278,25 @@ def _resolve_column_indices(page) -> dict:
         # Only trust a header map that located the two columns the verify logic depends on.
         if "status" in found and "online" in found:
             idx.update(found)
-            if idx != _COL_FALLBACK:
+            sig = ("ok", tuple(labels), tuple(sorted(idx.items())))
+            if idx != _COL_FALLBACK and sig not in _COL_IDX_LOGGED:
+                _COL_IDX_LOGGED.add(sig)
                 print(
                     f"[prod-batch] EGM columns resolved from header {labels!r} -> {idx}",
                     flush=True,
                 )
         else:
-            print(
-                f"[prod-batch] could not resolve Status/Online from header {labels!r}; "
-                f"using fallback indices {idx}",
-                flush=True,
-            )
-    try:
-        page._egm_col_idx = idx  # type: ignore[attr-defined]
-    except Exception:
-        pass
+            sig = ("fallback", tuple(labels))
+            if sig not in _COL_IDX_LOGGED:
+                _COL_IDX_LOGGED.add(sig)
+                print(
+                    f"[prod-batch] could not resolve Status/Online from header {labels!r}; "
+                    f"using fallback indices {idx}",
+                    flush=True,
+                )
+    if len(_COL_IDX_CACHE) > 16:  # bounded: a handful of long-lived pages at most
+        _COL_IDX_CACHE.clear()
+    _COL_IDX_CACHE[ckey] = idx
     return idx
 
 
