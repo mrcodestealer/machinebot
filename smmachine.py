@@ -756,12 +756,49 @@ def _bulk_row_read_enabled() -> bool:
     )
 
 
+# Set once the bulk read is proven to agree with the per-row reader (or proven not to).
+_BULK_ROWS_VERDICT: bool | None = None
+
+
+def _bulk_matches_per_row(page, data: list[dict], *, timeout_ms: int) -> bool:
+    """
+    Cross-check the bulk read against the authoritative per-row reader on one sample row.
+
+    Both are supposed to read the same cells (name=1, game=2, status=6, online=7), but the column
+    layout is not guaranteed to be identical on every EGM table — and a silently mis-indexed
+    status turns every verify into "status not as expected". Costs ~6 IPC calls once per process.
+    """
+    try:
+        rows = _table_body_rows(page)
+        mn, is_test, _gt, status, online = _row_report_fields(rows.nth(0), timeout_ms=timeout_ms)
+    except Exception:
+        return True  # cannot compare -> do not condemn the fast path on that basis
+    got = data[0]
+    same = (
+        str(got.get("name") or "").strip() == (mn or "").strip()
+        and str(got.get("status") or "").strip() == (status or "").strip()
+        and str(got.get("online") or "").strip() == (online or "").strip()
+        and bool(got.get("test")) == bool(is_test)
+    )
+    if not same:
+        print("[prod-batch] bulk row read DISAGREES with per-row read; disabling fast path.", flush=True)
+        print(f"   per-row: name={mn!r} status={status!r} online={online!r} test={is_test}", flush=True)
+        print(
+            f"   bulk   : name={got.get('name')!r} status={got.get('status')!r} "
+            f"online={got.get('online')!r} test={got.get('test')} cells={got.get('cells')}",
+            flush=True,
+        )
+    return same
+
+
 def read_page_rows_bulk(page, *, timeout_ms: int) -> list[dict] | None:
     """
     All rows of the current page in one round trip, or ``None`` when the read cannot be trusted
-    (count mismatch / evaluate failure) so callers fall back to the per-row path unchanged.
+    (count mismatch / evaluate failure / disagreement with the per-row reader) so callers fall
+    back to the per-row path unchanged.
     """
-    if not _bulk_row_read_enabled():
+    global _BULK_ROWS_VERDICT
+    if not _bulk_row_read_enabled() or _BULK_ROWS_VERDICT is False:
         return None
     rows = _table_body_rows(page)
     try:
@@ -775,6 +812,13 @@ def read_page_rows_bulk(page, *, timeout_ms: int) -> list[dict] | None:
         return None
     if not isinstance(data, list) or len(data) != n or n == 0:
         return None
+    if _BULK_ROWS_VERDICT is None:
+        # Prove the optimisation is equivalent before trusting it with mutation decisions.
+        _BULK_ROWS_VERDICT = _bulk_matches_per_row(page, data, timeout_ms=timeout_ms)
+        if _BULK_ROWS_VERDICT is False:
+            return None
+        print("[prod-batch] bulk row read verified against per-row reader — fast path active.",
+              flush=True)
     return data
 
 
