@@ -2680,11 +2680,24 @@ def _run_phased_env(
         else:
             if parent_action in ("set_maint", "set_both") and live and _status_is_occupy(str(live.get("status") or "")):
                 err = "game currently running"
+            elif not live:
+                # No row read at all -- the machine was not located on the refreshed table.
+                # Distinguished from a genuine state mismatch because the causes and the fix
+                # are completely different (pagination/filter/renamed row vs action not applied).
+                err = (
+                    "final EGM check: machine row not found on the refreshed EGM page "
+                    "(action may have applied — please re-check this machine)"
+                )
+                logger.warning(
+                    "prod-set: %s %s final verify found NO row for %s", belongs, parent_action, name
+                )
+            elif not _live_state_is_usable(live, name):
+                err = f"final EGM check: row state unreadable (live={live!r})"
             else:
-                detail = ""
-                if live:
-                    detail = f" (live status={live.get('status')!r}, test={live.get('test')})"
-                err = f"final EGM check failed{detail}"
+                err = (
+                    f"final EGM check failed (live status={live.get('status')!r}, "
+                    f"test={live.get('test')})"
+                )
             all_fail.append(
                 {
                     "belongs": m.get("belongs", belongs),
