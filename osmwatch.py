@@ -1600,7 +1600,11 @@ def _fmt_encoder_machine(entry: dict, only_types: "set[str] | None" = None) -> s
         if drift:
             lines.append(f"↪️ TRTC page still lists `{drift}`")
         room, user, sig = info.get("room_id") or "", info.get("user_id") or "", info.get("user_sig") or ""
-        if ENCODER_APP_ID:
+        # The SDKAppID only means something next to a room, so it is shown only
+        # when this stream actually has a TRTC encoder. On an IP-only stream (one
+        # the IP Audit knows but trtc-details has no room for) a lone APP ID would
+        # read as "there is a TRTC encoder here" when there is not.
+        if ENCODER_APP_ID and (room or user or sig):
             lines.append(f"🆔 APP ID   : `{ENCODER_APP_ID}`")
         if room:
             lines.append(f"🏠 ROOM ID  : `{room}`")
@@ -1692,7 +1696,8 @@ def _encoder_machine_md(entry: dict, only_types: "set[str] | None" = None) -> st
         if drift:
             block.append(f"↪️ TRTC page still lists `{drift}`")
         room, user, sig = info.get("room_id") or "", info.get("user_id") or "", info.get("user_sig") or ""
-        if ENCODER_APP_ID:
+        # Shown only when this stream has a TRTC encoder — see _fmt_encoder_machine.
+        if ENCODER_APP_ID and (room or user or sig):
             block.append(f"🆔 APP ID   : `{ENCODER_APP_ID}`")
         if room:
             block.append(f"🏠 ROOM ID  : `{room}`")
