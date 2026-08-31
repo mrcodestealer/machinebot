@@ -16,7 +16,7 @@ Runs on its own Lark app in **persistent connection** mode (Subscription mode �
 | `machine status NWR2008` | read-only status from the live scrape (`webmachine_data.json`) |
 | `/findmachine` or `/fm` | interactive card: environment + game type + online/offline → machine names |
 | `/nch /nwr /wf /tbr /tbp /cp /dhs /mdr <id(s)>` | asset / encoder sheet lookup, rendered as a TRTC-parsed card |
-| `/encoder nwr2205 & nwr2206` | MAIN/POOL/CCTV encoder IPs from `latestencoder.json` (`/encoder refresh` re-scrapes) |
+| `/encoder nwr2205 & nwr2206` | MAIN/POOL/CCTV encoder IPs — IP from the OSM-Watch **IP Audit** (CMDB column, `latestmachineip.json`), TRTC room/user/sig from `latestencoder.json` (`/encoder refresh` re-scrapes both) |
 | `/osmwatch [url]` | OSM-Watch dashboard screenshot (warm browser) |
 | `/loginosmwatch` | force a fresh OSM-Watch login QR (posted to the lab group) |
 | `/checkcredit <machine> [YYYY-MM-DD]` | today's/dated log → latest players → NP choice card (Third Http) |
@@ -45,7 +45,7 @@ The `/wm` machine dashboard (webmachine blueprint) is served on the bot's Flask 
 - `amountloss.py` — FPMS Amount Loss + CHECKLOG (`/al`); `chatagent.py` — optional LLM used by the AI summary
 - `webmachine.py` — machine dashboard + scrape loop; `webapp.py` here is a thin **alias** to it
 - `findmachine.py`, `machine_card.py` — find-machine form card + TRTC card rendering
-- `osmwatch.py` — OSM-Watch warm browser, QR login, encoder scraper (`latestencoder.json`)
+- `osmwatch.py` — OSM-Watch warm browser, QR login, IP-Audit scraper (`latestmachineip.json`) + TRTC encoder scraper (`latestencoder.json`)
 - `reminder.py` — one-time maintenance reminders (Bitable sheet + APScheduler)
 - `nch/nwr/winford/tbr/tbp/cp/dhs/mdr.py` — per-site asset sheet lookups (`mdr.py` patched to read
   `MDR_APP_ID`/`MDR_APP_SECRET` from `.env` instead of hardcoded credentials)
@@ -76,10 +76,11 @@ Lark developer console for this app:
 | --- | --- |
 | `webmachine_data.json` | machine list used by set/unset targeting + `/findmachine` before the first scrape finishes |
 | `osmwatch.json` | OSM-Watch Playwright session — without it the bot needs a fresh `/loginosmwatch` QR |
-| `latestencoder.json` | `/encoder` reads only this file; empty until the first authenticated scrape |
+| `latestmachineip.json` | machine IPs from the IP Audit (CMDB column) — the source `/encoder` shows; empty until the first authenticated scrape |
+| `latestencoder.json` | TRTC room / user id / user sig per machine; empty until the first authenticated scrape |
 
 ```bash
-scp root@<oldserver>:/root/osedutybot/{webmachine_data.json,osmwatch.json,latestencoder.json} /root/machinebot/
+scp root@<oldserver>:/root/osedutybot/{webmachine_data.json,osmwatch.json,latestencoder.json,latestmachineip.json} /root/machinebot/
 ```
 
 ## systemd service (server)

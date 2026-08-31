@@ -11,7 +11,9 @@ This is a self-contained bot that ONLY does the machine + encoder flows mirrored
   - ``machine status <names>``                 read-only status from webmachine_data.json
   - ``/findmachine`` (``/fm``)                 interactive card: env + game type + online/offline
   - ``/nch /nwr /wf /tbr /tbp /cp /dhs /mdr``  asset/encoder sheet lookups (TRTC-parsed cards)
-  - ``/encoder <machine(s)>``                  MAIN/POOL/CCTV IPs from OSM-Watch (latestencoder.json)
+  - ``/encoder <machine(s)>``                  MAIN/POOL/CCTV IPs from OSM-Watch's IP Audit
+                                              (CMDB column -> latestmachineip.json); TRTC
+                                              room/user/sig from latestencoder.json
   - ``/osmwatch [url]``                        OSM-Watch dashboard screenshot (warm browser)
   - ``/loginosmwatch``                         force a fresh OSM-Watch login QR (lab group)
   - ``/wm``                                    machine dashboard (webmachine blueprint + scrape loop)

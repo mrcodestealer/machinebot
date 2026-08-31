@@ -34,6 +34,8 @@ Usage
   python osmwatch.py --send              # also send the PNG to the Lark duty chat
   python osmwatch.py --send-to oc_xxx    # send to a specific chat_id
   python osmwatch.py --url https://osm-watch.cliveslot.com/some/page --send
+  python osmwatch.py --ipaudit-scrape    # refresh latestmachineip.json (CMDB IPs)
+  python osmwatch.py --encoder-scrape    # refresh latestencoder.json (TRTC)
   python osmwatch.py --headed            # watch it run locally (debug)
 
 Requires: pip install playwright python-dotenv requests && playwright install chromium
@@ -1096,6 +1098,11 @@ def do_encoder_dump(
 # page.evaluate — no per-asset clicking. Rows are grouped by machine into
 # latestencoder.json; the warm browser re-scrapes on a silent interval, and the
 # /encoder lookup reads the FILE (never the browser) so replies are instant.
+#
+# NOTE: the IP shown by /encoder does NOT come from here. This page's IPs go
+# stale when a machine is re-addressed; the IP Audit below is the live source,
+# and its CMDB column wins. This file supplies the TRTC fields only (room id /
+# user id / user sig / status), which the audit doesn't carry.
 LATESTENCODER_JSON = _ROOT_DIR / os.getenv("OSMWATCH_ENCODER_DATA_FILE", "latestencoder.json")
 
 # data-type on each row -> our normalized stream type. "top" is the dashboard's
@@ -1223,29 +1230,238 @@ def _build_encoder_snapshot(rows: list[dict]) -> dict:
     }
 
 
-def _persist_latestencoder(snapshot: dict) -> None:
-    # Atomic write: the warm browser rewrites this every ~30 min on its worker
-    # thread while /encoder reads it from separate command threads. Writing to a
-    # temp file then os.replace() means a reader never sees a truncated/partial
-    # file (which, since status cells carry a multibyte glyph like "⚠", could
-    # otherwise split a UTF-8 sequence mid-read).
+def _persist_snapshot(path: Path, snapshot: dict, *, log_tag: str) -> None:
+    # Atomic write: the warm browser rewrites these files every ~30 min on its
+    # worker thread while /encoder reads them from separate command threads.
+    # Writing to a temp file then os.replace() means a reader never sees a
+    # truncated/partial file (which, since status cells carry a multibyte glyph
+    # like "⚠", could otherwise split a UTF-8 sequence mid-read).
     try:
         data = json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n"
-        tmp = LATESTENCODER_JSON.with_name(LATESTENCODER_JSON.name + ".tmp")
+        tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(data, encoding="utf-8")
-        os.replace(tmp, LATESTENCODER_JSON)
+        os.replace(tmp, path)
     except OSError as e:
-        print(f"[osmwatch-enc] could not save {LATESTENCODER_JSON.name}: {e!r}", flush=True)
+        print(f"[{log_tag}] could not save {path.name}: {e!r}", flush=True)
 
 
-def load_latestencoder() -> dict | None:
+def _load_snapshot(path: Path) -> dict | None:
     # ValueError covers both json.JSONDecodeError and UnicodeDecodeError, so a
     # torn read degrades to the graceful "not ready yet" path instead of crashing.
     try:
-        raw = json.loads(LATESTENCODER_JSON.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return raw if isinstance(raw, dict) else None
+
+
+def _persist_latestencoder(snapshot: dict) -> None:
+    _persist_snapshot(LATESTENCODER_JSON, snapshot, log_tag="osmwatch-enc")
+
+
+def load_latestencoder() -> dict | None:
+    return _load_snapshot(LATESTENCODER_JSON)
+
+
+# ---------------------------------------------------------------------------
+# IP Audit -> latestmachineip.json  (the authoritative machine-IP source)
+# ---------------------------------------------------------------------------
+# /manage-ip/inventory-sources/ (the "IP Audit" tab) is where OSM-Watch now keeps
+# the LATEST machine IPs. Its table compares three sources per machine+stream —
+# CMDB vs Lark Sheet vs OSM-Watch — and CMDB is the column to trust, so that is
+# what we store and what /encoder /main /pool /cctv show. trtc-details stays the
+# source for the TRTC fields (room id / user id / user sig / status), which the
+# audit doesn't carry: IP from here, TRTC from there.
+#
+# The table paginates at 100 rows (~85 pages), but the page's own JS pulls the
+# WHOLE dataset from a JSON endpoint, so we call that endpoint from inside the
+# authenticated page instead of walking the DOM. Two details that matter:
+#   * "Hide offline / hidden / not found" is a CLIENT-SIDE filter — the endpoint
+#     always returns every row. We still untick it on the page so a screenshot
+#     (and the DOM fallback) shows the same unfiltered set we store.
+#   * offline / hidden / not-found machines are KEPT. Being offline doesn't make
+#     a machine's IP wrong, and dropping them would silently shrink /encoder.
+IPAUDIT_URL = os.getenv("OSMWATCH_IPAUDIT_URL", f"{OSM_BASE}/manage-ip/inventory-sources/")
+IPAUDIT_API_PATH = os.getenv("OSMWATCH_IPAUDIT_API", "/manage-ip/inventory-sources/ip-audit/")
+LATESTMACHINEIP_JSON = _ROOT_DIR / os.getenv("OSMWATCH_IPAUDIT_DATA_FILE", "latestmachineip.json")
+
+# The audit's ip_type -> the same stream vocabulary the TRTC scraper uses, so the
+# two snapshots merge cleanly per machine+stream.
+_IPAUDIT_TYPE_MAP = {"main": "main", "top": "pool", "pool": "pool", "cctv": "cctv"}
+# Which column wins. CMDB first — that's the rule; the Lark sheet / OSM-Watch
+# columns are fallbacks only for rows where CMDB is blank (or CMDB is down).
+_IPAUDIT_IP_FIELDS = (("cmdb_ip", "cmdb"), ("lark_ip", "lark"), ("osm_ip", "osm"))
+_IPAUDIT_SOURCE_LABEL = {"cmdb": "CMDB", "lark": "Lark sheet", "osm": "OSM-Watch"}
+
+
+def _ipaudit_enabled() -> bool:
+    return _truthy(os.getenv("OSMWATCH_IPAUDIT", "1"))
+
+
+# Runs inside the authenticated page: unticks the "hide inactive" checkbox, then
+# fetches the audit JSON with the page's own session cookies. If that fetch fails
+# it falls back to the rows the page already loaded into its `auditRows` binding
+# (a top-level `let`, reachable from an evaluated script).
+_IPAUDIT_ROWS_JS = r"""
+async (apiPath) => {
+  // Untick "Hide offline / hidden / not found". It only filters the rendered
+  // table, but we want the visible page to match the unfiltered set we store.
+  let unticked = false;
+  try {
+    const cb = document.querySelector('#audit-hide-inactive');
+    if (cb && cb.checked) {
+      cb.checked = false;
+      cb.dispatchEvent(new Event('change', { bubbles: true }));
+      unticked = true;
+    }
+  } catch (e) {}
+  const pageRows = () => {
+    try {
+      if (typeof auditRows !== 'undefined' && Array.isArray(auditRows) && auditRows.length) {
+        return auditRows;
+      }
+    } catch (e) {}
+    return null;
+  };
+  try {
+    const r = await fetch(apiPath, {
+      credentials: 'same-origin',
+      headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const ct = r.headers.get('content-type') || '';
+    if (ct.indexOf('json') === -1) throw new Error('non-JSON response (' + ct + ')');
+    const d = await r.json();
+    if (!d || d.success === false) throw new Error((d && d.error) || 'endpoint returned success=false');
+    return { ok: true, via: 'api', unticked,
+             rows: d.rows || [], cmdb_available: d.cmdb_available !== false };
+  } catch (e) {
+    const rows = pageRows();
+    if (rows) {
+      return { ok: true, via: 'page', unticked, rows, cmdb_available: true,
+               note: 'api fetch failed: ' + String(e) };
+    }
+    return { ok: false, error: String(e) };
+  }
+}
+"""
+
+
+def _ipaudit_pick_ip(row: dict) -> tuple[str, str]:
+    """``(ip, source)`` for one audit row — CMDB, else Lark sheet, else OSM-Watch."""
+    for field, source in _IPAUDIT_IP_FIELDS:
+        val = str(row.get(field) or "").strip()
+        if val:
+            return val, source
+    return "", ""
+
+
+def _group_ipaudit_rows(rows: list[dict]) -> dict[str, dict]:
+    """Group audit rows into ``{UPPER_MACHINE: {machine, env, backend_status, types}}``.
+
+    Every row is kept — including offline / hidden / not-found machines, which the
+    page's default checkbox would hide (see the section note above)."""
+    machines: dict[str, dict] = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        machine = str(r.get("machine") or "").strip()
+        if not machine:
+            continue
+        raw_type = str(r.get("ip_type") or r.get("type") or "").strip().lower()
+        typ = _IPAUDIT_TYPE_MAP.get(raw_type, raw_type or "?")
+        env = str(r.get("env") or "").strip()
+        backend = str(r.get("backend_status") or "").strip()
+        entry = machines.setdefault(
+            machine.upper(),
+            {"machine": machine, "env": env, "backend_status": backend, "types": {}},
+        )
+        if env and not entry.get("env"):
+            entry["env"] = env
+        if backend and not entry.get("backend_status"):
+            entry["backend_status"] = backend
+        ip, source = _ipaudit_pick_ip(r)
+        entry["types"][typ] = {
+            "ip": ip,
+            "ip_source": source,
+            "cmdb_ip": str(r.get("cmdb_ip") or "").strip(),
+            "lark_ip": str(r.get("lark_ip") or "").strip(),
+            "osm_ip": str(r.get("osm_ip") or "").strip(),
+            "audit_status": str(r.get("status") or "").strip(),
+        }
+    return machines
+
+
+def _build_ipaudit_snapshot(result: dict) -> dict:
+    rows = result.get("rows") or []
+    machines = _group_ipaudit_rows(rows)
+    return {
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": IPAUDIT_URL,
+        "via": result.get("via") or "api",
+        "cmdb_available": bool(result.get("cmdb_available", True)),
+        "row_count": len(rows),
+        "machine_count": len(machines),
+        "machines": machines,
+    }
+
+
+def _persist_latestmachineip(snapshot: dict) -> None:
+    _persist_snapshot(LATESTMACHINEIP_JSON, snapshot, log_tag="osmwatch-ip")
+
+
+def load_latestmachineip() -> dict | None:
+    return _load_snapshot(LATESTMACHINEIP_JSON)
+
+
+def _merge_latest_ips(entry: dict, audit_entry: dict | None) -> dict:
+    """Overlay the audit's IP onto a TRTC entry — the audit wins for the IP only.
+
+    The TRTC page's own IP is preserved as ``trtc_ip`` when the two disagree, so
+    the drift gets reported instead of silently overwritten. Streams the audit
+    knows about but TRTC doesn't are added IP-only, so ``/cctv`` still answers for
+    a machine whose CCTV encoder was never registered as a TRTC room."""
+    if not audit_entry:
+        return entry
+    audit_types = audit_entry.get("types") or {}
+    merged = dict(entry)
+    merged["types"] = {}
+    for typ, info in (entry.get("types") or {}).items():
+        info = dict(info)
+        aud = audit_types.get(typ) or {}
+        latest = str(aud.get("ip") or "").strip()
+        if latest:
+            trtc_ip = str(info.get("ip") or "").strip()
+            if trtc_ip and trtc_ip != latest:
+                info["trtc_ip"] = trtc_ip
+            info["ip"] = latest
+            info["ip_source"] = aud.get("ip_source") or ""
+        merged["types"][typ] = info
+    for typ, aud in audit_types.items():
+        ip = str(aud.get("ip") or "").strip()
+        if typ in merged["types"] or not ip:
+            continue
+        merged["types"][typ] = {"ip": ip, "ip_source": aud.get("ip_source") or "", "ip_only": True}
+    if not merged.get("env") and audit_entry.get("env"):
+        merged["env"] = audit_entry["env"]
+    if audit_entry.get("backend_status"):
+        merged["backend_status"] = audit_entry["backend_status"]
+    return merged
+
+
+def _entry_from_audit(audit_entry: dict) -> dict:
+    """Build an IP-only entry for a machine the TRTC page has no row for."""
+    types = {}
+    for typ, aud in (audit_entry.get("types") or {}).items():
+        ip = str(aud.get("ip") or "").strip()
+        if ip:
+            types[typ] = {"ip": ip, "ip_source": aud.get("ip_source") or "", "ip_only": True}
+    return {
+        "machine": audit_entry.get("machine") or "?",
+        "env": audit_entry.get("env") or "",
+        "backend_status": audit_entry.get("backend_status") or "",
+        "types": types,
+    }
 
 
 def _parse_encoder_queries(arg: str) -> list[str]:
@@ -1279,11 +1495,97 @@ def _only_types_label(only_types: "set[str] | None") -> str:
     return (" ".join(labels) + " ") if labels else ""
 
 
+def _log_merge_overlap(enc_snap: dict | None, ip_snap: dict | None) -> dict:
+    """Log how many TRTC machines the audit supplied an IP for, and return the counts.
+
+    The two pages are joined on the machine name, so this is the number that tells
+    you the join is actually working: a near-zero overlap means the pages name
+    machines differently and every /encoder answer is falling back to the stale
+    trtc-details IP. Cheap to compute, and silent failure here would be invisible."""
+    enc = set((enc_snap or {}).get("machines") or {})
+    aud = set((ip_snap or {}).get("machines") or {})
+    counts = {"trtc": len(enc), "audit": len(aud), "both": len(enc & aud),
+              "trtc_only": len(enc - aud), "audit_only": len(aud - enc)}
+    if enc and aud:
+        pct = 100.0 * counts["both"] / len(enc)
+        warn = "  ⚠ machine names may not match between the two pages" if pct < 50 else ""
+        print(f"[osmwatch-ip] IP merge: {counts['both']}/{counts['trtc']} TRTC machines got a "
+              f"live IP ({pct:.0f}%); {counts['audit_only']} audit-only, "
+              f"{counts['trtc_only']} without an audit row{warn}", flush=True)
+    return counts
+
+
+def _ip_provenance_note(shown: list) -> str:
+    """One-line note when the IP didn't come from the usual place (or at all).
+
+    Silent for the normal case (a CMDB IP plus a registered TRTC room), so it only
+    ever appears when it explains something the reader would otherwise wonder
+    about. The two oddities can coexist — a machine with no TRTC room AND a blank
+    CMDB cell — so both are reported in the same line rather than one hiding the
+    other."""
+    if not shown:
+        return ""
+    fallbacks = sorted({info.get("ip_source") for _, info in shown
+                        if info.get("ip_source") and info.get("ip_source") != "cmdb"})
+    names = ", ".join(_IPAUDIT_SOURCE_LABEL.get(s, s) for s in fallbacks)
+    if all(info.get("ip_only") for _, info in shown):
+        col = f"CMDB column blank; used {names}" if names else "CMDB"
+        return f"ℹ️ IP from the OSM-Watch IP Audit ({col}) — no TRTC room registered."
+    if names:
+        return f"ℹ️ CMDB column blank — IP taken from {names}."
+    return ""
+
+
+def _encoder_updated_label(snap: dict | None, ip_snap: dict | None) -> str:
+    """``updated <trtc-scrape> · IPs <audit-scrape>`` — two sources, two timestamps."""
+    enc = (snap or {}).get("updated_at") or "?"
+    ip = (ip_snap or {}).get("updated_at")
+    return f"updated {enc}" + (f" · IPs {ip}" if ip else "")
+
+
+def _match_encoder_machines(
+    arg: str, only_types: "set[str] | None" = None
+) -> "tuple[list[str], dict[str, dict], dict, dict]":
+    """Resolve a query into ``(tokens, matched, trtc_snap, ip_snap)``.
+
+    Every matched entry has the LATEST IP applied: TRTC gives the room/user/sig,
+    the IP Audit gives the IP. A machine the audit knows but TRTC has no row for
+    is still returned (IP-only) — the IP is the part people ask for, and it would
+    be wrong to answer "no match" when we hold a current address for it."""
+    snap = load_latestencoder() or {}
+    ip_snap = load_latestmachineip() or {}
+    machines = snap.get("machines") or {}
+    audit = ip_snap.get("machines") or {}
+    tokens = _parse_encoder_queries(arg)
+    matched: dict[str, dict] = {}
+    if not tokens:
+        return tokens, matched, snap, ip_snap
+    for tok in tokens:
+        up = tok.upper()
+        for key, entry in machines.items():
+            if up in key:
+                matched.setdefault(key, _merge_latest_ips(entry, audit.get(key)))
+        for key in sorted(audit):
+            if up in key and key not in machines:
+                built = _entry_from_audit(audit[key])
+                if built["types"]:
+                    matched.setdefault(key, built)
+    if only_types:
+        matched = {k: v for k, v in matched.items() if _entry_types_filtered(v, only_types)}
+    return tokens, matched, snap, ip_snap
+
+
+def _known_machine_count(snap: dict, ip_snap: dict) -> int:
+    """How many distinct machines either source knows about."""
+    return len((snap.get("machines") or {}).keys() | (ip_snap.get("machines") or {}).keys())
+
+
 def _fmt_encoder_machine(entry: dict, only_types: "set[str] | None" = None) -> str:
     machine = entry.get("machine") or "?"
     env = entry.get("env") or ""
     lines = [f"🎥 **{machine}**" + (f" ({env})" if env else "")]
-    for t, info in _entry_types_filtered(entry, only_types):
+    shown = _entry_types_filtered(entry, only_types)
+    for t, info in shown:
         ip = info.get("ip") or "—"
         meta = " · ".join(x for x in (info.get("status") or "", info.get("updated") or "") if x)
         label = _ENCODER_TYPE_LABEL.get(t, t.upper())
@@ -1292,6 +1594,11 @@ def _fmt_encoder_machine(entry: dict, only_types: "set[str] | None" = None) -> s
         if meta:
             head += f"  {meta}"
         lines.append(head)
+        # Only set when the TRTC page disagrees with the audit — worth surfacing:
+        # it means that room is still pointed at the machine's old address.
+        drift = info.get("trtc_ip")
+        if drift:
+            lines.append(f"↪️ TRTC page still lists `{drift}`")
         room, user, sig = info.get("room_id") or "", info.get("user_id") or "", info.get("user_sig") or ""
         if ENCODER_APP_ID:
             lines.append(f"🆔 APP ID   : `{ENCODER_APP_ID}`")
@@ -1301,40 +1608,33 @@ def _fmt_encoder_machine(entry: dict, only_types: "set[str] | None" = None) -> s
             lines.append(f"👤 User ID  : `{user}`")
         if sig:
             lines.append(f"🔑 User Sig : `{sig}`")
+    note = _ip_provenance_note(shown)
+    if note:
+        lines.append(note)
     return "\n".join(lines)
 
 
 def query_encoder(arg: str, only_types: "set[str] | None" = None) -> list[str]:
-    """Look up machines in latestencoder.json; return Lark-ready message string(s).
+    """Look up machines and return Lark-ready message string(s).
 
     Tokens split on whitespace / comma / ``&`` and matched as case-insensitive
     substrings of the machine name (e.g. ``nwr2205`` -> ``NWR2205``). ``only_types``
-    restricts output to one stream (``/main`` / ``/pool`` / ``/cctv``)."""
-    snap = load_latestencoder()
+    restricts output to one stream (``/main`` / ``/pool`` / ``/cctv``). IPs come from
+    ``latestmachineip.json`` (IP Audit / CMDB), TRTC fields from ``latestencoder.json``."""
+    tokens, matched, snap, ip_snap = _match_encoder_machines(arg, only_types)
     label = _only_types_label(only_types)  # "MAIN " / "" — used in headings + usage
     cmd_hint = f"/{next(iter(only_types))}" if (only_types and len(only_types) == 1) else "/encoder"
-    if not snap or not snap.get("machines"):
+    if not (snap.get("machines") or ip_snap.get("machines")):
         return ["⚠️ Encoder data isn't ready yet — it's scraped in the background. "
                 "Try again shortly (or run `/encoder refresh`)."]
-    machines = snap.get("machines") or {}
-    updated = snap.get("updated_at") or "?"
-    tokens = _parse_encoder_queries(arg)
+    updated = _encoder_updated_label(snap, ip_snap)
     if not tokens:
         return [f"Usage: `{cmd_hint} <machine>` — e.g. `{cmd_hint} nwr2205` "
                 f"(multiple: `nwr2205 & nwr2206`).\n"
-                f"📅 {snap.get('machine_count', '?')} machines · updated {updated}"]
-
-    matched: dict[str, dict] = {}  # ordered, deduped by machine key
-    for tok in tokens:
-        up = tok.upper()
-        for key, entry in machines.items():
-            if up in key:
-                matched.setdefault(key, entry)
-    if only_types:
-        matched = {k: v for k, v in matched.items() if _entry_types_filtered(v, only_types)}
+                f"📅 {_known_machine_count(snap, ip_snap)} machines · {updated}"]
 
     if not matched:
-        return [f"🔎 No {label}encoder machine matched: {', '.join(tokens)}\n📅 updated {updated}"]
+        return [f"🔎 No {label}encoder machine matched: {', '.join(tokens)}\n📅 {updated}"]
 
     cap = _encoder_max_matches()
     keys = list(matched.keys())
@@ -1342,7 +1642,7 @@ def query_encoder(arg: str, only_types: "set[str] | None" = None) -> list[str]:
     keys = keys[:cap]
 
     header = (f"🎬 **{label}Encoder RTC** — {len(matched)} match(es) for {', '.join(tokens)}"
-              f"\n📅 updated {updated}")
+              f"\n📅 {updated}")
     blocks = [header] + [_fmt_encoder_machine(matched[k], only_types) for k in keys]
     if truncated:
         blocks.append(f"… {len(matched) - cap} more not shown — narrow your query.")
@@ -1376,7 +1676,8 @@ def _encoder_machine_md(entry: dict, only_types: "set[str] | None" = None) -> st
     machine = entry.get("machine") or "?"
     env = entry.get("env") or ""
     parts = [f"🎥 **{machine}**" + (f"  ·  {env}" if env else "")]
-    for t, info in _entry_types_filtered(entry, only_types):
+    shown = _entry_types_filtered(entry, only_types)
+    for t, info in shown:
         emoji = _ENCODER_TYPE_EMOJI.get(t, "🎞️")
         label = _ENCODER_TYPE_LABEL.get(t, t.upper())
         ip = info.get("ip") or "—"
@@ -1387,6 +1688,9 @@ def _encoder_machine_md(entry: dict, only_types: "set[str] | None" = None) -> st
         block = [f"{emoji} **{label} Encoder** — IP ADDRESS `{ip}`"]
         if meta:
             block.append(meta)
+        drift = info.get("trtc_ip")
+        if drift:
+            block.append(f"↪️ TRTC page still lists `{drift}`")
         room, user, sig = info.get("room_id") or "", info.get("user_id") or "", info.get("user_sig") or ""
         if ENCODER_APP_ID:
             block.append(f"🆔 APP ID   : `{ENCODER_APP_ID}`")
@@ -1397,6 +1701,9 @@ def _encoder_machine_md(entry: dict, only_types: "set[str] | None" = None) -> st
         if sig:
             block.append(f"🔑 User Sig : `{sig}`")
         parts.append("\n".join(block))
+    note = _ip_provenance_note(shown)
+    if note:
+        parts.append(note)
     return "\n\n".join(parts)
 
 
@@ -1405,33 +1712,19 @@ def build_encoder_card(arg: str, only_types: "set[str] | None" = None) -> dict |
     the caller to fall back to plain text (no data / no tokens / no match).
 
     ``only_types`` restricts the card to one stream (``/main`` / ``/pool`` / ``/cctv``)."""
-    snap = load_latestencoder()
-    if not snap or not snap.get("machines"):
-        return None
-    tokens = _parse_encoder_queries(arg)
-    if not tokens:
-        return None
-    machines = snap.get("machines") or {}
-    matched: dict[str, dict] = {}
-    for tok in tokens:
-        up = tok.upper()
-        for key, entry in machines.items():
-            if up in key:
-                matched.setdefault(key, entry)
-    if only_types:
-        matched = {k: v for k, v in matched.items() if _entry_types_filtered(v, only_types)}
-    if not matched:
+    tokens, matched, snap, ip_snap = _match_encoder_machines(arg, only_types)
+    if not tokens or not matched:
         return None
 
     cap = _encoder_max_matches()
     keys = list(matched.keys())
     truncated = len(keys) > cap
     keys = keys[:cap]
-    updated = snap.get("updated_at") or "?"
+    updated = _encoder_updated_label(snap, ip_snap)
 
     elements: list[dict] = [
         {"tag": "div", "text": {"tag": "lark_md",
-         "content": f"🔎 **{len(matched)}** match(es) for `{', '.join(tokens)}`\n📅 updated {updated}"}},
+         "content": f"🔎 **{len(matched)}** match(es) for `{', '.join(tokens)}`\n📅 {updated}"}},
         {"tag": "hr"},
     ]
     for i, k in enumerate(keys):
@@ -1453,6 +1746,62 @@ def build_encoder_card(arg: str, only_types: "set[str] | None" = None) -> dict |
                    "title": {"tag": "plain_text", "content": f"{hemoji} {label}Encoder RTC Info"}},
         "body": {"elements": elements},
     }
+
+
+def _read_ipaudit_rows(page, *, timeout_ms: int = 90_000) -> dict:
+    """Load the IP Audit page and return ``{ok, rows, cmdb_available, via, …}``.
+
+    Raises ``RuntimeError`` when the page isn't authenticated or the audit can't
+    be read, so callers can tell "no session" apart from "no rows"."""
+    resp = page.goto(IPAUDIT_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+    _settle_url(page, seconds=15)
+    verdict = _classify(page, resp)
+    if verdict != "authenticated":
+        raise RuntimeError(f"ip-audit page not authenticated ({verdict})")
+    # The page hides its filter bar until its own audit fetch resolves, so waiting
+    # for the checkbox to become VISIBLE is really waiting for the data — and it
+    # means our untick lands on a rendered control instead of being a no-op.
+    try:
+        page.wait_for_selector("#audit-hide-inactive", timeout=60_000)
+    except Exception:
+        pass
+    result = page.evaluate(_IPAUDIT_ROWS_JS, IPAUDIT_API_PATH) or {}
+    if not result.get("ok"):
+        raise RuntimeError(f"ip-audit read failed: {result.get('error') or 'unknown error'}")
+    if result.get("note"):
+        print(f"[osmwatch-ip] {result['note']}", flush=True)
+    if not result.get("cmdb_available", True):
+        print("[osmwatch-ip] ⚠ CMDB unavailable — falling back to the Lark sheet / "
+              "OSM-Watch columns for this scrape", flush=True)
+    return result
+
+
+def do_ipaudit_scrape_cli(*, headless: bool, timeout_ms: int) -> int:
+    """One-shot CLI: scrape the IP Audit into latestmachineip.json (reuses the
+    saved session). Handy for testing the IP source without the bot running."""
+    from playwright.sync_api import sync_playwright
+
+    print(f"→ IP Audit scrape: {IPAUDIT_URL}")
+    with sync_playwright() as p:
+        browser, ctx, page = _open(p, headless=headless)
+        try:
+            result = _read_ipaudit_rows(page, timeout_ms=timeout_ms)
+            snap = _build_ipaudit_snapshot(result)
+            _persist_latestmachineip(snap)
+            _save_state(ctx)
+            print(f"✅ scraped {snap['row_count']} rows / {snap['machine_count']} machines "
+                  f"(via {snap['via']}) -> {LATESTMACHINEIP_JSON}")
+            _log_merge_overlap(load_latestencoder(), snap)
+            return 0
+        except RuntimeError as e:
+            print(f"⚠️  {e}")
+            print("   Log in first:  python osmwatch.py --login")
+            return 2
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
 
 def do_encoder_scrape_cli(*, headless: bool, timeout_ms: int) -> int:
@@ -1634,7 +1983,8 @@ class _OsmWatchWarm:
 
     def _encoder_loop(self) -> None:
         # Small initial delay so the startup ensure/login settles first, then a
-        # silent re-scrape on the interval keeps latestencoder.json fresh.
+        # silent re-scrape on the interval keeps BOTH encoder files fresh —
+        # latestmachineip.json (IPs) and latestencoder.json (TRTC).
         time.sleep(min(90, _encoder_interval_sec()))
         while True:
             self._tasks.put({"kind": "encoder_scrape", "auto": True})
@@ -1845,7 +2195,23 @@ class _OsmWatchWarm:
               f"machines -> {LATESTENCODER_JSON.name}", flush=True)
         return snap
 
+    def _scrape_ipaudit_into_file(self, *, timeout_ms: int = 90_000) -> dict:
+        """Read the IP Audit and persist latestmachineip.json (the IP source of truth).
+        Returns the snapshot. Raises on nav/auth/read failure (caller decides)."""
+        result = _read_ipaudit_rows(self._page, timeout_ms=timeout_ms)
+        snap = _build_ipaudit_snapshot(result)
+        _persist_latestmachineip(snap)
+        _save_state(self._context)
+        print(f"[osmwatch-ip] scraped {snap['row_count']} rows / {snap['machine_count']} "
+              f"machines (via {snap['via']}) -> {LATESTMACHINEIP_JSON.name}", flush=True)
+        return snap
+
     def _handle_encoder_scrape(self, task: dict) -> None:
+        """Refresh BOTH encoder sources: the IP Audit (IPs) and trtc-details (TRTC).
+
+        They're scraped in one task so the two files never drift far apart, but the
+        audit is wrapped separately: a failure there must not cost us the TRTC
+        refresh, since the last-known IPs stay usable while TRTC data does not."""
         box = task.get("box")
         chat_id = task.get("chat_id")
         try:
@@ -1861,14 +2227,38 @@ class _OsmWatchWarm:
                 else:
                     self._report_access_failed(chat_id, auto=bool(task.get("auto")))
                 return
+            ip_snap, ip_err = None, ""
+            if _ipaudit_enabled():
+                try:
+                    ip_snap = self._scrape_ipaudit_into_file()
+                    if box is not None:
+                        box["ip_snapshot"] = ip_snap
+                except Exception as e:
+                    ip_err = repr(e)
+                    print(f"[osmwatch-ip] scrape error: {ip_err}", flush=True)
+                    if box is not None:
+                        box["ip_error"] = ip_err
             snap = self._scrape_encoder_into_file()
             if box is not None:
                 box["snapshot"] = snap
+            if ip_snap:
+                _log_merge_overlap(snap, ip_snap)
             if chat_id:
+                # Say which half failed. Reporting a plain success after the IP
+                # scrape died would leave people trusting stale addresses.
+                if ip_snap:
+                    ip_bit = (f"\n📍 IPs (CMDB): {ip_snap['machine_count']} machines "
+                              f"({ip_snap['row_count']} rows)")
+                elif ip_err:
+                    ip_bit = (f"\n⚠️ IP Audit refresh FAILED — still serving the last known "
+                              f"IPs ({ip_err})")
+                else:
+                    ip_bit = ("\nℹ️ IP Audit disabled (OSMWATCH_IPAUDIT=0) — IPs come from "
+                              "trtc-details")
                 send_text_message(
                     chat_id,
                     f"✅ Encoder data refreshed: {snap['machine_count']} machines "
-                    f"({snap['row_count']} rows).",
+                    f"({snap['row_count']} rows).{ip_bit}",
                 )
         except Exception as e:
             print(f"[osmwatch-enc] scrape error: {e!r}", flush=True)
@@ -1898,7 +2288,8 @@ def prewarm_osmwatch_on_startup() -> None:
     w.start()
     w.submit_ensure(auto=True)
     if _encoder_enabled():
-        # Populate latestencoder.json soon after boot (don't wait a full interval).
+        # Populate latestmachineip.json + latestencoder.json soon after boot
+        # (don't wait a full interval for the first IPs).
         w.scrape_encoder()
     print("[osmwatch-warm] startup pre-warm submitted", flush=True)
 
@@ -1918,7 +2309,9 @@ def capture_and_send(chat_id: str | None = None, url: str | None = None) -> dict
 
 
 def refresh_encoder(chat_id: str | None = None) -> None:
-    """`/encoder refresh` entry point — queue a fresh scrape of latestencoder.json."""
+    """`/encoder refresh` entry point — queue a fresh scrape of both encoder
+    sources: the IP Audit (latestmachineip.json) and trtc-details
+    (latestencoder.json)."""
     w = warm()
     w.start()
     w.scrape_encoder(chat_id=chat_id)
@@ -2024,8 +2417,10 @@ def main(argv: list[str] | None = None) -> int:
     # --- encoder scraper / lookup (production feature) -------------------------
     ap.add_argument("--encoder-scrape", action="store_true",
                     help="One-shot: scrape the encoder/TRTC page into latestencoder.json.")
+    ap.add_argument("--ipaudit-scrape", action="store_true",
+                    help="One-shot: scrape the IP Audit (CMDB column) into latestmachineip.json.")
     ap.add_argument("--encoder-query", default=None,
-                    help="Look up machine(s) in latestencoder.json (e.g. 'nwr2205 & nwr2206') and print.")
+                    help="Look up machine(s) (e.g. 'nwr2205 & nwr2206') and print — IPs from\n                          latestmachineip.json, TRTC fields from latestencoder.json.")
     args = ap.parse_args(argv)
 
     if args.encoder_query is not None:
@@ -2033,6 +2428,12 @@ def main(argv: list[str] | None = None) -> int:
             print(msg)
             print("-" * 40)
         return 0
+
+    if args.ipaudit_scrape:
+        return do_ipaudit_scrape_cli(
+            headless=(_headless_default() and not args.headed),
+            timeout_ms=max(5_000, args.timeout_ms),
+        )
 
     if args.encoder_scrape:
         return do_encoder_scrape_cli(

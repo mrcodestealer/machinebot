@@ -11,6 +11,7 @@ venv/
 webmachine_data.json
 machineencoder.json
 latestencoder.json
+latestmachineip.json
 osmwatch.json
 osmwatch_qr.png
 osmwatch.png
