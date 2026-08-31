@@ -1635,11 +1635,15 @@ def _match_encoder_machines(
                 built = _entry_from_audit(audit[key])
                 if built["types"]:
                     matched.setdefault(key, built)
+    # Also collapse on the way out, not just at scrape time: a snapshot written
+    # by an older build (or before the next scrape lands) still holds both names,
+    # and the answer should be deduped regardless of the file's vintage. Safe on
+    # the matched subset — a needle that finds OSMDYB0007 finds DYB0007 too, so
+    # the bare twin is present here whenever it exists at all.
+    matched = _collapse_osm_aliases(matched)
     if only_types:
         matched = {k: v for k, v in matched.items() if _entry_types_filtered(v, only_types)}
     return tokens, matched, snap, ip_snap
-
-
 def _known_machine_count(snap: dict, ip_snap: dict) -> int:
     """How many distinct machines either source knows about."""
     return len((snap.get("machines") or {}).keys() | (ip_snap.get("machines") or {}).keys())
