@@ -1193,6 +1193,66 @@ _ENCODER_ROWS_JS = r"""
 """
 
 
+# Both OSM-Watch pages list some machines twice — once bare and once with an
+# "OSM" prefix (OSMDYB0001 and DYB0001 are the same machine, same IPs). We keep
+# the bare name and fold the prefixed twin into it, so /encoder answers once.
+_OSM_PREFIX = "OSM"
+
+
+def _strip_osm_prefix(name: str) -> str | None:
+    """``OSMDYB0001`` -> ``DYB0001``; ``None`` when the name isn't a prefixed alias.
+
+    The remainder must still contain a letter. ``OSM12`` is the venue sheets' own
+    OSM<asset-number> naming (see cp.py) — a different naming space, not a
+    duplicate of a machine called "12" — so it is left alone."""
+    if not name.startswith(_OSM_PREFIX):
+        return None
+    bare = name[len(_OSM_PREFIX):]
+    if bare and any(c.isalpha() for c in bare):
+        return bare
+    return None
+
+
+def _collapse_osm_aliases(machines: dict[str, dict], *, log_tag: str = "") -> dict[str, dict]:
+    """Merge ``OSM<name>`` entries into ``<name>``, keeping the bare name.
+
+    An alias is only collapsed when the bare name is actually present in the same
+    snapshot, so a machine whose ONLY name starts with OSM is never dropped. The
+    alias's streams fill gaps in the surviving entry rather than being discarded —
+    if one of the two rows is the more complete one, we keep what it knew."""
+    known = set(machines)
+    canon_of = {}
+    for key in machines:
+        bare = _strip_osm_prefix(key)
+        canon_of[key] = bare if (bare and bare in known) else key
+
+    out: dict[str, dict] = {}
+    for key, entry in machines.items():          # bare entries first, in order
+        if canon_of[key] == key:
+            copy = dict(entry)
+            copy["types"] = dict(entry.get("types") or {})
+            out[key] = copy
+    merged = 0
+    for key, entry in machines.items():          # then fold the aliases in
+        canon = canon_of[key]
+        if canon == key:
+            continue
+        target = out.get(canon)
+        if target is None:                       # unreachable, but never drop data
+            out[key] = entry
+            continue
+        merged += 1
+        for typ, info in (entry.get("types") or {}).items():
+            target["types"].setdefault(typ, info)
+        for field in ("env", "backend_status"):
+            if not target.get(field) and entry.get(field):
+                target[field] = entry[field]
+    if merged and log_tag:
+        print(f"[{log_tag}] collapsed {merged} OSM-prefixed alias(es) onto their bare names",
+              flush=True)
+    return out
+
+
 def _group_encoder_rows(rows: list[dict]) -> dict[str, dict]:
     """Group raw scrape rows into {UPPER_MACHINE: {machine, env, types:{...}}}."""
     machines: dict[str, dict] = {}
@@ -1216,7 +1276,7 @@ def _group_encoder_rows(rows: list[dict]) -> dict[str, dict]:
             "status": str(r.get("status") or "").strip(),
             "updated": str(r.get("updated") or "").strip(),
         }
-    return machines
+    return _collapse_osm_aliases(machines, log_tag="osmwatch-enc")
 
 
 def _build_encoder_snapshot(rows: list[dict]) -> dict:
@@ -1389,7 +1449,7 @@ def _group_ipaudit_rows(rows: list[dict]) -> dict[str, dict]:
             "osm_ip": str(r.get("osm_ip") or "").strip(),
             "audit_status": str(r.get("status") or "").strip(),
         }
-    return machines
+    return _collapse_osm_aliases(machines, log_tag="osmwatch-ip")
 
 
 def _build_ipaudit_snapshot(result: dict) -> dict:
@@ -1561,12 +1621,17 @@ def _match_encoder_machines(
     if not tokens:
         return tokens, matched, snap, ip_snap
     for tok in tokens:
-        up = tok.upper()
+        # Snapshots store the bare name, but people type either form, so a query
+        # for OSMDYB0001 has to still find DYB0001.
+        needles = [tok.upper()]
+        bare = _strip_osm_prefix(needles[0])
+        if bare:
+            needles.append(bare)
         for key, entry in machines.items():
-            if up in key:
+            if any(n in key for n in needles):
                 matched.setdefault(key, _merge_latest_ips(entry, audit.get(key)))
         for key in sorted(audit):
-            if up in key and key not in machines:
+            if key not in machines and any(n in key for n in needles):
                 built = _entry_from_audit(audit[key])
                 if built["types"]:
                     matched.setdefault(key, built)
