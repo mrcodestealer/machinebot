@@ -1859,20 +1859,20 @@ def _np_choice_row_md(idx: int, ch: dict[str, Any]) -> str:
     ts = str(ch.get("time_short") or "").strip()
     if np_choice_auto_reselect(ch):
         # Credit/time/error columns would all be "n/a" and say nothing; this says everything.
-        return f"**{idx}**  \u00b7  **`{uid}`**  \u00b7  This player is auto select another machine."
-    bits = [f"**{idx}**  \u00b7  **`{uid}`**"]
-    bits.append(f"\U0001f4b0 `{_fmt_credit_display(ch.get('credit'))}`")
+        return f"**{idx}**  ·  **`{uid}`**  ·  This player is auto select another machine."
+    bits = [f"**{idx}**  ·  **`{uid}`**"]
+    bits.append(f"💰 `{_fmt_credit_display(ch.get('credit'))}`")
     if ts:
-        bits.append(f"\U0001f552 `{ts}`")
+        bits.append(f"🕒 `{ts}`")
     errs = ch.get("errors_n")
     if isinstance(errs, int):
-        bits.append(f"\u26a0\ufe0f `{errs}` err" if errs > 0 else "\u2705 no err")
+        bits.append(f"⚠️ `{errs}` err" if errs > 0 else "✅ no err")
     # "with_error"/"no_error" only repeat the counter above; the log-order pick does not.
     if str(ch.get("source") or "").strip() == "latest_in_log":
         bits.append("_latest in log_")
-    line = "  \u00b7  ".join(bits)
+    line = "  ·  ".join(bits)
     if not ts:
-        line += "\n\u26d4 no credit time in the log \u2014 this one cannot open Third Http."
+        line += "\n⛔ no credit time in the log — this one cannot open Third Http."
     return line
 
 
@@ -1933,13 +1933,13 @@ def build_np_choice_lark_card(
             return ""
         if uid == la_uid == le_uid:
             return (
-                "\u2139\ufe0f **Same player** \u2014 last activity in the log **and** the last "
+                "ℹ️ **Same player** — last activity in the log **and** the last "
                 "error line are this user ID."
             )
         if uid == la_uid:
-            return "\u2139\ufe0f **Last player in the log** \u2014 not the last one with an error."
+            return "ℹ️ **Last player in the log** — not the last one with an error."
         if uid == le_uid:
-            return "\u2139\ufe0f **Last player with an error** \u2014 not the last one in the log."
+            return "ℹ️ **Last player with an error** — not the last one in the log."
         return ""
     any_error = any(
         isinstance(ch.get("errors_n"), int) and ch["errors_n"] > 0 for ch in np_choices
@@ -1956,19 +1956,19 @@ def build_np_choice_lark_card(
     # --- context strip: machine / log date / backend, then which files were read ---
     meta_bits: list[str] = []
     if md:
-        meta_bits.append(f"\U0001f579\ufe0f **{md}**")
+        meta_bits.append(f"🕹️ **{md}**")
     if td:
-        meta_bits.append(f"\U0001f4c5 **{td}**")
-    meta_bits.append(f"\U0001f50c `{be}`")
-    _div("  \u00b7  ".join(meta_bits))
+        meta_bits.append(f"📅 **{td}**")
+    meta_bits.append(f"🔌 `{be}`")
+    _div("  ·  ".join(meta_bits))
     if len(files_read) >= 2:
         _div(
-            f"\U0001f5c2\ufe0f Read **all {len(files_read)}** logic logs of this day "
+            f"🗂️ Read **all {len(files_read)}** logic logs of this day "
             f"(agent restarts): " + ", ".join(f"`{f}`" for f in files_read)
         )
     elif files_read and len(files_all) >= 2:
         _div(
-            f"\U0001f5c2\ufe0f Reading `{files_read[0]}` only \u2014 this day has "
+            f"🗂️ Reading `{files_read[0]}` only — this day has "
             f"**{len(files_all)}** logic logs."
         )
 
@@ -1988,7 +1988,7 @@ def build_np_choice_lark_card(
         if not ik2:
             continue
         title2 = str(it.get("title") or "Error context screenshot").strip()
-        _div(f"\U0001f4f7 **{title2}**")
+        _div(f"📷 **{title2}**")
         body_elements.append(
             {"tag": "img", "img_key": ik2, "alt": {"tag": "plain_text", "content": title2}}
         )
@@ -2007,19 +2007,19 @@ def build_np_choice_lark_card(
         _hr()
         if pickable_n:
             hint = [
-                f"\U0001f449 **Tap the player-ID button** under a player \u2014 or type the ID "
-                f"(or **1**\u2013**{n}**) in chat, no **@** needed.",
-                "\U0001f4f8 Screenshot window = the log date above + that player\u2019s credit time.",
+                f"👉 **Tap the player-ID button** under a player — or type the ID "
+                f"(or **1**–**{n}**) in chat, no **@** needed.",
+                "📸 Screenshot window = the log date above + that player’s credit time.",
             ]
             if blocked_n:
                 hint.append(
-                    f"\u26d4 **{blocked_n}** of **{n}** have no credit time in the log and "
+                    f"⛔ **{blocked_n}** of **{n}** have no credit time in the log and "
                     f"cannot be screenshotted."
                 )
         else:
             # Every listed player was bounced elsewhere: no buttons, so do not explain buttons.
             hint = [
-                "\u2139\ufe0f Every player below was auto-moved to another machine \u2014 "
+                "ℹ️ Every player below was auto-moved to another machine — "
                 "nothing was played on this cabinet, so there is nothing to screenshot."
             ]
         _div("\n".join(hint))
@@ -2059,14 +2059,14 @@ def build_np_choice_lark_card(
     # Only a leftover: when the verdict was pinned to a row above, do not repeat it here.
     sll = (same_last_line or "").strip()
     if sll and not noted:
-        _div(f"\u2139\ufe0f {sll}")
+        _div(f"ℹ️ {sll}")
 
     if navigator_same_day_multi_log or len(files_all) >= 2:
         body_elements.append(
             _np_lark_v2_button_row(
                 [
                     _np_lark_v2_button(
-                        "\U0001f5c2\ufe0f open one log file",
+                        "🗂️ open one log file",
                         "default",
                         {"k": "np_check_alt_logs"},
                         element_id="npcc_altlog",
@@ -2077,9 +2077,9 @@ def build_np_choice_lark_card(
 
     title = "Choose a player"
     if md:
-        title = f"Choose a player \u00b7 {md}"
+        title = f"Choose a player · {md}"
         if td:
-            title = f"{title} \u00b7 {td}"
+            title = f"{title} · {td}"
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "width_mode": "fill"},

@@ -27,7 +27,7 @@ This is a self-contained bot that ONLY does the machine + encoder flows mirrored
   - ``/stuckcredit <machine> [date]``          stuck credit: log + Third Http transfer-out check
   - ``/npthirdhttp <player_id> [date time]``   NP/WF/DHS/NCH/CP/OSM/MDR/TBP Third Http Detail
   - ``/cctvshot <machine>``                    EGM CCTV screenshot · ``/al [DD/MM]`` Amount Loss
-  - ``/showurl <machine> [more…]``            EGM screen of each machine, one card per machine
+  - ``/showurl <machine(s)> [YYYY-MM-DD]``     recharge Detail per machine, one card each
   - ``/main /pool /cctv <machine(s)>``         one encoder stream (MAIN/POOL/CCTV) from OSM-Watch
   - reply **1**–**4** after an NP prompt · **Missing Credit** alert paste → checkcredit card
 
@@ -2020,29 +2020,72 @@ def _showurl_max_machines() -> int:
         return 10
 
 
-def run_showurl_job(chat_id: str, machines: list[str]) -> None:
+def _showurl_pick_player(np_followup: dict) -> Optional[dict]:
     """
-    ``/showurl`` — one EGM operation-window screenshot per machine, each posted in its own card
-    (machine name as the title, the screenshot as the only content) as soon as it is ready.
+    The player ``/checkcredit``'s **first** button would open: latest in the log with a credit
+    time. Rows without one cannot drive a Detail at all, and a player the backend bounced to
+    another cabinet never played here — skip both.
+    """
+    for choice in (np_followup or {}).get("np_choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        if not str(choice.get("time_short") or "").strip():
+            continue
+        if choice.get("auto_reselect"):
+            continue
+        return choice
+    return None
 
-    Same picture ``/checkcredit`` puts on its player card, without the player list or buttons.
-    Each machine is a separate browser login, so they are done one at a time and posted as they
-    finish rather than batched at the end.
+
+def _showurl_expected_credit(choice: dict) -> Optional[float]:
+    """``credit_value`` when the log parsed one, else the printed credit — used to match the row."""
+    val = choice.get("credit_value")
+    if isinstance(val, (int, float)):
+        return float(val)
+    raw = choice.get("credit")
+    if raw in (None, "", "n/a"):
+        return None
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        return None
+
+
+def run_showurl_job(chat_id: str, machines: list[str], date_iso: str = "") -> None:
+    """
+    ``/showurl`` — for each machine: read the day's logic log, take the player ``/checkcredit``
+    would put on button **1**, and screenshot that player's Third Http **recharge Detail**.
+
+    Each machine gets one card of its own — machine name as the title, the screenshot as the only
+    content — posted as soon as it is ready, so a list of machines streams in rather than landing
+    all at once. No player card and no buttons: the pick a human would make is made here.
     """
     try:
         import checkcredit
     except ImportError as e:
         send_message(chat_id, f"❌ Cannot load checkcredit module: {e}")
         return
-    cap = getattr(checkcredit, "screenshot_egm_status_window", None)
-    if not callable(cap):
+    shot = getattr(checkcredit, "screenshot_np_recharge_detail", None)
+    if not callable(shot):
         send_message(
             chat_id,
-            "❌ `checkcredit.screenshot_egm_status_window` missing — deploy the latest `checkcredit.py`.",
+            "❌ `checkcredit.screenshot_np_recharge_detail` missing — deploy the latest "
+            "`checkcredit.py`.",
         )
         return
     build_card = getattr(checkcredit, "build_machine_screenshot_card", None)
-    resolve_route = getattr(checkcredit, "resolve_machine_display_for_egm_route", None)
+    use_oss = checkcredit.checkcredit_use_oss_source()
+    cc_base = getattr(checkcredit, "DEFAULT_BASE", None) or os.getenv("CHECKCREDIT_BASE", "")
+
+    try:
+        base_day = (
+            datetime.strptime(date_iso.strip(), "%Y-%m-%d").date()
+            if str(date_iso or "").strip()
+            else datetime.now().date()
+        )
+    except ValueError:
+        send_message(chat_id, f"❌ Invalid date `{date_iso}` — use `YYYY-MM-DD`.")
+        return
 
     wanted = list(machines or [])
     cap_n = _showurl_max_machines()
@@ -2051,27 +2094,67 @@ def run_showurl_job(chat_id: str, machines: list[str]) -> None:
     total = len(wanted)
     send_message(
         chat_id,
-        f"⏳ `/showurl` — {total} machine(s): "
+        f"⏳ `/showurl` — {total} machine(s) on `{base_day.isoformat()}`: "
         + ", ".join(f"`{m}`" for m in wanted)
         + (
-            f"\n⚠️ Only the first {cap_n} are done in one go; skipped: "
+            f"\n⚠️ Only the first {cap_n} run in one go; skipped: "
             + ", ".join(f"`{m}`" for m in dropped)
             if dropped
             else ""
         ),
     )
+
+    def _read_log(machine: str, day):
+        return checkcredit.run_finderror(
+            machine,
+            target_date=day,
+            timeout_ms=max(15_000, 90_000),
+            base=cc_base,
+            user=checkcredit.DEFAULT_USER,
+            pw=checkcredit.DEFAULT_PASS,
+            source="oss" if use_oss else "navigator",
+        )
+
     for idx, mq in enumerate(wanted, start=1):
         path = None
-        md = mq
         try:
-            ms: Optional[str] = None
-            if callable(resolve_route):
-                md, ms = resolve_route(mq, timeout_ms=120_000)
-            md = (md or "").strip() or mq
-            path = cap(
-                machine_display=md,
-                machine_substr=(ms or "").strip() or None,
+            _prewarm_third_http_for_machine(mq)
+            day = base_day
+            out = _read_log(mq, day)
+            np_fu = out.get("np_followup") or {}
+            choice = _showurl_pick_player(np_fu)
+            looked_at = [day]
+            if choice is None:
+                # Same reason /checkcredit looks back a day: an empty day usually means the
+                # cabinet's players are in yesterday's log, not that there are none.
+                prev = day - timedelta(days=1)
+                looked_at.append(prev)
+                out_prev = _read_log(mq, prev)
+                np_prev = out_prev.get("np_followup") or {}
+                choice_prev = _showurl_pick_player(np_prev)
+                if choice_prev is not None:
+                    day, np_fu, choice = prev, np_prev, choice_prev
+            if choice is None:
+                days_txt = " or ".join(f"`{d.isoformat()}`" for d in looked_at)
+                send_message(
+                    chat_id,
+                    f"ℹ️ `{mq}` ({idx}/{total}) — no player with a credit time in the "
+                    f"{days_txt} logic logs, so there is no recharge Detail to open.",
+                )
+                continue
+            md = str(np_fu.get("machine_display") or mq).strip() or mq
+            ms = str(np_fu.get("machine_match_substr") or "").strip() or None
+            uid = str(choice.get("user_id") or "").strip()
+            time_short = str(choice.get("time_short") or "").strip()
+            day_iso = str(np_fu.get("target_date") or day.isoformat()).strip()
+            path = shot(
+                uid,
+                day_iso,
+                time_short,
                 timeout_ms=120_000,
+                machine_substr=ms,
+                expected_credit=_showurl_expected_credit(choice),
+                machine_display=md,
                 headed=False,
             )
             key = upload_image_lark(path) or ""
@@ -2089,7 +2172,7 @@ def run_showurl_job(chat_id: str, machines: list[str]) -> None:
                 send_message(chat_id, f"**{md}**")
                 send_image_message(chat_id, key)
         except Exception as e:
-            send_message(chat_id, f"❌ `{mq}` ({idx}/{total}) — screenshot failed: {e}")
+            send_message(chat_id, f"❌ `{mq}` ({idx}/{total}) — recharge Detail failed: {e}")
             print(f"[showurl] {mq}: {e!r}", flush=True)
         finally:
             if path and os.path.isfile(path):
@@ -2372,8 +2455,8 @@ def run_np_third_http_by_choice(chat_id: str, choice_idx: int) -> None:
     if ch.get("auto_reselect") and not time_short:
         _checkcredit_send(
             chat_id,
-            f"\u2139\ufe0f `{uid or 'this player'}` was auto-moved to another machine "
-            "(*Game in progress, select another machine*) \u2014 there is no credit line on this "
+            f"ℹ️ `{uid or 'this player'}` was auto-moved to another machine "
+            "(*Game in progress, select another machine*) — there is no credit line on this "
             "cabinet to screenshot.",
         )
         return
@@ -2928,7 +3011,7 @@ _HELP_TEXT = (
     "• `/stuckcredit <machine> [date]` — stuck credit + Third Http transfer-out check\n"
     "• `/npthirdhttp <player_id> [YYYY-MM-DD HH:MM:SS.mmm]` — Third Http Detail\n"
     "• `/cctvshot <machine>` — EGM CCTV screenshot · `/al [DD/MM]` — Amount Loss\n"
-    "• `/showurl <machine(s)>` — EGM screen of each machine (one card each, no buttons)\n"
+    "• `/showurl <machine(s)> [date]` — recharge Detail of each machine's latest player\n"
     "• reply **1**–**4** after an NP prompt · paste a **Missing Credit** alert to auto-fill\n"
     "• `/main /pool /cctv <machine(s)>` — only that encoder stream from OSM-Watch\n"
     "• `who am i` — your Lark open_id (for tagging / config)\n"
@@ -3270,19 +3353,27 @@ def _handle_machine_message(
         start_lark_background_thread(run_cctv_screenshot_job, chat_id, m_cv.group(1))
         return
 
-    # /showurl <machine> [more…] — EGM screen per machine, one card each. Machines may be listed
-    # one per line under the command (so read the multi-line body, not the collapsed one).
+    # /showurl <machine> [more…] — recharge Detail per machine, one card each. Machines may be
+    # listed one per line under the command (so read the multi-line body, not the collapsed one).
     if re.match(r"^/showurl\b", ct, re.I):
-        machines_su = _parse_machine_list(clean_text_multiline or ct, "/showurl")
+        tokens_su = _parse_machine_list(clean_text_multiline or ct, "/showurl")
+        date_su = ""
+        machines_su = []
+        for tok in tokens_su:
+            if not date_su and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tok):
+                date_su = tok          # one optional date applies to every machine in the list
+                continue
+            machines_su.append(tok)
         if not machines_su:
             send_message(
                 chat_id,
-                "❌ Usage: `/showurl <machine>` — EGM screen of each machine, one card each.\n"
-                "One per line, or all on one line:\n"
+                "❌ Usage: `/showurl <machine(s)>` — Third Http **recharge Detail** of each "
+                "machine's latest player, one card each (no button to tap).\n"
+                "One machine per line, or all on one line; add `YYYY-MM-DD` for another day:\n"
                 "```\n/showurl\nNWR2096\nNCH1498\nNWR2110\n```",
             )
             return
-        start_lark_background_thread(run_showurl_job, chat_id, machines_su)
+        start_lark_background_thread(run_showurl_job, chat_id, machines_su, date_su)
         return
 
     # /npthirdhttp <player_id> [date time]
