@@ -1,5 +1,11 @@
 """
-Jackpot check on the EGM operation-window screenshot (``/checkcredit`` player card).
+Readings taken from the EGM operation-window screenshot by the local vision model.
+
+Two of them:
+
+* :func:`detect_jackpot` — does the game screen show a jackpot-sized win? (``/checkcredit``)
+* :func:`read_machine_credit` — what does the cabinet's **Machine Credit** field say? (``/showurl``
+  matches the recharge Detail amount against it.)
 
 ``/checkcredit`` already screenshots the machine's operation window for the card it posts
 (machine name, member, credit, and the live game screen below it). The same PNG is handed to the
@@ -99,24 +105,18 @@ def _api_key() -> str:
 
 def _parse_verdict(text: str) -> dict[str, Any]:
     """First JSON object in the reply; a bare yes/no sentence is accepted as a fallback."""
-    raw = (text or "").strip()
     # Thinking models can wrap the answer in <think>…</think> even with reasoning off.
-    raw = re.sub(r"<think>.*?</think>", " ", raw, flags=re.S | re.I).strip()
-    m = re.search(r"\{.*\}", raw, re.S)
-    if m:
-        try:
-            obj = json.loads(m.group(0))
-            if isinstance(obj, dict):
-                return {
-                    "jackpot": bool(obj.get("jackpot")),
-                    "win": str(obj.get("win") or "").strip(),
-                    "credit": str(obj.get("credit") or "").strip(),
-                    "reason": str(obj.get("reason") or "").strip(),
-                    "raw": raw[:600],
-                    "error": "",
-                }
-        except ValueError:
-            pass
+    raw = re.sub(r"<think>.*?</think>", " ", (text or "").strip(), flags=re.S | re.I).strip()
+    obj = _first_json_object(raw)
+    if obj is not None:
+        return {
+            "jackpot": bool(obj.get("jackpot")),
+            "win": str(obj.get("win") or "").strip(),
+            "credit": str(obj.get("credit") or "").strip(),
+            "reason": str(obj.get("reason") or "").strip(),
+            "raw": raw[:600],
+            "error": "",
+        }
     low = raw.lower()
     if low.startswith(("yes", "true", "jackpot")):
         return {"jackpot": True, "win": "", "credit": "", "reason": raw[:120],
@@ -125,34 +125,27 @@ def _parse_verdict(text: str) -> dict[str, Any]:
             "raw": raw[:600], "error": "" if raw else "empty model reply"}
 
 
-def detect_jackpot(png_bytes: bytes, *, machine_display: str = "") -> dict[str, Any]:
+def _ask_about_image(
+    prompt: str,
+    png_bytes: bytes,
+    *,
+    max_tokens: int = 300,
+) -> tuple[str, str, str]:
     """
-    Ask the vision model whether this operation-window screenshot shows a jackpot.
+    One vision question about one PNG → ``(reply_text, model, error)``.
 
-    Returns ``{"jackpot", "win", "credit", "reason", "raw", "error", "model"}``; ``jackpot`` is
-    False whenever anything went wrong (``error`` says what).
+    Never raises: a model that is down, slow or unconfigured comes back as an ``error`` string,
+    so a reading can only cost the extra message, never the command that asked for it.
     """
-    out: dict[str, Any] = {
-        "jackpot": False, "win": "", "credit": "", "reason": "",
-        "raw": "", "error": "", "model": "",
-    }
     if not png_bytes:
-        out["error"] = "no screenshot bytes"
-        return out
+        return "", "", "no screenshot bytes"
     model = _model()
     if not model:
-        out["error"] = "no vision model configured (BOT_CHAT_MODEL)"
-        return out
-    out["model"] = model
+        return "", "", "no vision model configured (BOT_CHAT_MODEL)"
     api_key = _api_key()
     if not api_key:
-        out["error"] = "no API key (BOT_CHAT_API_KEY)"
-        return out
+        return "", model, "no API key (BOT_CHAT_API_KEY)"
 
-    prompt = _PROMPT
-    md = (machine_display or "").strip()
-    if md:
-        prompt = f"{prompt}\n\nThis window belongs to machine {md}."
     b64 = base64.standard_b64encode(png_bytes).decode("ascii")
     payload: dict[str, Any] = {
         "model": model,
@@ -168,8 +161,8 @@ def detect_jackpot(png_bytes: bytes, *, machine_display: str = "") -> dict[str, 
                 ],
             }
         ],
-        # Enough for the one-line JSON; a verdict is not a place for creativity.
-        "max_tokens": 300,
+        # Enough for the one-line JSON; reading a counter is not a place for creativity.
+        "max_tokens": max_tokens,
         "temperature": 0,
     }
     try:
@@ -194,23 +187,109 @@ def detect_jackpot(png_bytes: bytes, *, machine_display: str = "") -> dict[str, 
             detail = exc.read().decode("utf-8", errors="replace")[:300]
         except Exception:
             pass
-        out["error"] = f"HTTP {exc.code}: {detail or exc.reason}"
-        return out
-    except Exception as exc:  # noqa: BLE001 - a jackpot hint must never break /checkcredit
-        out["error"] = f"request failed: {exc!r}"
-        return out
+        return "", model, f"HTTP {exc.code}: {detail or exc.reason}"
+    except Exception as exc:  # noqa: BLE001 - a reading must never break its caller
+        return "", model, f"request failed: {exc!r}"
 
     choices = body.get("choices") or []
     if not choices:
-        out["error"] = "no choices in model response"
-        return out
-    message = choices[0].get("message") or {}
-    content = message.get("content")
+        return "", model, "no choices in model response"
+    content = (choices[0].get("message") or {}).get("content")
     if isinstance(content, list):  # some servers return content parts
-        content = " ".join(
-            str(p.get("text") or "") for p in content if isinstance(p, dict)
-        )
-    verdict = _parse_verdict(str(content or ""))
+        content = " ".join(str(p.get("text") or "") for p in content if isinstance(p, dict))
+    return str(content or ""), model, ""
+
+
+def _first_json_object(text: str) -> dict[str, Any] | None:
+    """First ``{...}`` in a reply, with any ``<think>`` wrapper stripped."""
+    raw = re.sub(r"<think>.*?</think>", " ", (text or "").strip(), flags=re.S | re.I).strip()
+    m = re.search(r"\{.*\}", raw, re.S)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+_CREDIT_PROMPT = (
+    "This is a casino back-office operation window for one slot machine. Near the top it lists "
+    "fields such as Machine Name, GameType, Member, Machine Credit, Member Status and Machine "
+    "Status. Below that is the live game screen, whose bottom bar shows CREDIT, BET and WIN.\n\n"
+    "Read two numbers:\n"
+    "- machine_credit: the value of the \"Machine Credit\" field in the text area at the top.\n"
+    "- screen_credit: the CREDIT counter on the game screen (digits only \u2014 drop currency "
+    "symbols and thousands separators).\n\n"
+    "Use null for a number you cannot read. Reply with ONE line of JSON and nothing else:\n"
+    '{"machine_credit": <number or null>, "screen_credit": <number or null>}'
+)
+
+
+def _as_float(val: Any) -> float | None:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        return float(str(val).replace(",", "").replace("\u20b1", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def read_machine_credit(png_bytes: bytes, *, machine_display: str = "") -> dict[str, Any]:
+    """
+    Read the cabinet's credit off its operation window.
+
+    Returns ``{"credit", "machine_credit", "screen_credit", "raw", "error", "model"}`` where
+    ``credit`` is the **Machine Credit** field when the model could read it, else the on-screen
+    CREDIT counter, else ``None``. ``/showurl`` matches the recharge Detail amount against it.
+    """
+    out: dict[str, Any] = {
+        "credit": None, "machine_credit": None, "screen_credit": None,
+        "raw": "", "error": "", "model": "",
+    }
+    prompt = _CREDIT_PROMPT
+    md = (machine_display or "").strip()
+    if md:
+        prompt = f"{prompt}\n\nThis window belongs to machine {md}."
+    text, model, err = _ask_about_image(prompt, png_bytes, max_tokens=200)
+    out["model"] = model
+    out["raw"] = (text or "")[:600]
+    if err:
+        out["error"] = err
+        return out
+    obj = _first_json_object(text)
+    if obj is None:
+        out["error"] = "model reply was not JSON"
+        return out
+    out["machine_credit"] = _as_float(obj.get("machine_credit"))
+    out["screen_credit"] = _as_float(obj.get("screen_credit"))
+    out["credit"] = out["machine_credit"] if out["machine_credit"] is not None else out["screen_credit"]
+    if out["credit"] is None:
+        out["error"] = "no credit value in the model reply"
+    return out
+
+
+def detect_jackpot(png_bytes: bytes, *, machine_display: str = "") -> dict[str, Any]:
+    """
+    Ask the vision model whether this operation-window screenshot shows a jackpot.
+
+    Returns ``{"jackpot", "win", "credit", "reason", "raw", "error", "model"}``; ``jackpot`` is
+    False whenever anything went wrong (``error`` says what).
+    """
+    out: dict[str, Any] = {
+        "jackpot": False, "win": "", "credit": "", "reason": "",
+        "raw": "", "error": "", "model": "",
+    }
+    prompt = _PROMPT
+    md = (machine_display or "").strip()
+    if md:
+        prompt = f"{prompt}\n\nThis window belongs to machine {md}."
+    text, model, err = _ask_about_image(prompt, png_bytes)
+    out["model"] = model
+    if err:
+        out["error"] = err
+        return out
+    verdict = _parse_verdict(text)
     verdict["model"] = model
     return verdict
 

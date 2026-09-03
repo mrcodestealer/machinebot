@@ -3159,6 +3159,21 @@ except ValueError:
     NP_BACKEND_MAX_PAGES = 20
 
 
+def _np_require_positive_amount() -> bool:
+    """
+    A recharge Detail must have a **positive** Request ``amount``.
+
+    A negative ``amount`` on a ``recharge`` row is credit going *into* the cabinet, not the
+    cash-out leg ``/checkcredit`` is asking about, so a Detail like ``amount: -2001`` is the wrong
+    record even when its magnitude matches the log credit exactly. Set
+    ``NP_BACKEND_REQUIRE_POSITIVE_AMOUNT=0`` to accept either sign again (the old behaviour).
+    """
+    return (
+        os.environ.get("NP_BACKEND_REQUIRE_POSITIVE_AMOUNT", "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
+
+
 def _np_amount_match_eps() -> float:
     """Max |request_amount − log_credit| to accept (some backends round differently). Default 0.05."""
     try:
@@ -3884,6 +3899,27 @@ def _np_machine_id_contains_substr(machine_substr: str | None, machine_id_value:
     return False
 
 
+def machine_credit_amount_candidates(credit: float | None) -> list[float]:
+    """
+    The same cabinet credit written the three ways a backend may record it: as shown, doubled,
+    halved. Some cabinets keep credit at half or twice the denomination the recharge is booked in,
+    so ``3822`` on screen can legitimately appear as ``7644`` or ``1911`` on the Detail.
+
+    Non-positive or unreadable credit yields no candidates — there is nothing to match then.
+    """
+    try:
+        c = float(credit)
+    except (TypeError, ValueError):
+        return []
+    if c <= 0:
+        return []
+    out: list[float] = []
+    for v in (c, c * 2.0, c / 2.0):
+        if v > 0 and not any(abs(v - seen) <= 1e-9 for seen in out):
+            out.append(v)
+    return out
+
+
 def _np_expected_credit_for_match(expected_credit: float | None) -> float | None:
     """
     Keep numeric log credit for amount matching (including ``0.0`` and negatives).
@@ -3904,26 +3940,43 @@ def _np_detail_matches_credit_and_machine_id(
     expected_credit: float | None,
     *,
     amount_scale: float = 1.0,
+    expected_credit_any: list[float] | None = None,
 ) -> bool:
     """
     Request JSON: ``machineId`` contains machine digits; when ``expected_credit`` is not ``None``,
     ``amount`` matches within ``NP_BACKEND_AMOUNT_EPS`` (default 0.05), after optional
     ``amount_scale`` (TBP: ``TBP_THIRD_HTTP_AMOUNT_SCALE``).
+
+    A negative ``amount`` is rejected outright (see :func:`_np_require_positive_amount`): that row
+    is credit going into the cabinet, so it is the wrong Detail however well it matches otherwise.
+
+    ``expected_credit_any``: accept the row when the amount is within eps of **any** value in the
+    list, and ignore ``expected_credit`` for the comparison. ``/showurl`` passes the machine credit
+    read off the cabinet plus its x2 / /2 forms
+    (:func:`machine_credit_amount_candidates`).
     """
     mid, amt = _np_parse_machine_amount_from_request_blob(req_blob)
     if mid is None:
         return False
     if not _np_machine_id_contains_substr(machine_substr, mid):
         return False
+    if amt is not None and amt < 0 and _np_require_positive_amount():
+        return False
+    candidates = [c for c in (expected_credit_any or []) if c is not None]
+    if candidates:
+        if amt is None:
+            return False
+        scaled_any = float(amt) / (amount_scale if amount_scale and amount_scale > 0 else 1.0)
+        eps = _np_amount_match_eps()
+        return any(abs(scaled_any - float(c)) <= eps for c in candidates)
     if expected_credit is None:
-        # Machine-only match (e.g. TBP fallback): accept a missing amount; reject only an
-        # exactly-zero one. A transfer-OUT leg is legitimately **negative** (credit leaving the
-        # cabinet), so the sign must not decide the match.
+        # Machine-only match (e.g. TBP fallback): accept a missing amount; reject an exactly-zero
+        # one (and, above, a negative one).
         #
         # This is the ONLY amount test on this path. When the caller came here from the
         # machine-only fallback it also applies _np_amount_plausible_for_soft_match, but when
         # ``expected_credit`` was None from the start there is nothing to compare against and
-        # any non-zero amount is accepted — callers must report that as unverified.
+        # any non-zero positive amount is accepted — callers must report that as unverified.
         if amt is not None and amt == 0:
             return False
         return True
@@ -4143,6 +4196,7 @@ def _np_try_screenshot_matching_detail(
     amount_scale: float = 1.0,
     soft_expected_credit: float | None = None,
     scan_stats: dict[str, Any] | None = None,
+    expected_credit_any: list[float] | None = None,
 ) -> bool:
     """
     For each candidate row: accept when Request JSON ``machineId`` contains the machine digits and
@@ -4197,6 +4251,7 @@ def _np_try_screenshot_matching_detail(
                 machine_substr,
                 expected_credit,
                 amount_scale=amount_scale,
+                expected_credit_any=expected_credit_any,
             ):
                 ok = True
                 matched_txt = cand
@@ -4207,6 +4262,14 @@ def _np_try_screenshot_matching_detail(
         if ok and expected_credit is None and soft_expected_credit is not None:
             if not _np_amount_plausible_for_soft_match(soft_expected_credit, amt_m):
                 ok = False
+        if (
+            not ok
+            and scan_stats is not None
+            and amt_p is not None
+            and amt_p < 0
+            and _np_require_positive_amount()
+        ):
+            scan_stats["skipped_negative"] = int(scan_stats.get("skipped_negative") or 0) + 1
         if ok:
             if scan_stats is not None:
                 scan_stats["matched_machine_id"] = mid_m
@@ -4228,14 +4291,13 @@ def _np_amount_plausible_for_soft_match(expected: float | None, detail_amt: floa
     """
     Reject machine-only picks where Detail amount is wildly unlike log credit (e.g. 2 vs 77099).
 
-    **Magnitudes only.** A transfer-OUT Detail carries a negative ``amount`` (credit leaving the
-    cabinet) while the log credit is positive, so a *signed* ratio rejected every cash-out leg no
-    matter how close the magnitude was. Direction is asserted by the caller, not here.
+    The band itself compares **magnitudes**, so a log credit of 2001 and a Detail amount of 2001
+    are one ratio apart whatever their signs; the sign is judged separately, and a negative
+    ``detail_amt`` is rejected (see :func:`_np_require_positive_amount`) because a recharge Detail
+    for a cash-out is positive.
 
-    Mostly this loosens the gate, but it **tightens** one case: a negative ``expected`` used to let
-    any positive ``detail_amt`` through unchecked (``if exp <= 0: return amt > 0``) and now has the
-    0.2x-5x band applied like any other magnitude. Only ``expected == 0`` keeps a free pass, since
-    there is then no magnitude to compare against.
+    A negative ``expected`` gets the 0.2x-5x band like any other magnitude. Only ``expected == 0``
+    keeps a free pass, since there is then no magnitude to compare against.
     """
     if expected is None or detail_amt is None:
         return True
@@ -4245,6 +4307,8 @@ def _np_amount_plausible_for_soft_match(expected: float | None, detail_amt: floa
     except (TypeError, ValueError):
         return True
     if amt == 0:
+        return False
+    if amt < 0 and _np_require_positive_amount():
         return False
     if exp == 0:
         # No magnitude to compare against — any non-zero amount is equally (im)plausible.
@@ -5084,6 +5148,7 @@ def screenshot_np_recharge_detail(
     pause_for_input: bool = False,
     time_short_candidates: list[str] | None = None,
     match_info: dict[str, Any] | None = None,
+    expected_credit_any: list[float] | None = None,
 ) -> str:
     """
     Login to NP backend, open Log Third Http Req, set date range ±NP_BACKEND_WINDOW_MINUTES,
@@ -5093,8 +5158,14 @@ def screenshot_np_recharge_detail(
     ``expected_credit`` is numeric (``0.0`` and negatives included) — ``amount`` is within
     ``NP_BACKEND_AMOUNT_EPS`` of it (default 0.05). If that finds nothing, a second
     **machineId-only** pass runs (see :func:`_np_machine_only_fallback_enabled`) which ignores the
-    log credit and accepts any non-zero ``amount`` whose **magnitude** is within 0.2x–5x of it;
-    the sign is deliberately not tested there, because a transfer-OUT Detail is negative.
+    log credit and accepts any non-zero ``amount`` whose **magnitude** is within 0.2x–5x of it.
+    Either pass rejects a **negative** ``amount``: that row is credit going into the cabinet, not
+    the cash-out (``NP_BACKEND_REQUIRE_POSITIVE_AMOUNT=0`` restores the old, sign-blind match).
+
+    ``expected_credit_any``: when given, the Detail ``amount`` must equal one of these values and
+    the log credit is not consulted for the amount at all — ``/showurl`` passes the credit read off
+    the cabinet's own screen with its x2 / /2 forms. The machine-only magnitude fallback is skipped
+    then: a band that accepts 0.2x-5x would defeat an explicit candidate set.
     **Header Request Time is not used to reject** (avoids closing valid dialogs when UI text
     differs slightly from log seconds).
 
@@ -5204,6 +5275,7 @@ def screenshot_np_recharge_detail(
                 headless=headless,
                 out_path=out_path,
                 match_info=match_info,
+                expected_credit_any=expected_credit_any,
             )
         finally:
             if pause_for_input:

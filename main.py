@@ -2037,6 +2037,13 @@ def _showurl_pick_player(np_followup: dict) -> Optional[dict]:
     return None
 
 
+def _showurl_fmt(value: Optional[float]) -> str:
+    """``3822.0`` -> ``3,822``; ``1911.5`` keeps the halves."""
+    if not isinstance(value, (int, float)):
+        return "n/a"
+    return f"{int(value):,}" if float(value) == int(value) else f"{float(value):,.2f}"
+
+
 def _showurl_expected_credit(choice: dict) -> Optional[float]:
     """``credit_value`` when the log parsed one, else the printed credit — used to match the row."""
     val = choice.get("credit_value")
@@ -2051,10 +2058,53 @@ def _showurl_expected_credit(choice: dict) -> Optional[float]:
         return None
 
 
+def _showurl_machine_credit(machine_display: str, machine_substr: Optional[str]) -> dict:
+    """
+    Screenshot the cabinet's operation window and read its **Machine Credit** with the vision
+    model. Returns the ``jackpotvision.read_machine_credit`` dict, or one carrying ``error``.
+
+    This is the number ``/showurl`` matches the recharge Detail against, so it is read from the
+    machine itself rather than trusted from the log.
+    """
+    fail = {"credit": None, "error": "", "model": ""}
+    try:
+        import checkcredit
+        import jackpotvision
+    except ImportError as ex:
+        return dict(fail, error=f"module unavailable: {ex}")
+    cap = getattr(checkcredit, "screenshot_egm_status_window", None)
+    if not callable(cap):
+        return dict(fail, error="checkcredit.screenshot_egm_status_window missing")
+    path = None
+    try:
+        path = cap(
+            machine_display=machine_display,
+            machine_substr=machine_substr,
+            timeout_ms=120_000,
+            headed=False,
+        )
+        with open(path, "rb") as fh:
+            png = fh.read()
+    except Exception as ex:  # noqa: BLE001 - fall back to the log credit instead of failing
+        return dict(fail, error=f"EGM screenshot failed: {ex}")
+    finally:
+        if path and os.path.isfile(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    return jackpotvision.read_machine_credit(png, machine_display=machine_display)
+
+
 def run_showurl_job(chat_id: str, machines: list[str], date_iso: str = "") -> None:
     """
     ``/showurl`` — for each machine: read the day's logic log, take the player ``/checkcredit``
-    would put on button **1**, and screenshot that player's Third Http **recharge Detail**.
+    would put on button **1**, read the cabinet's **Machine Credit** off its own operation window
+    (vision model), and screenshot the Third Http **recharge Detail** whose amount matches that
+    credit — as shown, doubled or halved, since cabinets differ on denomination.
+
+    The machine credit, not the log credit, decides the amount here. An idle cabinet reads 0 and
+    has nothing to match against, so the leaving player's log credit is used instead.
 
     Each machine gets one card of its own — machine name as the title, the screenshot as the only
     content — posted as soon as it is ready, so a list of machines streams in rather than landing
@@ -2147,13 +2197,34 @@ def run_showurl_job(chat_id: str, machines: list[str], date_iso: str = "") -> No
             uid = str(choice.get("user_id") or "").strip()
             time_short = str(choice.get("time_short") or "").strip()
             day_iso = str(np_fu.get("target_date") or day.isoformat()).strip()
+
+            log_credit = _showurl_expected_credit(choice)
+            read = _showurl_machine_credit(md, ms)
+            credit = read.get("credit")
+            read_err = str(read.get("error") or "")
+            if read_err:
+                print(f"[showurl] {md}: credit read failed: {read_err}", flush=True)
+            credit_from = "machine"
+            if not isinstance(credit, (int, float)) or credit <= 0:
+                # Nothing on the machine to match: either the cabinet is idle (credit 0) or the
+                # screen could not be read. Fall back to what the leaving player had in the log —
+                # but keep the two apart, because one is normal and the other is a fault.
+                credit_from = "log_unread" if (read_err or credit is None) else "log_idle"
+                credit = log_credit
+            candidates = checkcredit.machine_credit_amount_candidates(credit)
+            print(
+                f"[showurl] {md}: credit={credit} from={credit_from} "
+                f"candidates={candidates} (log credit {log_credit})",
+                flush=True,
+            )
             path = shot(
                 uid,
                 day_iso,
                 time_short,
                 timeout_ms=120_000,
                 machine_substr=ms,
-                expected_credit=_showurl_expected_credit(choice),
+                expected_credit=candidates[0] if candidates else log_credit,
+                expected_credit_any=candidates or None,
                 machine_display=md,
                 headed=False,
             )
@@ -2161,15 +2232,30 @@ def run_showurl_job(chat_id: str, machines: list[str], date_iso: str = "") -> No
             if not key:
                 send_message(chat_id, f"❌ `{md}` — screenshot upload failed.")
                 continue
+            # Which machine / player / moment this Detail belongs to. The date is spelled out
+            # because the fallback above may have moved the read to the previous day.
+            caption = (
+                f"🕹️ **{md}**  ·  👤 **`{uid}`**  ·  🕒 **`{day_iso} {time_short}`**"
+            )
+            if candidates:
+                where = {
+                    "machine": "machine credit",
+                    "log_idle": "log credit (machine idle)",
+                    "log_unread": "log credit (machine credit unreadable)",
+                }[credit_from]
+                also = " / ".join(f"`{_showurl_fmt(c)}`" for c in candidates[1:])
+                caption += f"\n💰 Matched to {where} `{_showurl_fmt(credit)}`"
+                if also:
+                    caption += f" — also accepting {also}"
             sent = False
             if callable(build_card):
-                card = build_card(machine_display=md, image_key=key)
+                card = build_card(machine_display=md, image_key=key, subtitle=caption)
                 resp = send_message(chat_id, json.dumps(card), msg_type="interactive")
                 sent = isinstance(resp, dict) and resp.get("code") == 0
                 if not sent:
                     print(f"[showurl] card rejected for {md}: {resp!r}", flush=True)
             if not sent:
-                send_message(chat_id, f"**{md}**")
+                send_message(chat_id, caption)
                 send_image_message(chat_id, key)
         except Exception as e:
             send_message(chat_id, f"❌ `{mq}` ({idx}/{total}) — recharge Detail failed: {e}")

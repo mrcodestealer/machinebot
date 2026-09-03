@@ -126,6 +126,7 @@ def np_third_http_run_search_and_screenshot(
     headless: bool,
     out_path: str,
     match_info: dict[str, Any] | None = None,
+    expected_credit_any: list[float] | None = None,
 ) -> None:
     import checkcredit as cc
 
@@ -198,6 +199,7 @@ def np_third_http_run_search_and_screenshot(
             stats: dict[str, Any] = {
                 "recharge_rows": 0,
                 "details_tried": 0,
+                "skipped_negative": 0,
                 "sample_mids": [],
             }
             cc._np_pagination_go_first_page(page, timeout_ms=timeout_ms)
@@ -238,6 +240,7 @@ def np_third_http_run_search_and_screenshot(
                         to_scan,
                         machine_substr=machine_substr,
                         expected_credit=exp_try,
+                        expected_credit_any=expected_credit_any,
                         out_path=out_path,
                         timeout_ms=timeout_ms,
                         dialog_settle_ms=dsm,
@@ -262,12 +265,16 @@ def np_third_http_run_search_and_screenshot(
                 not matched
                 and ms
                 and exp_match is not None
+                # An explicit candidate set is the whole criterion; a 0.2x-5x magnitude band
+                # would accept exactly the rows it was given to exclude.
+                and not expected_credit_any
                 and cc._np_machine_only_fallback_enabled(_log_http_backend_tag)
             ):
                 ran_machine_only = True
                 mo_ok, mo_stats = _scan_detail_pages(None, settle_ms=settle)
                 stats["recharge_rows"] += mo_stats.get("recharge_rows", 0)
                 stats["details_tried"] += mo_stats.get("details_tried", 0)
+                stats["skipped_negative"] += mo_stats.get("skipped_negative", 0)
                 for s in mo_stats.get("sample_mids") or []:
                     if len(stats["sample_mids"]) < 8:
                         stats["sample_mids"].append(s)
@@ -324,6 +331,12 @@ def np_third_http_run_search_and_screenshot(
                 f"recharge rows seen `{scan_stats.get('recharge_rows', 0)}`, "
                 f"Detail tries `{scan_stats.get('details_tried', 0)}`."
             )
+            neg_n = int(scan_stats.get("skipped_negative") or 0)
+            if neg_n:
+                hint += (
+                    f" Skipped `{neg_n}` Detail(s) with a **negative** amount "
+                    "(credit into the cabinet, not the cash-out)."
+                )
             samples = scan_stats.get("sample_mids") or []
             if samples:
                 hint += " Sample Detail machineId/amount: " + ", ".join(
