@@ -125,6 +125,7 @@ def np_third_http_run_search_and_screenshot(
     timeout_ms: int,
     headless: bool,
     out_path: str,
+    match_info: dict[str, Any] | None = None,
 ) -> None:
     import checkcredit as cc
 
@@ -270,6 +271,9 @@ def np_third_http_run_search_and_screenshot(
                 for s in mo_stats.get("sample_mids") or []:
                     if len(stats["sample_mids"]) < 8:
                         stats["sample_mids"].append(s)
+                if mo_ok:
+                    stats["matched_machine_id"] = mo_stats.get("matched_machine_id")
+                    stats["matched_amount"] = mo_stats.get("matched_amount")
                 matched = mo_ok
             stats["ran_machine_only"] = ran_machine_only
             return matched, stats
@@ -280,6 +284,21 @@ def np_third_http_run_search_and_screenshot(
             _click_np_search()
             page.wait_for_timeout(post_search_ms + 2500)
             matched, scan_stats = _run_match_pass(extra_post_ms=800, extra_dialog_ms=900)
+
+        if matched and match_info is not None:
+            # Report what was actually matched so the caller need not assert that the log
+            # credit and the Detail amount agree - under the machine-only pass they need not.
+            match_info["machine_id"] = scan_stats.get("matched_machine_id")
+            match_info["amount"] = scan_stats.get("matched_amount")
+            match_info["machine_only"] = bool(scan_stats.get("ran_machine_only"))
+            match_info["expected_credit"] = exp_match
+            match_info["amount_scale"] = amt_scale
+            # True only when the Detail amount was really compared to the log credit:
+            # exp_match None means no credit to compare, and ran_machine_only means the
+            # amount pass found nothing and the match came from machineId alone.
+            match_info["amount_checked"] = bool(
+                exp_match is not None and not scan_stats.get("ran_machine_only")
+            )
 
         if not matched:
             bits: list[str] = []
@@ -352,3 +371,8 @@ def np_third_http_run_search_and_screenshot(
             timeout_ms=timeout_ms,
             settle_ms=600,
         )
+        if match_info is not None:
+            # No machine and no credit were supplied, so nothing was matched at all -
+            # say so rather than letting the least-verified path be the quietest.
+            match_info["no_match_performed"] = True
+            match_info["amount_checked"] = False

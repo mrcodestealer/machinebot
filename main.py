@@ -1738,7 +1738,7 @@ def run_check_machine_log_job(
                 )
                 success_caption = (
                     f"✅ **Third Http ({be})** — player `{uid}` **transferred out credit** successfully "
-                    f"(Detail matches log amount `{cr_s}` @ `{ts}`).\n"
+                    f"(log credit `{cr_s}` @ `{ts}`).\n"
                     f"✅ Third Http 有匹配记录 — 玩家 **`{uid}`** 额度应已成功转出（卡机可清）。"
                 )
             else:
@@ -1753,8 +1753,8 @@ def run_check_machine_log_job(
                     )
                     success_caption = (
                         f"✅ **Third Http ({be})** — player **`{uid}`** **transferred out credit** "
-                        f"(Detail `{cr_s}` @ `{ts}`, machine `{md}`).\n"
-                        f"✅ Third Http — 玩家 **`{uid}`** 转出成功（非 error 玩家 `{err_p}`）。"
+                        f"(log credit `{cr_s}` @ `{ts}`, machine `{md}`).\n"
+                        f"✅ Third Http — 玩家 **`{uid}`** 额度应已成功转出（非 error 玩家 `{err_p}`）。"
                     )
                 else:
                     _cml_send(
@@ -1764,7 +1764,7 @@ def run_check_machine_log_job(
                     )
                     success_caption = (
                         f"✅ **Third Http ({be})** — player `{uid}` **transferred out credit** successfully "
-                        f"(Detail matches log amount `{cr_s}` @ `{ts}`).\n"
+                        f"(log credit `{cr_s}` @ `{ts}`).\n"
                         f"✅ Third Http 有匹配记录 — 玩家 **`{uid}`** 额度应已成功转出。"
                     )
             _np_run_screenshot_worker(
@@ -1931,6 +1931,133 @@ def run_cctv_screenshot_job(chat_id: str, machine_query: str) -> None:
                 pass
 
 
+def _np_unverified_reason(match_info: Optional[dict]) -> tuple[str, str]:
+    """Why the Detail ``amount`` was never compared to the log credit — (English, Chinese)."""
+    if not match_info:
+        return "", ""
+    if match_info.get("no_match_performed"):
+        return (
+            "no machine and no log credit were supplied, so nothing was matched",
+            "无机台号与额度，未做任何匹配",
+        )
+    if not isinstance(match_info.get("expected_credit"), (int, float)):
+        return (
+            "the log had no credit value to compare against",
+            "日志无额度可对比",
+        )
+    return (
+        "matched on **machineId only** after the amount pass found nothing",
+        "金额未匹配，仅按机台号找到记录",
+    )
+
+
+def _np_match_verdict_line(
+    match_info: Optional[dict], expected_credit: Optional[float]
+) -> str:
+    """
+    State what the Third Http Detail actually said — never assert that it agrees with the log.
+
+    A transfer-OUT Detail carries a **negative** ``amount`` (credit leaving the cabinet), and the
+    machineId-only paths match without comparing the amount at all, so the old "Detail matches log
+    amount" caption asserted an equality the matcher had not checked. Print both numbers and let
+    the reader compare them against the screenshot. The ⚠️ for an unverified amount is raised by
+    :func:`_np_caption_with_verdict`, which owns the headline, so it is not repeated here.
+    """
+    if not match_info:
+        return ""
+    if match_info.get("no_match_performed"):
+        return (
+            "📊 The first `recharge` row in the time window was screenshotted as-is."
+            "\n📊 直接截取时间窗内第一条 recharge 记录。"
+        )
+    mid = str(match_info.get("machine_id") or "").strip()
+    amt = match_info.get("amount")
+    exp = match_info.get("expected_credit")
+    if exp is None:
+        exp = expected_credit
+    try:
+        scale = float(match_info.get("amount_scale") or 1.0) or 1.0
+    except (TypeError, ValueError):
+        scale = 1.0
+    shown = None
+    if amt is not None:
+        try:
+            shown = float(amt) / scale
+        except (TypeError, ValueError):
+            shown = None
+
+    head = "📊 Matched Detail" + (f" `{mid}`" if mid else "")
+    if amt is None:
+        parts = ["`amount` not parsed"]
+    elif scale != 1.0 and shown is not None:
+        parts = [f"`amount` `{amt}` (÷ `{scale}` = `{shown}`)"]
+    else:
+        parts = [f"`amount` `{amt}`"]
+    if isinstance(exp, (int, float)):
+        parts.append(f"log credit `{exp}`")
+        if shown is not None:
+            try:
+                import checkcredit
+
+                eps = float(checkcredit._np_amount_match_eps())
+            except Exception:
+                eps = 0.05
+            try:
+                gap = abs(abs(shown) - abs(float(exp)))
+            except (TypeError, ValueError):
+                gap = None
+            if gap is not None:
+                parts.append(
+                    "magnitudes agree"
+                    if gap <= eps
+                    else f"magnitudes differ by `{round(gap, 2)}`"
+                )
+    line = f"{head} — " + " · ".join(parts)
+    try:
+        if shown is not None and float(shown) < 0:
+            line += (
+                "\nℹ️ A negative `amount` means credit **leaving** the cabinet (transfer-out leg)."
+            )
+    except (TypeError, ValueError):
+        pass
+    return line
+
+
+def _np_caption_with_verdict(
+    success_caption: Optional[str],
+    match_info: Optional[dict],
+    expected_credit: Optional[float],
+    *,
+    uid: Optional[str] = None,
+    backend_tag: Optional[str] = None,
+) -> str:
+    """
+    Caption for a Third Http screenshot, chosen **after** the match is known.
+
+    The pre-built ``success_caption`` asserts the transfer succeeded and (for stuck credit) that
+    the machine can be cleared. That claim is only earned when the Detail ``amount`` was actually
+    compared to the log credit, so when it was not, the success wording is dropped entirely rather
+    than being contradicted a line later.
+    """
+    verdict = _np_match_verdict_line(match_info, expected_credit)
+    if match_info and not match_info.get("amount_checked"):
+        be = backend_tag or "?"
+        who = uid or "?"
+        why, why_zh = _np_unverified_reason(match_info)
+        head = (
+            f"⚠️ **Third Http ({be})** — a `recharge` Detail for player `{who}` was "
+            f"screenshotted, but the **amount was not verified**: {why}. "
+            "Read the numbers in the screenshot before acting."
+            f"\n⚠️ Third Http（{be}）— 已截取玩家 `{who}` 的 recharge 记录，但**金额未核对**"
+            f"（{why_zh}），请先核对截图再决定。"
+        )
+        return f"{head}\n{verdict}" if verdict else head
+    cap = (success_caption or "").strip()
+    if cap and verdict:
+        return f"{cap}\n{verdict}"
+    return verdict or cap
+
+
 def _np_run_screenshot_worker(
     chat_id: str,
     uid: str,
@@ -1970,6 +2097,7 @@ def _np_run_screenshot_worker(
         f"{' (warm browser)' if _third_http_warm_enabled_for_bot() else ''}…",
     )
     path = None
+    match_info: dict = {}
     try:
         path = screenshot_np_recharge_detail(
             uid,
@@ -1981,13 +2109,21 @@ def _np_run_screenshot_worker(
             machine_display=machine_display,
             headed=False,
             time_short_candidates=time_short_candidates,
+            match_info=match_info,
         )
         key = upload_image_lark(path)
         if not key:
             _np_send("❌ Failed to upload screenshot to Lark.")
             return
-        if (success_caption or "").strip():
-            _np_send(success_caption.strip())
+        cap = _np_caption_with_verdict(
+            success_caption,
+            match_info,
+            expected_credit,
+            uid=uid,
+            backend_tag=backend_tag,
+        )
+        if cap:
+            _np_send(cap)
         if root:
             r = reply_message_in_thread(root, key, msg_type="image")
         else:

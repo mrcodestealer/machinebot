@@ -3834,8 +3834,15 @@ def _np_detail_matches_credit_and_machine_id(
     if not _np_machine_id_contains_substr(machine_substr, mid):
         return False
     if expected_credit is None:
-        # Machine-only match (e.g. TBP fallback): accept if amount missing; reject obvious non-positive.
-        if amt is not None and amt <= 0:
+        # Machine-only match (e.g. TBP fallback): accept a missing amount; reject only an
+        # exactly-zero one. A transfer-OUT leg is legitimately **negative** (credit leaving the
+        # cabinet), so the sign must not decide the match.
+        #
+        # This is the ONLY amount test on this path. When the caller came here from the
+        # machine-only fallback it also applies _np_amount_plausible_for_soft_match, but when
+        # ``expected_credit`` was None from the start there is nothing to compare against and
+        # any non-zero amount is accepted — callers must report that as unverified.
+        if amt is not None and amt == 0:
             return False
         return True
     if amt is None:
@@ -4091,46 +4098,37 @@ def _np_try_screenshot_matching_detail(
         mid_p, amt_p = _np_parse_machine_amount_from_request_blob(blob or layers or full_txt)
         if scan_stats is not None and len(scan_stats.get("sample_mids") or []) < 8:
             scan_stats.setdefault("sample_mids", []).append((mid_p, amt_p))
-        ok = _np_detail_matches_credit_and_machine_id(
+        # Same layer order as before, but remember *which* text matched so the reported
+        # machineId / amount come from the layer the decision was made on — not from a
+        # different layer that happened to parse first.
+        ok = False
+        matched_txt = ""
+        for cand in (
             blob,
-            machine_substr,
-            expected_credit,
-            amount_scale=amount_scale,
+            layers,
+            full_txt,
+            _np_detail_request_section(layers),
+            "\n".join((blob, layers, full_txt)),
+        ):
+            if _np_detail_matches_credit_and_machine_id(
+                cand,
+                machine_substr,
+                expected_credit,
+                amount_scale=amount_scale,
+            ):
+                ok = True
+                matched_txt = cand
+                break
+        mid_m, amt_m = (
+            _np_parse_machine_amount_from_request_blob(matched_txt) if ok else (None, None)
         )
-        if not ok:
-            ok = _np_detail_matches_credit_and_machine_id(
-                layers,
-                machine_substr,
-                expected_credit,
-                amount_scale=amount_scale,
-            )
-        if not ok:
-            ok = _np_detail_matches_credit_and_machine_id(
-                full_txt,
-                machine_substr,
-                expected_credit,
-                amount_scale=amount_scale,
-            )
-        if not ok:
-            blob2 = _np_detail_request_section(layers)
-            ok = _np_detail_matches_credit_and_machine_id(
-                blob2,
-                machine_substr,
-                expected_credit,
-                amount_scale=amount_scale,
-            )
-        if not ok:
-            ok = _np_detail_matches_credit_and_machine_id(
-                "\n".join((blob, layers, full_txt)),
-                machine_substr,
-                expected_credit,
-                amount_scale=amount_scale,
-            )
         if ok and expected_credit is None and soft_expected_credit is not None:
-            _, det_amt = _np_parse_machine_amount_from_request_blob(blob or layers or full_txt)
-            if not _np_amount_plausible_for_soft_match(soft_expected_credit, det_amt):
+            if not _np_amount_plausible_for_soft_match(soft_expected_credit, amt_m):
                 ok = False
         if ok:
+            if scan_stats is not None:
+                scan_stats["matched_machine_id"] = mid_m
+                scan_stats["matched_amount"] = amt_m
             _np_capture_detail_dialog_screenshot(
                 page,
                 dlg_sel,
@@ -4145,7 +4143,18 @@ def _np_try_screenshot_matching_detail(
 
 
 def _np_amount_plausible_for_soft_match(expected: float | None, detail_amt: float | None) -> bool:
-    """Reject machine-only picks where Detail amount is wildly unlike log credit (e.g. 2 vs 77099)."""
+    """
+    Reject machine-only picks where Detail amount is wildly unlike log credit (e.g. 2 vs 77099).
+
+    **Magnitudes only.** A transfer-OUT Detail carries a negative ``amount`` (credit leaving the
+    cabinet) while the log credit is positive, so a *signed* ratio rejected every cash-out leg no
+    matter how close the magnitude was. Direction is asserted by the caller, not here.
+
+    Mostly this loosens the gate, but it **tightens** one case: a negative ``expected`` used to let
+    any positive ``detail_amt`` through unchecked (``if exp <= 0: return amt > 0``) and now has the
+    0.2x-5x band applied like any other magnitude. Only ``expected == 0`` keeps a free pass, since
+    there is then no magnitude to compare against.
+    """
     if expected is None or detail_amt is None:
         return True
     try:
@@ -4153,9 +4162,12 @@ def _np_amount_plausible_for_soft_match(expected: float | None, detail_amt: floa
         amt = float(detail_amt)
     except (TypeError, ValueError):
         return True
-    if exp <= 0:
-        return amt > 0
-    ratio = amt / exp
+    if amt == 0:
+        return False
+    if exp == 0:
+        # No magnitude to compare against — any non-zero amount is equally (im)plausible.
+        return True
+    ratio = abs(amt) / abs(exp)
     if ratio > 5.0 or ratio < 0.2:
         return False
     return True
@@ -4989,15 +5001,24 @@ def screenshot_np_recharge_detail(
     headed: bool | None = None,
     pause_for_input: bool = False,
     time_short_candidates: list[str] | None = None,
+    match_info: dict[str, Any] | None = None,
 ) -> str:
     """
     Login to NP backend, open Log Third Http Req, set date range ±NP_BACKEND_WINDOW_MINUTES,
-    filter UserId, Search, then scan recharge rows (same-minute rows first, then **all** other recharge
-    rows so headless / table-parse quirks do not skip a match).     Accept a Detail when Request JSON has ``machineId`` containing the machine digits; when
-    ``expected_credit`` is set and **> 0**, also require ``amount`` > 0 and within ``NP_BACKEND_AMOUNT_EPS``
-    of that credit (default 0.05).
-    (non-positive ``expected_credit`` is ignored — same as ``None``). **Header Request Time is not
-    used to reject** (avoids closing valid dialogs when UI text differs slightly from log seconds).
+    filter UserId, Search, then scan every ``recharge`` row nearest-log-time first.
+
+    A Detail is accepted when Request JSON ``machineId`` contains the machine digits and — when
+    ``expected_credit`` is numeric (``0.0`` and negatives included) — ``amount`` is within
+    ``NP_BACKEND_AMOUNT_EPS`` of it (default 0.05). If that finds nothing, a second
+    **machineId-only** pass runs (see :func:`_np_machine_only_fallback_enabled`) which ignores the
+    log credit and accepts any non-zero ``amount`` whose **magnitude** is within 0.2x–5x of it;
+    the sign is deliberately not tested there, because a transfer-OUT Detail is negative.
+    **Header Request Time is not used to reject** (avoids closing valid dialogs when UI text
+    differs slightly from log seconds).
+
+    ``match_info``: optional dict filled in on success with ``machine_id``, ``amount``,
+    ``expected_credit`` and ``machine_only`` — so the caller can report what was matched rather
+    than assert that the Detail amount equals the log credit.
     ``machine_display``: LogNavigator / OSS folder label (``DHS*`` / ``NCH*`` / ``CP*`` / ``OSM*`` / ``MDR*`` / ``TBR*`` / ``TBP*`` → respective backend;
     creds fall back to ``NP_BACKEND_*`` when ``DHS_BACKEND_*`` / ``NCH_BACKEND_*`` unset).
     ``WF*`` / ``NWR8173`` → Winford + ``WF_BACKEND_*``; else NP + ``NP_BACKEND_*``.
@@ -5055,6 +5076,7 @@ def screenshot_np_recharge_detail(
                 expected_credit=expected_credit,
                 machine_display=machine_display,
                 timeout_ms=timeout_ms,
+                match_info=match_info,
             )
     except Exception as ex:
         print(
@@ -5099,6 +5121,7 @@ def screenshot_np_recharge_detail(
                 timeout_ms=timeout_ms,
                 headless=headless,
                 out_path=out_path,
+                match_info=match_info,
             )
         finally:
             if pause_for_input:

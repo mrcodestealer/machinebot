@@ -151,6 +151,7 @@ class _ThirdHttpWarmWorker:
                 timeout_ms=timeout_ms,
                 headless=headless,
                 out_path=out_path,
+                match_info=kw.get("match_info"),
             )
             box["path"] = out_path
         except Exception as ex:
