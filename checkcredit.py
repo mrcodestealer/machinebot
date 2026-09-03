@@ -2091,6 +2091,41 @@ def build_np_choice_lark_card(
     }
 
 
+def build_machine_screenshot_card(
+    *,
+    machine_display: str,
+    image_key: str,
+    subtitle: str = "",
+) -> dict[str, Any]:
+    """
+    Card 2.0 holding one machine's screenshot and nothing else: the machine name is the header,
+    the image is the body. Used by ``/showurl``, which posts one of these per machine.
+    """
+    md = (machine_display or "").strip() or "Machine"
+    elements: list[dict[str, Any]] = []
+    sub = (subtitle or "").strip()
+    if sub:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": sub}})
+    ik = (image_key or "").strip()
+    if ik:
+        elements.append(
+            {"tag": "img", "img_key": ik, "alt": {"tag": "plain_text", "content": md}}
+        )
+    else:
+        elements.append(
+            {"tag": "div", "text": {"tag": "lark_md", "content": "_No screenshot._"}}
+        )
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "width_mode": "fill"},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": md},
+        },
+        "body": {"elements": elements},
+    }
+
+
 def build_np_followup_payload(
     top2_any: list[dict[str, Any]],
     top2_err: list[dict[str, Any]],

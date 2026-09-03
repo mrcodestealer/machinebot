@@ -27,6 +27,7 @@ This is a self-contained bot that ONLY does the machine + encoder flows mirrored
   - ``/stuckcredit <machine> [date]``          stuck credit: log + Third Http transfer-out check
   - ``/npthirdhttp <player_id> [date time]``   NP/WF/DHS/NCH/CP/OSM/MDR/TBP Third Http Detail
   - ``/cctvshot <machine>``                    EGM CCTV screenshot · ``/al [DD/MM]`` Amount Loss
+  - ``/showurl <machine> [more…]``            EGM screen of each machine, one card per machine
   - ``/main /pool /cctv <machine(s)>``         one encoder stream (MAIN/POOL/CCTV) from OSM-Watch
   - reply **1**–**4** after an NP prompt · **Missing Credit** alert paste → checkcredit card
 
@@ -1991,6 +1992,113 @@ def run_cctv_screenshot_job(chat_id: str, machine_query: str) -> None:
                 pass
 
 
+def _parse_machine_list(text: str, cmd: str) -> list[str]:
+    """
+    Machines given after a command word — one per line (the ``/showurl`` shape) or separated by
+    spaces/commas on one line. Order is kept and repeats dropped, so a pasted list with a
+    duplicate does not screenshot the same cabinet twice.
+    """
+    body = re.sub(rf"(?is)^\s*{re.escape(cmd)}\b[ \t]*", "", (text or "").strip(), count=1)
+    out: list[str] = []
+    seen: set[str] = set()
+    for tok in re.split(r"[\s,;]+", body):
+        name = tok.strip().strip(",;")
+        if not name:
+            continue
+        key = name.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+    return out
+
+
+def _showurl_max_machines() -> int:
+    try:
+        return max(1, int((os.getenv("SHOWURL_MAX_MACHINES") or "10").strip()))
+    except ValueError:
+        return 10
+
+
+def run_showurl_job(chat_id: str, machines: list[str]) -> None:
+    """
+    ``/showurl`` — one EGM operation-window screenshot per machine, each posted in its own card
+    (machine name as the title, the screenshot as the only content) as soon as it is ready.
+
+    Same picture ``/checkcredit`` puts on its player card, without the player list or buttons.
+    Each machine is a separate browser login, so they are done one at a time and posted as they
+    finish rather than batched at the end.
+    """
+    try:
+        import checkcredit
+    except ImportError as e:
+        send_message(chat_id, f"❌ Cannot load checkcredit module: {e}")
+        return
+    cap = getattr(checkcredit, "screenshot_egm_status_window", None)
+    if not callable(cap):
+        send_message(
+            chat_id,
+            "❌ `checkcredit.screenshot_egm_status_window` missing — deploy the latest `checkcredit.py`.",
+        )
+        return
+    build_card = getattr(checkcredit, "build_machine_screenshot_card", None)
+    resolve_route = getattr(checkcredit, "resolve_machine_display_for_egm_route", None)
+
+    wanted = list(machines or [])
+    cap_n = _showurl_max_machines()
+    dropped = wanted[cap_n:]
+    wanted = wanted[:cap_n]
+    total = len(wanted)
+    send_message(
+        chat_id,
+        f"⏳ `/showurl` — {total} machine(s): "
+        + ", ".join(f"`{m}`" for m in wanted)
+        + (
+            f"\n⚠️ Only the first {cap_n} are done in one go; skipped: "
+            + ", ".join(f"`{m}`" for m in dropped)
+            if dropped
+            else ""
+        ),
+    )
+    for idx, mq in enumerate(wanted, start=1):
+        path = None
+        md = mq
+        try:
+            ms: Optional[str] = None
+            if callable(resolve_route):
+                md, ms = resolve_route(mq, timeout_ms=120_000)
+            md = (md or "").strip() or mq
+            path = cap(
+                machine_display=md,
+                machine_substr=(ms or "").strip() or None,
+                timeout_ms=120_000,
+                headed=False,
+            )
+            key = upload_image_lark(path) or ""
+            if not key:
+                send_message(chat_id, f"❌ `{md}` — screenshot upload failed.")
+                continue
+            sent = False
+            if callable(build_card):
+                card = build_card(machine_display=md, image_key=key)
+                resp = send_message(chat_id, json.dumps(card), msg_type="interactive")
+                sent = isinstance(resp, dict) and resp.get("code") == 0
+                if not sent:
+                    print(f"[showurl] card rejected for {md}: {resp!r}", flush=True)
+            if not sent:
+                send_message(chat_id, f"**{md}**")
+                send_image_message(chat_id, key)
+        except Exception as e:
+            send_message(chat_id, f"❌ `{mq}` ({idx}/{total}) — screenshot failed: {e}")
+            print(f"[showurl] {mq}: {e!r}", flush=True)
+        finally:
+            if path and os.path.isfile(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
 def _np_unverified_reason(match_info: Optional[dict]) -> tuple[str, str]:
     """Why the Detail ``amount`` was never compared to the log credit — (English, Chinese)."""
     if not match_info:
@@ -2820,6 +2928,7 @@ _HELP_TEXT = (
     "• `/stuckcredit <machine> [date]` — stuck credit + Third Http transfer-out check\n"
     "• `/npthirdhttp <player_id> [YYYY-MM-DD HH:MM:SS.mmm]` — Third Http Detail\n"
     "• `/cctvshot <machine>` — EGM CCTV screenshot · `/al [DD/MM]` — Amount Loss\n"
+    "• `/showurl <machine(s)>` — EGM screen of each machine (one card each, no buttons)\n"
     "• reply **1**–**4** after an NP prompt · paste a **Missing Credit** alert to auto-fill\n"
     "• `/main /pool /cctv <machine(s)>` — only that encoder stream from OSM-Watch\n"
     "• `who am i` — your Lark open_id (for tagging / config)\n"
@@ -3159,6 +3268,21 @@ def _handle_machine_message(
             )
             return
         start_lark_background_thread(run_cctv_screenshot_job, chat_id, m_cv.group(1))
+        return
+
+    # /showurl <machine> [more…] — EGM screen per machine, one card each. Machines may be listed
+    # one per line under the command (so read the multi-line body, not the collapsed one).
+    if re.match(r"^/showurl\b", ct, re.I):
+        machines_su = _parse_machine_list(clean_text_multiline or ct, "/showurl")
+        if not machines_su:
+            send_message(
+                chat_id,
+                "❌ Usage: `/showurl <machine>` — EGM screen of each machine, one card each.\n"
+                "One per line, or all on one line:\n"
+                "```\n/showurl\nNWR2096\nNCH1498\nNWR2110\n```",
+            )
+            return
+        start_lark_background_thread(run_showurl_job, chat_id, machines_su)
         return
 
     # /npthirdhttp <player_id> [date time]
