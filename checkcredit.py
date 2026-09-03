@@ -1787,6 +1787,28 @@ def _np_lark_v2_button_row(buttons: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+_AUTO_RESELECT_RE = re.compile(r"select\s+another\s+machine", re.I)
+
+
+def _is_auto_reselect_error(err: dict[str, Any]) -> bool:
+    """
+    ``errorJson{'desc': 'Game in progress, select another machine.', 'error': 1}``.
+
+    The cabinet was busy (a game still running, a jackpot being paid, a fault), so the backend
+    sent the player to a different machine before any play happened here. There is no credit line
+    for them on this cabinet and never will be.
+    """
+    text = f"{err.get('snippet') or ''} {err.get('full_line') or ''}"
+    return bool(_AUTO_RESELECT_RE.search(text))
+
+
+def np_choice_auto_reselect(choice: dict[str, Any] | None) -> bool:
+    """A listed player whose whole story here is 'go play somewhere else'."""
+    if not isinstance(choice, dict):
+        return False
+    return bool(choice.get("auto_reselect")) and not str(choice.get("time_short") or "").strip()
+
+
 def np_choices_actionable(
     np_followup: dict[str, Any] | list[dict[str, Any]] | None,
     *,
@@ -1835,6 +1857,9 @@ def _np_choice_row_md(idx: int, ch: dict[str, Any]) -> str:
     """One player line: index, ID, credit, credit time, error count, why it is listed."""
     uid = str(ch.get("user_id") or "").strip() or "n/a"
     ts = str(ch.get("time_short") or "").strip()
+    if np_choice_auto_reselect(ch):
+        # Credit/time/error columns would all be "n/a" and say nothing; this says everything.
+        return f"**{idx}**  \u00b7  **`{uid}`**  \u00b7  This player is auto select another machine."
     bits = [f"**{idx}**  \u00b7  **`{uid}`**"]
     bits.append(f"\U0001f4b0 `{_fmt_credit_display(ch.get('credit'))}`")
     if ts:
@@ -1892,6 +1917,13 @@ def build_np_choice_lark_card(
     files_read = [str(f).strip() for f in (merged_log_files or []) if str(f).strip()]
     n = len(np_choices)
     actionable_n = sum(1 for ch in np_choices if str(ch.get("time_short") or "").strip())
+    # Players bounced to another cabinet are already explained on their own row.
+    blocked_n = sum(
+        1
+        for ch in np_choices
+        if not str(ch.get("time_short") or "").strip() and not np_choice_auto_reselect(ch)
+    )
+    pickable_n = sum(1 for ch in np_choices if not np_choice_auto_reselect(ch))
     la_uid = str(latest_any_uid or "").strip()
     le_uid = str(latest_err_uid or "").strip()
 
@@ -1973,16 +2005,23 @@ def build_np_choice_lark_card(
     # --- how to pick (before the list, so the buttons below need no explaining) ---
     if n:
         _hr()
-        hint = [
-            f"\U0001f449 **Tap the player-ID button** under a player \u2014 or type the ID "
-            f"(or **1**\u2013**{n}**) in chat, no **@** needed.",
-            "\U0001f4f8 Screenshot window = the log date above + that player\u2019s credit time.",
-        ]
-        if actionable_n < n:
-            hint.append(
-                f"\u26d4 **{n - actionable_n}** of **{n}** have no credit time in the log and "
-                f"cannot be screenshotted."
-            )
+        if pickable_n:
+            hint = [
+                f"\U0001f449 **Tap the player-ID button** under a player \u2014 or type the ID "
+                f"(or **1**\u2013**{n}**) in chat, no **@** needed.",
+                "\U0001f4f8 Screenshot window = the log date above + that player\u2019s credit time.",
+            ]
+            if blocked_n:
+                hint.append(
+                    f"\u26d4 **{blocked_n}** of **{n}** have no credit time in the log and "
+                    f"cannot be screenshotted."
+                )
+        else:
+            # Every listed player was bounced elsewhere: no buttons, so do not explain buttons.
+            hint = [
+                "\u2139\ufe0f Every player below was auto-moved to another machine \u2014 "
+                "nothing was played on this cabinet, so there is nothing to screenshot."
+            ]
         _div("\n".join(hint))
 
     # --- the players: each row followed by its own ID button ---
@@ -1994,6 +2033,12 @@ def build_np_choice_lark_card(
         _hr()
         _div(_np_choice_row_md(i, ch))
         uid = str(ch.get("user_id") or "").strip()
+        if np_choice_auto_reselect(ch):
+            # No Third Http window to open, so no button — and the same/different verdict about
+            # this player would only repeat what the row already says.
+            if _row_note(uid):
+                noted = True
+            continue
         note = _row_note(uid)
         if note:
             _div(note)
@@ -2079,6 +2124,8 @@ def build_np_followup_payload(
             "credit_value": credit_val,
             "source": source,
             "errors_n": len(errs),
+            # Every error line is the "select another machine" bounce -> nothing played here.
+            "auto_reselect": bool(errs) and all(_is_auto_reselect_error(e) for e in errs),
         }
 
     merged = merged_players or []

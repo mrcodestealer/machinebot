@@ -1429,6 +1429,55 @@ def _third_http_warm_enabled_for_bot() -> bool:
         return False
 
 
+def _start_jackpot_vision_check(
+    chat_id: str,
+    png_bytes: bytes,
+    machine_display: str,
+    thread_root: Optional[str],
+) -> None:
+    """
+    Ask the local vision model whether the EGM screenshot shows a jackpot, and post a follow-up
+    in the card's thread when it does.
+
+    Runs on its own thread: the model takes tens of seconds and the player card must not wait for
+    it. Every failure is logged and swallowed — a missing hint is not worth a broken /checkcredit.
+    """
+    if not png_bytes:
+        return
+    try:
+        import jackpotvision
+    except ImportError as ex:
+        print(f"[jackpot] module unavailable: {ex!r}", flush=True)
+        return
+    if not jackpotvision.jackpot_vision_enabled():
+        return
+
+    def _run() -> None:
+        try:
+            verdict = jackpotvision.detect_jackpot(png_bytes, machine_display=machine_display)
+        except Exception as ex:  # noqa: BLE001 - defensive: the module already catches its own
+            print(f"[jackpot] check failed: {ex!r}", flush=True)
+            return
+        if verdict.get("error"):
+            print(f"[jackpot] {machine_display}: {verdict['error']}", flush=True)
+            return
+        print(
+            f"[jackpot] {machine_display}: jackpot={verdict.get('jackpot')} "
+            f"win={verdict.get('win')!r} credit={verdict.get('credit')!r} "
+            f"reason={verdict.get('reason')!r}",
+            flush=True,
+        )
+        if not verdict.get("jackpot"):
+            return
+        _checkcredit_send(
+            chat_id,
+            jackpotvision.format_jackpot_notice(verdict, machine_display=machine_display),
+            thread_root=thread_root,
+        )
+
+    threading.Thread(target=_run, daemon=True, name="jackpot-vision").start()
+
+
 def run_checkcredit_finderror(
     chat_id,
     machine_query: str,
@@ -1530,6 +1579,7 @@ def run_checkcredit_finderror(
         text = (out.get("text") or "").strip()
         np = out.get("np_followup")
         preview_img_path = None
+        preview_img_bytes = b""
         preview_img_key = ""
         preview_img_err = ""
         preview_img_attempted = False
@@ -1548,6 +1598,11 @@ def run_checkcredit_finderror(
                         timeout_ms=120_000,
                         headed=False,
                     )
+                    try:
+                        with open(preview_img_path, "rb") as _shot:
+                            preview_img_bytes = _shot.read()
+                    except OSError as _shot_err:
+                        print(f"[jackpot] could not read screenshot: {_shot_err!r}", flush=True)
                     preview_img_key = upload_image_lark(preview_img_path) or ""
                     if not preview_img_key:
                         preview_img_err = "upload image failed"
@@ -1667,6 +1722,11 @@ def run_checkcredit_finderror(
 
         if isinstance(np, dict):
             _set_checkcredit_np_pending(chat_id, np, thread_root=thread_root)
+        # After the card, never before it: the model needs tens of seconds.
+        jackpot_md = str(machine_query).strip()
+        if isinstance(np, dict):
+            jackpot_md = str(np.get("machine_display") or "").strip() or jackpot_md
+        _start_jackpot_vision_check(chat_id, preview_img_bytes, jackpot_md, thread_root)
     except Exception as e:
         cmd = "machineerror" if str(mode or "").strip().lower() == "error_only" else "checkcredit"
         _cc_send(f"❌ {cmd} failed: {e}")
@@ -2201,6 +2261,14 @@ def run_np_third_http_by_choice(chat_id: str, choice_idx: int) -> None:
     uid = str(ch.get("user_id") or "").strip()
     date_iso = (pend.get("target_date") or "").strip()
     time_short = (ch.get("time_short") or "").strip()
+    if ch.get("auto_reselect") and not time_short:
+        _checkcredit_send(
+            chat_id,
+            f"\u2139\ufe0f `{uid or 'this player'}` was auto-moved to another machine "
+            "(*Game in progress, select another machine*) \u2014 there is no credit line on this "
+            "cabinet to screenshot.",
+        )
+        return
     if not uid or not date_iso or not time_short:
         _checkcredit_send(chat_id, "❌ Pending NP choice is incomplete — use `/npthirdhttp …` with full date/time.")
         return
