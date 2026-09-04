@@ -16,7 +16,10 @@ Runs on its own Lark app in **persistent connection** mode (Subscription mode �
 | `machine status NWR2008` | read-only status from the live scrape (`webmachine_data.json`) |
 | `/findmachine` or `/fm` | interactive card: environment + game type + online/offline → machine names |
 | `/nch /nwr /wf /tbr /tbp /cp /dhs /mdr <id(s)>` | asset / encoder sheet lookup, rendered as a TRTC-parsed card |
-| `/encoder nwr2205 & nwr2206` | MAIN/POOL/CCTV encoder IPs — IP from the OSM-Watch **IP Audit** (CMDB column, `latestmachineip.json`), TRTC room/user/sig from `latestencoder.json` (`/encoder refresh` re-scrapes both) |
+| `/encoder nwr2205 & nwr2206` | MAIN/POOL/CCTV encoder IPs — IP from the **OSM Machine List** wiki sheet (`machineip.py`) first, OSM-Watch's **IP Audit** (CMDB column, `latestmachineip.json`) as fallback; TRTC room/user/sig from `latestencoder.json` (`/encoder refresh` re-scrapes OSM-Watch) |
+| `/main /pool /cctv /minipc <machine(s)>` | one stream only — MAIN / POOL (the sheet's *Top Encoder*) / CCTV / Mini PC |
+| tag the bot with machine name(s) | `@bot NWR2205`, `@bot dyb21 & 8527` — every IP we hold for those machines, no command word |
+| `/iprefresh` | re-read the OSM Machine List sheet now (it is otherwise cached for `MACHINE_IP_TTL_SEC`, default 10 min) |
 | `/osmwatch [url]` | OSM-Watch dashboard screenshot (warm browser) |
 | `/loginosmwatch` | force a fresh OSM-Watch login QR (posted to the lab group) |
 | `/checkcredit <machine> [YYYY-MM-DD]` | today's/dated log → latest players → NP choice card (Third Http) |
@@ -25,7 +28,7 @@ Runs on its own Lark app in **persistent connection** mode (Subscription mode �
 | `/checkmachinelog <machine> [date]` | logic-log card + AI summary (+ Third Http follow-up) |
 | `/stuckcredit <machine> [date]` | stuck credit: log + Third Http transfer-out check |
 | `/npthirdhttp <player_id> [YYYY-MM-DD HH:MM:SS.mmm]` | NP/WF/DHS/NCH/CP/OSM/MDR/TBP Third Http Detail screenshot |
-| `/cctv <machine>` | EGM CCTV screenshot (no credit check) |
+| `/cctvshot <machine>` | EGM CCTV screenshot (no credit check) — `/cctv` is the CCTV **encoder** stream |
 | `/al [DD/MM]` | Amount Loss (CHECKLOG) card + copy-for-sheet TSV |
 | reply `1`–`4` after an NP prompt | Third Http Detail for the picked player |
 | paste a **Missing Credit** alert (@bot) | parses account/amount/date → checkcredit form card |
@@ -45,6 +48,10 @@ The `/wm` machine dashboard (webmachine blueprint) is served on the bot's Flask 
 - `amountloss.py` — FPMS Amount Loss + CHECKLOG (`/al`); `chatagent.py` — optional LLM used by the AI summary
 - `webmachine.py` — machine dashboard + scrape loop; `webapp.py` here is a thin **alias** to it
 - `findmachine.py`, `machine_card.py` — find-machine form card + TRTC card rendering
+- `machineip.py` — OSM Machine List wiki sheet reader (`machineiplist.json`): the primary machine-IP
+  source for `/encoder /main /pool /cctv /minipc` and the plain "@bot &lt;machine&gt;" tag. One tab per
+  venue (CP NCH DYB DHS WF NWR TBR TBP); the `(Lab)` and `Template` tabs are ignored. Machines are
+  matched on venue + asset digits, so `dyb21`, `DYB0021` and a bare `8527` all resolve
 - `osmwatch.py` — OSM-Watch warm browser, QR login, IP-Audit scraper (`latestmachineip.json`) + TRTC encoder scraper (`latestencoder.json`)
 - `reminder.py` — one-time maintenance reminders (Bitable sheet + APScheduler)
 - `nch/nwr/winford/tbr/tbp/cp/dhs/mdr.py` — per-site asset sheet lookups (`mdr.py` patched to read
@@ -67,8 +74,12 @@ cp .env.example .env   # then fill in APP_ID/APP_SECRET/VERIFICATION_TOKEN + tok
 Lark developer console for this app:
 - **Events & callbacks → Subscription mode**: *Receive events through a persistent connection*.
 - Subscribe to `im.message.receive_v1`; card interactions arrive as `card.action.trigger`.
-- Permissions: send/read messages, upload images, Sheets + Bitable read/write
-  (asset lookup sheets and the reminder table must be accessible to **this** app).
+- Permissions: send/read messages, upload images, Sheets + Bitable read/write, **Wiki
+  node read** (`wiki:wiki:readonly` — needed to resolve the OSM Machine List wiki link to
+  its spreadsheet). The asset lookup sheets, the reminder table **and the OSM Machine List
+  doc** must be accessible to **this** app; if the machine list is only shared with another
+  app, point `MACHINE_IP_APP_ID` / `MACHINE_IP_APP_SECRET` at that one, or set
+  `MACHINE_IP_SPREADSHEET_TOKEN` to skip wiki resolution entirely.
 
 ### Data files to seed (gitignored — copy from the osedutybot server)
 
@@ -76,7 +87,8 @@ Lark developer console for this app:
 | --- | --- |
 | `webmachine_data.json` | machine list used by set/unset targeting + `/findmachine` before the first scrape finishes |
 | `osmwatch.json` | OSM-Watch Playwright session — without it the bot needs a fresh `/loginosmwatch` QR |
-| `latestmachineip.json` | machine IPs from the IP Audit (CMDB column) — the source `/encoder` shows; empty until the first authenticated scrape |
+| `latestmachineip.json` | machine IPs from the IP Audit (CMDB column) — the **fallback** IP source; empty until the first authenticated scrape |
+| `machineiplist.json` | cached read of the OSM Machine List sheet (the primary IP source) — regenerated on demand, so nothing to copy |
 | `latestencoder.json` | TRTC room / user id / user sig per machine; empty until the first authenticated scrape |
 
 ```bash

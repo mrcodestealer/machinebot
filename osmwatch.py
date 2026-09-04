@@ -1108,9 +1108,24 @@ LATESTENCODER_JSON = _ROOT_DIR / os.getenv("OSMWATCH_ENCODER_DATA_FILE", "latest
 # data-type on each row -> our normalized stream type. "top" is the dashboard's
 # internal name for the POOL stream (its badge reads "🎮 POOL").
 _ENCODER_TYPE_MAP = {"main": "main", "top": "pool", "pool": "pool", "cctv": "cctv"}
-_ENCODER_TYPE_ORDER = ("main", "pool", "cctv")
-_ENCODER_TYPE_LABEL = {"main": "MAIN", "pool": "POOL", "cctv": "CCTV"}
-_ENCODER_TYPE_EMOJI = {"main": "🎬", "pool": "🎱", "cctv": "📹"}
+_ENCODER_TYPE_ORDER = ("main", "pool", "cctv", "minipc", "minipc_lucky")
+_ENCODER_TYPE_LABEL = {"main": "MAIN", "pool": "POOL", "cctv": "CCTV",
+                       "minipc": "MINI PC", "minipc_lucky": "LUCKY LINK MINI PC"}
+_ENCODER_TYPE_EMOJI = {"main": "🎬", "pool": "🎱", "cctv": "📹",
+                       "minipc": "🖥️", "minipc_lucky": "🍀"}
+# Heading per stream. A Mini PC is not an encoder, so it must not be labelled as
+# one — everything else keeps the wording /encoder has always printed.
+_ENCODER_TYPE_TITLE = {"main": "MAIN Encoder", "pool": "POOL Encoder", "cctv": "CCTV Encoder",
+                       "minipc": "Mini PC", "minipc_lucky": "Lucky Link Mini PC"}
+# Streams that exist only in the OSM Machine List sheet (the IP Audit has no such
+# rows). `/encoder` with no filter keeps showing exactly the three encoder streams
+# it always did; these appear when asked for by name (`/minipc`) or on a plain
+# "@bot <machine>" tag, which asks for everything we hold.
+_ENCODER_EXTRA_TYPES = frozenset({"minipc", "minipc_lucky"})
+_ENCODER_ALL_TYPES = frozenset(_ENCODER_TYPE_ORDER)
+# Public name for the same set: main.py's "@bot <machine>" path asks for every
+# stream we hold, Mini PC included.
+ALL_STREAM_TYPES = _ENCODER_ALL_TYPES
 _ENCODER_QUERY_SPLIT = re.compile(r"[\s,&]+")
 
 # TRTC SDKAppID shown next to every room. Fixed across all OSM-Watch rooms; override
@@ -1353,6 +1368,12 @@ _IPAUDIT_TYPE_MAP = {"main": "main", "top": "pool", "pool": "pool", "cctv": "cct
 _IPAUDIT_IP_FIELDS = (("cmdb_ip", "cmdb"), ("lark_ip", "lark"), ("osm_ip", "osm"))
 _IPAUDIT_SOURCE_LABEL = {"cmdb": "CMDB", "lark": "Lark sheet", "osm": "OSM-Watch"}
 
+# The OSM Machine List wiki sheet (machineip.py) — the FIRST place an IP comes
+# from. The IP Audit below is the fallback for a machine, or a single stream, the
+# sheet has no address for.
+_SHEET_SOURCE = "sheet"
+_SHEET_SOURCE_LABEL = "OSM Machine List sheet"
+
 
 def _ipaudit_enabled() -> bool:
     return _truthy(os.getenv("OSMWATCH_IPAUDIT", "1"))
@@ -1524,6 +1545,165 @@ def _entry_from_audit(audit_entry: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# OSM Machine List sheet — the primary IP source (machineip.py)
+# ---------------------------------------------------------------------------
+# The sheet is the floor's own record of every cabinet's addresses, so it answers
+# first and the IP Audit answers for what it doesn't carry. Everything below is
+# written so a sheet outage (no credentials, doc unshared, Lark down) degrades to
+# the previous OSM-Watch-only behaviour instead of breaking /encoder.
+_SHEET_MOD: "object | None" = None      # None = not tried yet, False = unusable
+
+
+def _sheet_mod():
+    """The machineip module, or ``None`` when the sheet source can't be used."""
+    global _SHEET_MOD
+    if _SHEET_MOD is None:
+        try:
+            import machineip as _mod
+            _SHEET_MOD = _mod
+        except Exception as e:
+            print(f"[osmwatch-ip] OSM Machine List sheet unavailable: {e!r}", flush=True)
+            _SHEET_MOD = False
+    mod = _SHEET_MOD or None
+    if mod is None:
+        return None
+    try:
+        return mod if mod.enabled() else None
+    except Exception:
+        return None
+
+
+def _sheet_call(fn_name: str, *args, default=None):
+    """Call one machineip function, swallowing any failure."""
+    mod = _sheet_mod()
+    if not mod:
+        return default
+    try:
+        return getattr(mod, fn_name)(*args)
+    except Exception as e:
+        print(f"[osmwatch-ip] sheet {fn_name} failed: {e!r}", flush=True)
+        return default
+
+
+def _sheet_matches(tokens: list[str]) -> dict[str, dict]:
+    return _sheet_call("match", tokens, default={}) or {}
+
+
+def _sheet_canon(name: str) -> str | None:
+    return _sheet_call("canon_key", name)
+
+
+def _sheet_snapshot() -> dict:
+    return _sheet_call("load_machine_ips", default={}) or {}
+
+
+def _sheet_loaded() -> bool:
+    """True when a sheet snapshot is actually in hand.
+
+    Distinguishes "this machine isn't in the sheet" from "we have no sheet" —
+    without it, a deployment with no access to the doc would tell every user that
+    every machine is missing from a sheet nobody could read."""
+    return bool(_sheet_snapshot().get("machines"))
+
+
+def _sheet_index() -> dict[str, dict]:
+    """``{canonical key: row}`` for the whole sheet, resolved once.
+
+    Callers must NOT look machines up one at a time through machineip: each such
+    call re-resolves the snapshot, and on a host where the sheet is unreadable
+    that means one failed read per matched machine for a single chat command."""
+    return _sheet_snapshot().get("machines") or {}
+
+
+def _sheet_row(index: dict, machine: str) -> dict | None:
+    """This machine's row from an index built by ``_sheet_index``, as a copy.
+
+    Copied because the index belongs to machineip's cache; merging into the
+    original would leak one command's edits into the next command's answer."""
+    canon = _sheet_canon(machine)
+    row = index.get(canon) if canon else None
+    if not row:
+        return None
+    return {**row, "types": {t: dict(i) for t, i in (row.get("types") or {}).items()}}
+
+
+def _merge_sheet_ips(entry: dict, sheet_entry: dict | None) -> dict:
+    """Overlay the sheet's IPs onto an entry — the sheet wins, per stream.
+
+    A blank or ``N/A`` cell is not an answer, so it changes nothing and the
+    OSM-Watch address stands. When the two records disagree the replaced address
+    is kept as ``osm_ip`` and reported, because a machine whose CMDB row and floor
+    sheet point at different hosts is exactly what someone needs to know."""
+    if not sheet_entry:
+        return entry
+    sheet_types = sheet_entry.get("types") or {}
+    if not sheet_types:
+        return entry
+    merged = dict(entry)
+    merged["types"] = {}
+    for typ, info in (entry.get("types") or {}).items():
+        info = dict(info)
+        ip = str((sheet_types.get(typ) or {}).get("ip") or "").strip()
+        if ip:
+            prev = str(info.get("ip") or "").strip()
+            if prev and prev != ip:
+                # Name the record it came from: the audit stamps ip_source, a
+                # stream TRTC alone knew about leaves it empty.
+                key_for_prev = "osm_ip" if info.get("ip_source") in _IPAUDIT_SOURCE_LABEL else "trtc_ip"
+                info[key_for_prev] = prev
+            info["ip"] = ip
+            info["ip_source"] = _SHEET_SOURCE
+            # The TRTC drift line was recorded against the audit's address; if the
+            # sheet's address is the one TRTC had all along there is no drift left
+            # to report, and repeating the same IP back reads like a fault.
+            if str(info.get("trtc_ip") or "").strip() == ip:
+                info.pop("trtc_ip", None)
+        merged["types"][typ] = info
+    for typ, cell in sheet_types.items():
+        ip = str(cell.get("ip") or "").strip()
+        if typ in merged["types"] or not ip:
+            continue
+        merged["types"][typ] = {"ip": ip, "ip_source": _SHEET_SOURCE, "ip_only": True}
+    # The sheet's Asset ID is the machine's name — that is the rule for this data,
+    # and it is what people read off the floor. In the ordinary case both records
+    # already agree (NWR2205, OSM077, DHS3049); where they differ it is because
+    # OSM-Watch stored an alias spelling like OSMDYB0021, and the sheet's DYB0021
+    # is the name to show.
+    sheet_name = str(sheet_entry.get("machine") or "").strip()
+    if sheet_name:
+        merged["machine"] = sheet_name
+    merged["sheet_venue"] = sheet_entry.get("venue") or ""
+    merged["sheet_status"] = sheet_entry.get("sheet_status") or ""
+    if sheet_entry.get("dupe_rows"):
+        merged["sheet_dupe_rows"] = list(sheet_entry["dupe_rows"])
+        merged["sheet_dupe_conflict"] = bool(sheet_entry.get("dupe_conflict"))
+    if not merged.get("env"):
+        merged["env"] = sheet_entry.get("venue") or ""
+    return merged
+
+
+def _entry_from_sheet(sheet_entry: dict) -> dict:
+    """Build an IP-only entry for a machine only the sheet knows about."""
+    types = {}
+    for typ, cell in (sheet_entry.get("types") or {}).items():
+        ip = str(cell.get("ip") or "").strip()
+        if ip:
+            types[typ] = {"ip": ip, "ip_source": _SHEET_SOURCE, "ip_only": True}
+    entry = {
+        "machine": sheet_entry.get("machine") or "?",
+        "env": sheet_entry.get("venue") or "",
+        "backend_status": "",
+        "sheet_venue": sheet_entry.get("venue") or "",
+        "sheet_status": sheet_entry.get("sheet_status") or "",
+        "types": types,
+    }
+    if sheet_entry.get("dupe_rows"):
+        entry["sheet_dupe_rows"] = list(sheet_entry["dupe_rows"])
+        entry["sheet_dupe_conflict"] = bool(sheet_entry.get("dupe_conflict"))
+    return entry
+
+
 def _parse_encoder_queries(arg: str) -> list[str]:
     return [t for t in _ENCODER_QUERY_SPLIT.split((arg or "").strip()) if t]
 
@@ -1531,8 +1711,10 @@ def _parse_encoder_queries(arg: str) -> list[str]:
 def _entry_types_filtered(entry: dict, only_types: "set[str] | None" = None):
     """Ordered ``(type, info)`` pairs for a machine, optionally restricted to ``only_types``.
 
-    ``only_types`` powers ``/main`` / ``/pool`` / ``/cctv`` (show just that stream); ``None``
-    (``/encoder``) shows all of main/pool/cctv.
+    ``only_types`` powers ``/main`` / ``/pool`` / ``/cctv`` / ``/minipc`` (show just
+    that stream); ``None`` (``/encoder``) shows the three encoder streams plus any
+    unrecognised type the audit reported, but not the sheet-only Mini PC rows —
+    those are asked for by name, so an unfiltered /encoder card stays as it was.
     """
     types = entry.get("types") or {}
     ordered = list(_ENCODER_TYPE_ORDER) + [t for t in types if t not in _ENCODER_TYPE_ORDER]
@@ -1540,19 +1722,50 @@ def _entry_types_filtered(entry: dict, only_types: "set[str] | None" = None):
     for t in ordered:
         if only_types and t not in only_types:
             continue
+        if not only_types and t in _ENCODER_EXTRA_TYPES:
+            continue
         info = types.get(t)
         if info:
             out.append((t, info))
     return out
 
 
-def _only_types_label(only_types: "set[str] | None") -> str:
-    """Space-suffixed label for a type filter, e.g. ``"MAIN "`` (or ``""`` for all)."""
-    if not only_types:
-        return ""
-    labels = [_ENCODER_TYPE_LABEL.get(t, t.upper()) for t in _ENCODER_TYPE_ORDER if t in only_types]
-    labels += [t.upper() for t in only_types if t not in _ENCODER_TYPE_ORDER]
-    return (" ".join(labels) + " ") if labels else ""
+# Which command asked for a given filter — used in usage text, so the example a
+# user is shown is the command they actually typed.
+_CMD_FOR_TYPES = {
+    frozenset({"main"}): "/main",
+    frozenset({"pool"}): "/pool",
+    frozenset({"cctv"}): "/cctv",
+    frozenset(_ENCODER_EXTRA_TYPES): "/minipc",
+}
+
+
+def _stream_heading(only_types: "set[str] | None") -> str:
+    """Heading noun for a type filter: ``Encoder RTC``, ``MAIN Encoder``, ``Mini PC``.
+
+    A filter covering every stream — what a plain "@bot <machine>" tag asks for —
+    reads like ``/encoder`` rather than listing five stream names, and the two
+    Mini PC columns are one thing to a reader, so they get one word."""
+    if not only_types or set(only_types) >= _ENCODER_ALL_TYPES:
+        return "Encoder RTC"
+    if set(only_types) == set(_ENCODER_EXTRA_TYPES):
+        return "Mini PC"
+    titles = [_ENCODER_TYPE_TITLE.get(t, f"{_ENCODER_TYPE_LABEL.get(t, t.upper())} Encoder")
+              for t in _ENCODER_TYPE_ORDER if t in only_types]
+    titles += [t.upper() for t in only_types if t not in _ENCODER_TYPE_ORDER]
+    return " / ".join(titles) or "Encoder RTC"
+
+
+def _stream_emoji(only_types: "set[str] | None") -> str:
+    if only_types and len(only_types) == 1:
+        return _ENCODER_TYPE_EMOJI.get(next(iter(only_types)), "🎬")
+    if only_types and set(only_types) == set(_ENCODER_EXTRA_TYPES):
+        return _ENCODER_TYPE_EMOJI["minipc"]
+    return "🎬"
+
+
+def _cmd_hint(only_types: "set[str] | None") -> str:
+    return _CMD_FOR_TYPES.get(frozenset(only_types or ()), "/encoder")
 
 
 def _log_merge_overlap(enc_snap: dict | None, ip_snap: dict | None) -> dict:
@@ -1578,29 +1791,61 @@ def _log_merge_overlap(enc_snap: dict | None, ip_snap: dict | None) -> dict:
 def _ip_provenance_note(shown: list) -> str:
     """One-line note when the IP didn't come from the usual place (or at all).
 
-    Silent for the normal case (a CMDB IP plus a registered TRTC room), so it only
-    ever appears when it explains something the reader would otherwise wonder
-    about. The two oddities can coexist — a machine with no TRTC room AND a blank
-    CMDB cell — so both are reported in the same line rather than one hiding the
-    other."""
+    The usual place is the OSM Machine List sheet, so a machine the sheet carries
+    gets no note at all. Anything else is worth a word: falling through to the IP
+    Audit means the sheet has no row (or no cell) for that machine, and a machine
+    with no TRTC room registered is still called out as before."""
     if not shown:
         return ""
-    fallbacks = sorted({info.get("ip_source") for _, info in shown
-                        if info.get("ip_source") and info.get("ip_source") != "cmdb"})
+    sources = {info.get("ip_source") for _, info in shown if str(info.get("ip") or "").strip()}
+    fallbacks = sorted(s for s in sources if s and s != _SHEET_SOURCE)
     names = ", ".join(_IPAUDIT_SOURCE_LABEL.get(s, s) for s in fallbacks)
-    if all(info.get("ip_only") for _, info in shown):
-        col = f"CMDB column blank; used {names}" if names else "CMDB"
-        return f"ℹ️ IP from the OSM-Watch IP Audit ({col}) — no TRTC room registered."
-    if names:
-        return f"ℹ️ CMDB column blank — IP taken from {names}."
-    return ""
+    # "No TRTC room" is only worth saying about a stream that could have had one.
+    # A Mini PC never does, so /minipc must not end every answer with it.
+    no_room = (all(info.get("ip_only") for _, info in shown)
+               and not all(t in _ENCODER_EXTRA_TYPES for t, _ in shown))
+    if _SHEET_SOURCE in sources:
+        where = f"the {_SHEET_SOURCE_LABEL}"
+        if names:
+            where += f", and from the OSM-Watch IP Audit ({names}) where the sheet has no cell"
+        elif not no_room:
+            return ""                      # the normal case — say nothing
+    elif not _sheet_loaded():
+        # No sheet in hand (switched off, or the doc isn't shared with this app).
+        # Behave as before the sheet became the primary source: speak up only when
+        # the audit itself fell back off its CMDB column, and never blame a sheet
+        # that was never read.
+        others = ", ".join(_IPAUDIT_SOURCE_LABEL.get(s, s) for s in fallbacks if s != "cmdb")
+        if no_room:
+            col = f"CMDB column blank; used {others}" if others else "CMDB"
+            return f"ℹ️ IP from the OSM-Watch IP Audit ({col}) — no TRTC room registered."
+        return f"ℹ️ CMDB column blank — IP taken from {others}." if others else ""
+    elif names:
+        where = f"the OSM-Watch IP Audit ({names}), not the sheet"
+    else:
+        return "ℹ️ No IP on record for this machine." if no_room else ""
+    if no_room:
+        return f"ℹ️ IP from {where} — no TRTC room registered."
+    return f"ℹ️ IP from {where}."
 
 
 def _encoder_updated_label(snap: dict | None, ip_snap: dict | None) -> str:
-    """``updated <trtc-scrape> · IPs <audit-scrape>`` — two sources, two timestamps."""
-    enc = (snap or {}).get("updated_at") or "?"
+    """``sheet <read> · TRTC <scrape> · IP Audit <scrape>`` — three sources, three clocks.
+
+    Only the ones we actually hold are named: a missing OSM-Watch scrape used to
+    print "updated ?", which reads like a broken answer rather than "that source
+    hasn't run yet"."""
+    bits = []
+    sheet = (_sheet_snapshot() or {}).get("updated_at")
+    if sheet:
+        bits.append(f"sheet {sheet}")
+    enc = (snap or {}).get("updated_at")
+    if enc:
+        bits.append(f"TRTC {enc}")
     ip = (ip_snap or {}).get("updated_at")
-    return f"updated {enc}" + (f" · IPs {ip}" if ip else "")
+    if ip:
+        bits.append(f"IP Audit {ip}")
+    return " · ".join(bits) or "no source has been read yet"
 
 
 def _match_encoder_machines(
@@ -1608,8 +1853,9 @@ def _match_encoder_machines(
 ) -> "tuple[list[str], dict[str, dict], dict, dict]":
     """Resolve a query into ``(tokens, matched, trtc_snap, ip_snap)``.
 
-    Every matched entry has the LATEST IP applied: TRTC gives the room/user/sig,
-    the IP Audit gives the IP. A machine the audit knows but TRTC has no row for
+    Every matched entry has the LATEST IP applied, in source order: the OSM
+    Machine List sheet first, the IP Audit for whatever the sheet doesn't carry,
+    and TRTC for the room/user/sig. A machine only one of the three knows about
     is still returned (IP-only) — the IP is the part people ask for, and it would
     be wrong to answer "no match" when we hold a current address for it."""
     snap = load_latestencoder() or {}
@@ -1620,6 +1866,8 @@ def _match_encoder_machines(
     matched: dict[str, dict] = {}
     if not tokens:
         return tokens, matched, snap, ip_snap
+    sheet_hits = _sheet_matches(tokens)
+    sheet_index = _sheet_index()
     for tok in tokens:
         # Snapshots store the bare name, but people type either form, so a query
         # for OSMDYB0001 has to still find DYB0001.
@@ -1629,45 +1877,107 @@ def _match_encoder_machines(
             needles.append(bare)
         for key, entry in machines.items():
             if any(n in key for n in needles):
-                matched.setdefault(key, _merge_latest_ips(entry, audit.get(key)))
+                merged = _merge_latest_ips(entry, audit.get(key))
+                matched.setdefault(key, _merge_sheet_ips(merged, _sheet_row(sheet_index, key)))
         for key in sorted(audit):
             if key not in machines and any(n in key for n in needles):
-                built = _entry_from_audit(audit[key])
+                built = _merge_sheet_ips(_entry_from_audit(audit[key]), _sheet_row(sheet_index, key))
                 if built["types"]:
                     matched.setdefault(key, built)
+    # Machines the sheet matched that the loops above didn't. The sheet matches on
+    # venue + asset digits, so it finds machines OSM-Watch's substring test misses
+    # (a query for "dyb21" never was a substring of "DYB0021") as well as cabinets
+    # OSM-Watch simply hasn't scraped. Where OSM-Watch does hold the same machine
+    # under a different spelling, its row is folded in here rather than dropped —
+    # and the canonical key keeps a machine already answered above from being
+    # listed twice.
+    if sheet_hits:
+        seen = {_sheet_canon(k) or k for k in matched}
+        canon_trtc = {_sheet_canon(k) or k: k for k in machines}
+        canon_audit = {_sheet_canon(k) or k: k for k in audit}
+        for key, sheet_entry in sheet_hits.items():
+            if key in seen:
+                continue
+            seen.add(key)
+            trtc_key, audit_key = canon_trtc.get(key), canon_audit.get(key)
+            if trtc_key:
+                out_key = trtc_key
+                aud = audit.get(trtc_key) or (audit.get(audit_key) if audit_key else None)
+                built = _merge_sheet_ips(_merge_latest_ips(machines[trtc_key], aud), sheet_entry)
+            elif audit_key:
+                out_key = audit_key
+                built = _merge_sheet_ips(_entry_from_audit(audit[audit_key]), sheet_entry)
+            else:
+                built = _entry_from_sheet(sheet_entry)
+                out_key = str(built["machine"]).upper()
+            if built["types"]:
+                matched.setdefault(out_key, built)
     # Also collapse on the way out, not just at scrape time: a snapshot written
     # by an older build (or before the next scrape lands) still holds both names,
     # and the answer should be deduped regardless of the file's vintage. Safe on
     # the matched subset — a needle that finds OSMDYB0007 finds DYB0007 too, so
     # the bare twin is present here whenever it exists at all.
     matched = _collapse_osm_aliases(matched)
-    if only_types:
-        matched = {k: v for k, v in matched.items() if _entry_types_filtered(v, only_types)}
+    # Drop machines with nothing to show for this query — whatever the filter is.
+    # An unfiltered /encoder hides the Mini PC streams, so a machine whose only
+    # address on record is a Mini PC one would otherwise render as a bare name
+    # with no IP under it.
+    matched = {k: v for k, v in matched.items() if _entry_types_filtered(v, only_types)}
     return tokens, matched, snap, ip_snap
 def _known_machine_count(snap: dict, ip_snap: dict) -> int:
-    """How many distinct machines either source knows about."""
-    return len((snap.get("machines") or {}).keys() | (ip_snap.get("machines") or {}).keys())
+    """How many distinct machines any source knows about.
+
+    Counted on the sheet's canonical key (venue + asset digits) so a machine the
+    audit calls ``OSMDYB0021`` and the sheet calls ``DYB0021`` counts once."""
+    keys = (snap.get("machines") or {}).keys() | (ip_snap.get("machines") or {}).keys()
+    canon = {_sheet_canon(k) or k for k in keys}
+    return len(canon | set((_sheet_snapshot().get("machines") or {}).keys()))
+
+
+def _sheet_dupe_note(entry: dict) -> str:
+    """Say so when the sheet holds more than one row for this asset id.
+
+    Two cabinets typed with the same Asset ID (different serials, different IPs)
+    is a real thing in the sheet. The first row is what gets shown, and staying
+    quiet about the second would make a wrong answer look like a certain one."""
+    rows = entry.get("sheet_dupe_rows")
+    if not rows:
+        return ""
+    where = ", ".join(str(r) for r in rows)
+    tail = (" with different IPs — showing the first."
+            if entry.get("sheet_dupe_conflict") else " — showing the first.")
+    return f"⚠️ The sheet has another row for this asset (row {where}){tail}"
+
+
+def _entry_head_bits(entry: dict) -> str:
+    """``(NWR · Online)`` — venue/env plus the sheet's own Status column."""
+    bits = [x for x in (entry.get("env") or "", entry.get("sheet_status") or "") if x]
+    return f" ({' · '.join(bits)})" if bits else ""
 
 
 def _fmt_encoder_machine(entry: dict, only_types: "set[str] | None" = None) -> str:
     machine = entry.get("machine") or "?"
-    env = entry.get("env") or ""
-    lines = [f"🎥 **{machine}**" + (f" ({env})" if env else "")]
+    lines = [f"🎥 **{machine}**" + _entry_head_bits(entry)]
     shown = _entry_types_filtered(entry, only_types)
     for t, info in shown:
         ip = info.get("ip") or "—"
         meta = " · ".join(x for x in (info.get("status") or "", info.get("updated") or "") if x)
-        label = _ENCODER_TYPE_LABEL.get(t, t.upper())
+        title = _ENCODER_TYPE_TITLE.get(t, f"{_ENCODER_TYPE_LABEL.get(t, t.upper())} Encoder")
         emoji = _ENCODER_TYPE_EMOJI.get(t, "🎞️")
-        head = f"{emoji} **{label} Encoder** IP ADDRESS — `{ip}`"
+        head = f"{emoji} **{title}** IP ADDRESS — `{ip}`"
         if meta:
             head += f"  {meta}"
         lines.append(head)
-        # Only set when the TRTC page disagrees with the audit — worth surfacing:
-        # it means that room is still pointed at the machine's old address.
+        # Only set when the TRTC page disagrees — worth surfacing: it means that
+        # room is still pointed at the machine's old address.
         drift = info.get("trtc_ip")
         if drift:
             lines.append(f"↪️ TRTC page still lists `{drift}`")
+        # Only set when the sheet and the IP Audit disagree — the two records
+        # naming different hosts is precisely what someone needs told.
+        audit_drift = info.get("osm_ip")
+        if audit_drift:
+            lines.append(f"↪️ OSM-Watch IP Audit lists `{audit_drift}`")
         room, user, sig = info.get("room_id") or "", info.get("user_id") or "", info.get("user_sig") or ""
         # The SDKAppID only means something next to a room, so it is shown only
         # when this stream actually has a TRTC encoder. On an IP-only stream (one
@@ -1681,6 +1991,9 @@ def _fmt_encoder_machine(entry: dict, only_types: "set[str] | None" = None) -> s
             lines.append(f"👤 User ID  : `{user}`")
         if sig:
             lines.append(f"🔑 User Sig : `{sig}`")
+    dupe = _sheet_dupe_note(entry)
+    if dupe:
+        lines.append(dupe)
     note = _ip_provenance_note(shown)
     if note:
         lines.append(note)
@@ -1690,16 +2003,20 @@ def _fmt_encoder_machine(entry: dict, only_types: "set[str] | None" = None) -> s
 def query_encoder(arg: str, only_types: "set[str] | None" = None) -> list[str]:
     """Look up machines and return Lark-ready message string(s).
 
-    Tokens split on whitespace / comma / ``&`` and matched as case-insensitive
-    substrings of the machine name (e.g. ``nwr2205`` -> ``NWR2205``). ``only_types``
-    restricts output to one stream (``/main`` / ``/pool`` / ``/cctv``). IPs come from
-    ``latestmachineip.json`` (IP Audit / CMDB), TRTC fields from ``latestencoder.json``."""
+    Tokens split on whitespace / comma / ``&``; the sheet matches them on venue +
+    asset digits (``dyb21`` -> ``DYB0021``, a bare ``8527`` -> ``TBP 8527``) and
+    OSM-Watch matches them as case-insensitive substrings of the machine name.
+    ``only_types`` restricts output to one stream (``/main`` / ``/pool`` / ``/cctv`` /
+    ``/minipc``). IPs come from the OSM Machine List sheet first (machineip.py),
+    then ``latestmachineip.json`` (IP Audit / CMDB); TRTC fields from
+    ``latestencoder.json``."""
     tokens, matched, snap, ip_snap = _match_encoder_machines(arg, only_types)
-    label = _only_types_label(only_types)  # "MAIN " / "" — used in headings + usage
-    cmd_hint = f"/{next(iter(only_types))}" if (only_types and len(only_types) == 1) else "/encoder"
-    if not (snap.get("machines") or ip_snap.get("machines")):
-        return ["⚠️ Encoder data isn't ready yet — it's scraped in the background. "
-                "Try again shortly (or run `/encoder refresh`)."]
+    heading = _stream_heading(only_types)      # "MAIN Encoder" / "Mini PC" / "Encoder RTC"
+    cmd_hint = _cmd_hint(only_types)
+    if not (snap.get("machines") or ip_snap.get("machines") or _sheet_snapshot().get("machines")):
+        return ["⚠️ Machine IP data isn't ready yet — the sheet is read on demand and "
+                "the encoder data is scraped in the background. Try again shortly "
+                "(or run `/iprefresh`, or `/encoder refresh`)."]
     updated = _encoder_updated_label(snap, ip_snap)
     if not tokens:
         return [f"Usage: `{cmd_hint} <machine>` — e.g. `{cmd_hint} nwr2205` "
@@ -1707,15 +2024,31 @@ def query_encoder(arg: str, only_types: "set[str] | None" = None) -> list[str]:
                 f"📅 {_known_machine_count(snap, ip_snap)} machines · {updated}"]
 
     if not matched:
-        return [f"🔎 No {label}encoder machine matched: {', '.join(tokens)}\n📅 {updated}"]
+        # A machine that exists but has nothing in the asked-for column is a
+        # different answer from "no such machine", and saying the same thing for
+        # both sends people looking for a typo that isn't there. Probed against
+        # every stream type, since an unfiltered /encoder hides the Mini PC ones.
+        _, any_type, _, _ = _match_encoder_machines(arg, _ENCODER_ALL_TYPES)
+        if any_type:
+            names = ", ".join((e.get("machine") or k) for k, e in list(any_type.items())[:5])
+            if not only_types:
+                return [f"🔎 No encoder IP on record for {names} — the only address the sheet "
+                        f"has for it is a Mini PC one. Try `/minipc {tokens[0]}`.\n📅 {updated}"]
+            if _sheet_loaded():
+                return [f"🔎 No {heading} on record for {names} — no address in that column "
+                        f"of the sheet, and nothing from OSM-Watch either.\n📅 {updated}"]
+            return [f"🔎 No {heading} on record for {names} — the OSM Machine List sheet isn't "
+                    f"loaded (try `/iprefresh`) and OSM-Watch has no address for it either."
+                    f"\n📅 {updated}"]
+        return [f"🔎 No machine matched: {', '.join(tokens)}\n📅 {updated}"]
 
     cap = _encoder_max_matches()
     keys = list(matched.keys())
     truncated = len(keys) > cap
     keys = keys[:cap]
 
-    header = (f"🎬 **{label}Encoder RTC** — {len(matched)} match(es) for {', '.join(tokens)}"
-              f"\n📅 {updated}")
+    header = (f"{_stream_emoji(only_types)} **{heading}** — {len(matched)} match(es) "
+              f"for {', '.join(tokens)}\n📅 {updated}")
     blocks = [header] + [_fmt_encoder_machine(matched[k], only_types) for k in keys]
     if truncated:
         blocks.append(f"… {len(matched) - cap} more not shown — narrow your query.")
@@ -1747,23 +2080,26 @@ def _encoder_status_emoji(status: str) -> str:
 def _encoder_machine_md(entry: dict, only_types: "set[str] | None" = None) -> str:
     """lark_md body for one machine card block (emoji per stream type)."""
     machine = entry.get("machine") or "?"
-    env = entry.get("env") or ""
-    parts = [f"🎥 **{machine}**" + (f"  ·  {env}" if env else "")]
+    head = " · ".join(x for x in (entry.get("env") or "", entry.get("sheet_status") or "") if x)
+    parts = [f"🎥 **{machine}**" + (f"  ·  {head}" if head else "")]
     shown = _entry_types_filtered(entry, only_types)
     for t, info in shown:
         emoji = _ENCODER_TYPE_EMOJI.get(t, "🎞️")
-        label = _ENCODER_TYPE_LABEL.get(t, t.upper())
+        title = _ENCODER_TYPE_TITLE.get(t, f"{_ENCODER_TYPE_LABEL.get(t, t.upper())} Encoder")
         ip = info.get("ip") or "—"
         status_raw = info.get("status") or ""
         status_txt = re.sub(r"^[✓✔✗✖⚠️\s]+", "", status_raw).strip()
         status_bit = f"{_encoder_status_emoji(status_raw)} {status_txt}".strip() if (status_raw or status_txt) else ""
         meta = " · ".join(x for x in (status_bit, info.get("updated") or "") if x)
-        block = [f"{emoji} **{label} Encoder** — IP ADDRESS `{ip}`"]
+        block = [f"{emoji} **{title}** — IP ADDRESS `{ip}`"]
         if meta:
             block.append(meta)
         drift = info.get("trtc_ip")
         if drift:
             block.append(f"↪️ TRTC page still lists `{drift}`")
+        audit_drift = info.get("osm_ip")
+        if audit_drift:
+            block.append(f"↪️ OSM-Watch IP Audit lists `{audit_drift}`")
         room, user, sig = info.get("room_id") or "", info.get("user_id") or "", info.get("user_sig") or ""
         # Shown only when this stream has a TRTC encoder — see _fmt_encoder_machine.
         if ENCODER_APP_ID and (room or user or sig):
@@ -1775,6 +2111,9 @@ def _encoder_machine_md(entry: dict, only_types: "set[str] | None" = None) -> st
         if sig:
             block.append(f"🔑 User Sig : `{sig}`")
         parts.append("\n".join(block))
+    dupe = _sheet_dupe_note(entry)
+    if dupe:
+        parts.append(dupe)
     note = _ip_provenance_note(shown)
     if note:
         parts.append(note)
@@ -1785,7 +2124,8 @@ def build_encoder_card(arg: str, only_types: "set[str] | None" = None) -> dict |
     """Build a Lark schema-2.0 interactive card for the query, or None to signal
     the caller to fall back to plain text (no data / no tokens / no match).
 
-    ``only_types`` restricts the card to one stream (``/main`` / ``/pool`` / ``/cctv``)."""
+    ``only_types`` restricts the card to one stream (``/main`` / ``/pool`` / ``/cctv``
+    / ``/minipc``); the full set is what a plain "@bot <machine>" tag asks for."""
     tokens, matched, snap, ip_snap = _match_encoder_machines(arg, only_types)
     if not tokens or not matched:
         return None
@@ -1811,13 +2151,13 @@ def build_encoder_card(arg: str, only_types: "set[str] | None" = None) -> dict |
         elements.append({"tag": "div", "text": {"tag": "lark_md",
                          "content": f"… {len(matched) - cap} more not shown — narrow your query."}})
 
-    label = _only_types_label(only_types)
-    hemoji = _ENCODER_TYPE_EMOJI.get(next(iter(only_types)), "🎬") if (only_types and len(only_types) == 1) else "🎬"
+    heading = _stream_heading(only_types)
+    hemoji = _stream_emoji(only_types)
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "width_mode": "fill"},
         "header": {"template": "blue",
-                   "title": {"tag": "plain_text", "content": f"{hemoji} {label}Encoder RTC Info"}},
+                   "title": {"tag": "plain_text", "content": f"{hemoji} {heading} Info"}},
         "body": {"elements": elements},
     }
 

@@ -12,6 +12,8 @@ webmachine_data.json
 machineencoder.json
 latestencoder.json
 latestmachineip.json
+machineiplist.json
+machineiplist.json.tmp
 osmwatch.json
 osmwatch_qr.png
 osmwatch.png

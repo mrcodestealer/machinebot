@@ -11,9 +11,11 @@ This is a self-contained bot that ONLY does the machine + encoder flows mirrored
   - ``machine status <names>``                 read-only status from webmachine_data.json
   - ``/findmachine`` (``/fm``)                 interactive card: env + game type + online/offline
   - ``/nch /nwr /wf /tbr /tbp /cp /dhs /mdr``  asset/encoder sheet lookups (TRTC-parsed cards)
-  - ``/encoder <machine(s)>``                  MAIN/POOL/CCTV IPs from OSM-Watch's IP Audit
-                                              (CMDB column -> latestmachineip.json); TRTC
-                                              room/user/sig from latestencoder.json
+  - ``/encoder <machine(s)>``                  MAIN/POOL/CCTV IPs — from the OSM Machine List
+                                              wiki sheet (machineip.py) first, OSM-Watch's IP
+                                              Audit (CMDB -> latestmachineip.json) as fallback;
+                                              TRTC room/user/sig from latestencoder.json
+  - ``/iprefresh``                             re-read the OSM Machine List sheet now
   - ``/osmwatch [url]``                        OSM-Watch dashboard screenshot (warm browser)
   - ``/loginosmwatch``                         force a fresh OSM-Watch login QR (lab group)
   - ``/wm``                                    machine dashboard (webmachine blueprint + scrape loop)
@@ -28,7 +30,8 @@ This is a self-contained bot that ONLY does the machine + encoder flows mirrored
   - ``/npthirdhttp <player_id> [date time]``   NP/WF/DHS/NCH/CP/OSM/MDR/TBP Third Http Detail
   - ``/cctvshot <machine>``                    EGM CCTV screenshot · ``/al [DD/MM]`` Amount Loss
   - ``/showurl <machine(s)> [YYYY-MM-DD]``     recharge Detail per machine, one card each
-  - ``/main /pool /cctv <machine(s)>``         one encoder stream (MAIN/POOL/CCTV) from OSM-Watch
+  - ``/main /pool /cctv /minipc <machine(s)>`` one stream only (MAIN/POOL/CCTV/Mini PC)
+  - ``@bot NWR2205`` (no command)              tagged with just machine name(s) → all its IPs
   - reply **1**–**4** after an NP prompt · **Missing Credit** alert paste → checkcredit card
 
 The heavy lifting lives in the sibling modules copied verbatim from ``osedutybot``:
@@ -3086,7 +3089,8 @@ _HELP_TEXT = (
     "• `machine status NWR2008` — read-only status from the live scrape\n"
     "• `/findmachine` (`/fm`) — interactive card: env + game type + online/offline\n"
     "• `/nch /nwr /wf /tbr /tbp /cp /dhs /mdr <id(s)>` — asset / encoder sheet lookup\n"
-    "• `/encoder <machine(s)>` — MAIN/POOL/CCTV IPs from OSM-Watch (`/encoder refresh` to rescrape)\n"
+    "• `/encoder <machine(s)>` — MAIN/POOL/CCTV IPs, OSM Machine List sheet first\n"
+    "• `/iprefresh` — re-read the OSM Machine List sheet (`/encoder refresh` rescrapes OSM-Watch)\n"
     "• `/osmwatch [url]` — OSM-Watch dashboard screenshot\n"
     "• `/checkosmwatch` — check the bot can still access OSM-Watch (Show Qr Code if not)\n"
     "• `/loginosmwatch` — force a fresh OSM-Watch login QR (lab group)\n"
@@ -3099,7 +3103,8 @@ _HELP_TEXT = (
     "• `/cctvshot <machine>` — EGM CCTV screenshot · `/al [DD/MM]` — Amount Loss\n"
     "• `/showurl <machine(s)> [date]` — recharge Detail of each machine's latest player\n"
     "• reply **1**–**4** after an NP prompt · paste a **Missing Credit** alert to auto-fill\n"
-    "• `/main /pool /cctv <machine(s)>` — only that encoder stream from OSM-Watch\n"
+    "• `/main /pool /cctv /minipc <machine(s)>` — only that stream\n"
+    "• tag the bot with just machine name(s) — `@bot NWR2205` — for all of its IPs\n"
     "• `who am i` — your Lark open_id (for tagging / config)\n"
     "• `/deploy` — git pull origin main + restart the systemd service"
 )
@@ -3118,12 +3123,73 @@ _WHOAMI_RE = re.compile(
 
 # Encoder-stream commands: `/encoder` shows all of MAIN/POOL/CCTV; the others filter to one stream.
 # NOTE: `/cctv` here is the CCTV *encoder* stream; the EGM CCTV screenshot moved to `/cctvshot`.
+# `/minipc` asks for both Mini PC columns of the OSM Machine List sheet: the plain one, which
+# every row fills in, and the Lucky Link one, which only Lucky Link cabinets carry (blank or
+# N/A everywhere else, so it simply doesn't render for the rest).
 _ENCODER_TYPE_CMDS: dict[str, "set[str] | None"] = {
     "/encoder": None,
     "/main": {"main"},
     "/pool": {"pool"},
     "/cctv": {"cctv"},
+    "/minipc": {"minipc", "minipc_lucky"},
 }
+
+# Venue prefixes accepted in front of an asset number when the bot is tagged with
+# nothing but machine names. Same vocabulary as maintenancemachineagent's
+# _ENV_PREFIXES, plus the aliases smmachine.py folds together (OSM -> CP, WIN* -> WF).
+_TAG_VENUES = ("OSM", "NWR", "NCH", "DYB", "DHS", "WINFORD", "WIN", "WF",
+               "TBR", "TBP", "MDR", "CP", "NP", "NC")
+# ``OSMDYB0001`` is one of the names OSM-Watch itself stores, so an OSM in front of
+# a venue code is still one machine — while a bare ``OSM077`` is CP's own asset
+# naming and has to keep that prefix (machineip.canon_key draws the same line).
+# The compound alternative comes first so it wins over the plain "OSM".
+_TAG_PREFIX_ALT = "|".join(
+    ("OSM(?:" + "|".join(v for v in _TAG_VENUES if v != "OSM") + ")",) + _TAG_VENUES
+)
+_TAG_PREFIX_ONLY_RE = re.compile(r"(?i)^(?:" + _TAG_PREFIX_ALT + r")$")
+_TAG_MACHINE_RE = re.compile(r"(?i)^(" + _TAG_PREFIX_ALT + r")?[-_]?(\d{1,6})$")
+
+
+def _machine_tokens_only(text: str) -> "list[str] | None":
+    """The machine tokens when a message is nothing BUT machine references.
+
+    This is what makes a plain "@bot NWR2205" (or "@bot dyb21 & 8527") answer with
+    IPs. It runs last, after every keyword intent has had its look, and it gives
+    up the moment anything else appears in the message — it must never hijack a
+    sentence that merely contains a number.
+
+    A venue prefix standing on its own binds to the number after it, so the
+    "DHS 3049" spelling the sheets use reads as one machine. A bare number needs
+    three digits or more, which keeps a stray "ok 1" out of the machine path.
+    """
+    raw = (text or "").strip()
+    if not raw or raw.startswith("/"):
+        return None
+    parts = [p.strip(".:;()[]?!\"'") for p in re.split(r"[\s,&]+", raw)]
+    parts = [p for p in parts if p]
+    # Generous enough for a pasted list written in the sheet's own "DHS 3049"
+    # spelling, where every machine costs two tokens, and still bounded.
+    if not parts or len(parts) > 24:
+        return None
+    out: list[str] = []
+    pending = ""
+    for tok in parts:
+        if _TAG_PREFIX_ONLY_RE.match(tok):
+            if pending:
+                return None                     # two prefixes in a row — not a machine list
+            pending = tok
+            continue
+        m = _TAG_MACHINE_RE.match(tok)
+        if not m:
+            return None
+        prefix, digits = m.group(1), m.group(2)
+        if pending and prefix:
+            return None                         # "NWR NCH2205" is not something to guess at
+        prefix, pending = (prefix or pending), ""
+        if not prefix and len(digits) < 3:
+            return None
+        out.append(f"{prefix}{digits}".upper())
+    return out if (out and not pending) else None
 
 
 def _sst_run_batch(
@@ -3357,6 +3423,64 @@ def _handle_machine_message(
                     pass
 
         start_lark_background_thread(_run_osmwatch_shot)
+        return
+
+    # ---- OSM Machine List sheet: re-read the primary IP source now ----
+    if cmd in ("/iprefresh", "/refreship"):
+        def _run_iprefresh(chat_id_ip=chat_id):
+            try:
+                import machineip as _mi
+
+                if not _mi.enabled():
+                    send_message(
+                        chat_id_ip,
+                        "ℹ️ The OSM Machine List sheet source is switched off "
+                        "(`MACHINE_IP_SHEET=0`) — IPs are coming from OSM-Watch only.",
+                    )
+                    return
+                send_message(chat_id_ip, "🔄 Re-reading the OSM Machine List sheet…")
+                snap = _mi.refresh()          # raises when the sheet can't be read
+                tabs = " · ".join(f"{t['title']} {t['machines']}" for t in snap.get("tabs") or [])
+                skipped = ", ".join(snap.get("skipped_tabs") or []) or "none"
+                # Warnings are the only signal that a column was renamed or a tab
+                # went unreadable — the lookup would just start falling back to
+                # OSM-Watch silently, so they belong in the reply, not only the log.
+                warns = snap.get("warnings") or []
+                warn_txt = ""
+                if warns:
+                    shown = warns[:5]
+                    warn_txt = "\n⚠️ " + "\n⚠️ ".join(shown)
+                    if len(warns) > len(shown):
+                        warn_txt += f"\n⚠️ … {len(warns) - len(shown)} more"
+                send_message(
+                    chat_id_ip,
+                    f"✅ OSM Machine List re-read — **{snap.get('count', 0)}** machines\n"
+                    f"📅 {snap.get('updated_at', '')}\n{tabs}\nskipped: {skipped}{warn_txt}",
+                )
+            except Exception as _ip_err:
+                print(f"❌ /iprefresh: {_ip_err!r}", flush=True)
+                # Say what the bot is answering from now, because a failed re-read
+                # is not the same situation as having no sheet at all.
+                try:
+                    import machineip as _mi_stale
+
+                    _stale_at = (_mi_stale.load_machine_ips() or {}).get("updated_at")
+                except Exception:
+                    _stale_at = None
+                _tail = (
+                    f"\nStill answering from the copy read at {_stale_at}."
+                    if _stale_at
+                    else "\nNo copy of the sheet is loaded, so IPs come from OSM-Watch only."
+                )
+                try:
+                    send_message(
+                        chat_id_ip,
+                        f"❌ Could not read the OSM Machine List sheet: {_ip_err}{_tail}",
+                    )
+                except Exception:
+                    pass
+
+        start_lark_background_thread(_run_iprefresh)
         return
 
     # ---- Encoder / TRTC lookup from latestencoder.json (osmwatch keeps it fresh) ----
@@ -3799,6 +3923,39 @@ def _handle_machine_message(
     ):
         return
 
+
+    # ---- Tagged with nothing but machine name(s): "@bot NWR2205", "@bot dyb21 & 8527" ----
+    # Deliberately last: there is no command word to key on, so every keyword
+    # intent above gets first refusal and this is the fallback reading of a
+    # message that is only machine references. Same gate as the help text below —
+    # in a group the message has to actually be addressed to the bot.
+    if chat_type == "p2p" or bot_mentioned:
+        _tag_machines = _machine_tokens_only(ct)
+        if _tag_machines:
+            def _run_tagged_ips(chat_id_tag=chat_id, arg_tag=" ".join(_tag_machines)):
+                try:
+                    import osmwatch as _ow_mod
+
+                    _tag_card = _ow_mod.build_encoder_card(
+                        arg_tag, only_types=_ow_mod.ALL_STREAM_TYPES
+                    )
+                    if _tag_card:
+                        _tag_resp = send_message(
+                            chat_id_tag, json.dumps(_tag_card), msg_type="interactive"
+                        )
+                        if isinstance(_tag_resp, dict) and _tag_resp.get("code") == 0:
+                            return
+                    for _msg in _ow_mod.query_encoder(arg_tag, only_types=_ow_mod.ALL_STREAM_TYPES):
+                        send_message(chat_id_tag, _msg)
+                except Exception as _tag_err:
+                    print(f"❌ tagged machine lookup: {_tag_err!r}", flush=True)
+                    try:
+                        send_message(chat_id_tag, f"❌ Machine IP lookup failed: {_tag_err}")
+                    except Exception:
+                        pass
+
+            start_lark_background_thread(_run_tagged_ips)
+            return
 
     # ---- Nothing matched — help only when directly addressed ----
     if chat_type == "p2p" or bot_mentioned:
@@ -4412,6 +4569,17 @@ def _run_main_entry() -> int:
             _boot_ow.prewarm_osmwatch_on_startup()
         except Exception as _boot_ow_err:
             print(f"[osmwatch-warm] startup pre-warm skipped: {_boot_ow_err!r}", flush=True)
+        try:
+            # Read the OSM Machine List sheet once in the background: ~9 API calls,
+            # so doing it here keeps the first /main or @bot tag from paying for it.
+            # On a thread because startup must not wait on Lark being reachable.
+            import machineip as _boot_mip
+
+            threading.Thread(
+                target=_boot_mip.prewarm, daemon=True, name="machinebot-sheet-ip"
+            ).start()
+        except Exception as _boot_mip_err:
+            print(f"[machineip] startup pre-warm skipped: {_boot_mip_err!r}", flush=True)
 
         if _lark_ws_uses_persistent_connection():
             # /wm dashboard is served by this Flask; bind 0.0.0.0 via FLASK_BIND_HOST when the
