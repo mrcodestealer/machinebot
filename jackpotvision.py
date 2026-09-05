@@ -259,7 +259,8 @@ def read_machine_credit(png_bytes: bytes, *, machine_display: str = "") -> dict[
         return out
     obj = _first_json_object(text)
     if obj is None:
-        out["error"] = "model reply was not JSON"
+        snippet = " ".join((text or "").split())[:120]
+        out["error"] = f"model reply was not JSON ({snippet!r})" if snippet else "empty model reply"
         return out
     out["machine_credit"] = _as_float(obj.get("machine_credit"))
     out["screen_credit"] = _as_float(obj.get("screen_credit"))

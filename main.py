@@ -2040,6 +2040,12 @@ def _showurl_pick_player(np_followup: dict) -> Optional[dict]:
     return None
 
 
+def _showurl_short(text: str, limit: int = 160) -> str:
+    """One-line, length-capped reason for a card (Playwright errors run to many lines)."""
+    s = " ".join(str(text or "").split())
+    return s if len(s) <= limit else s[: limit - 1] + "…"
+
+
 def _showurl_fmt(value: Optional[float]) -> str:
     """``3822.0`` -> ``3,822``; ``1911.5`` keeps the halves."""
     if not isinstance(value, (int, float)):
@@ -2206,7 +2212,12 @@ def run_showurl_job(chat_id: str, machines: list[str], date_iso: str = "") -> No
             credit = read.get("credit")
             read_err = str(read.get("error") or "")
             if read_err:
-                print(f"[showurl] {md}: credit read failed: {read_err}", flush=True)
+                raw_reply = str(read.get("raw") or "").strip()
+                print(
+                    f"[showurl] {md}: credit read failed: {read_err}"
+                    + (f" | model said: {raw_reply[:200]!r}" if raw_reply else ""),
+                    flush=True,
+                )
             credit_from = "machine"
             if not isinstance(credit, (int, float)) or credit <= 0:
                 # Nothing on the machine to match: either the cabinet is idle (credit 0) or the
@@ -2241,15 +2252,20 @@ def run_showurl_job(chat_id: str, machines: list[str], date_iso: str = "") -> No
                 f"🕹️ **{md}**  ·  👤 **`{uid}`**  ·  🕒 **`{day_iso} {time_short}`**"
             )
             if candidates:
-                where = {
-                    "machine": "machine credit",
-                    "log_idle": "log credit (machine idle)",
-                    "log_unread": "log credit (machine credit unreadable)",
-                }[credit_from]
+                where = "machine credit" if credit_from == "machine" else "log credit"
                 also = " / ".join(f"`{_showurl_fmt(c)}`" for c in candidates[1:])
                 caption += f"\n💰 Matched to {where} `{_showurl_fmt(credit)}`"
                 if also:
                     caption += f" — also accepting {also}"
+                # Why the machine's own credit was not the one used. Without the reason on the
+                # card, "unreadable" only sends the reader to the console to find out.
+                if credit_from == "log_idle":
+                    caption += (
+                        "\nℹ️ Machine credit reads `0` (cabinet idle) — used the log credit instead."
+                    )
+                elif credit_from == "log_unread":
+                    why = read_err or "no number in the model reply"
+                    caption += f"\n⚠️ Could not read the machine credit: {_showurl_short(why)}"
             sent = False
             if callable(build_card):
                 card = build_card(machine_display=md, image_key=key, subtitle=caption)
