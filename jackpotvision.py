@@ -4,7 +4,7 @@ Readings taken from the EGM operation-window screenshot by the local vision mode
 Two of them:
 
 * :func:`detect_jackpot` — does the game screen show a jackpot-sized win? (``/checkcredit``)
-* :func:`read_machine_credit` — what does the cabinet's **Machine Credit** field say? (``/showurl``
+* :func:`read_machine_credit` — what does the cabinet's **Machine Credit** field say? (``/url``
   matches the recharge Detail amount against it.)
 
 ``/checkcredit`` already screenshots the machine's operation window for the card it posts
@@ -21,6 +21,8 @@ Env:
                                       ``BOT_CHAT_MODEL``). It must be vision-capable —
                                       ``ollama show <model>`` has to list ``vision``.
   ``CHECKCREDIT_JACKPOT_TIMEOUT``     seconds to wait for the model (default 180).
+  ``CHECKCREDIT_VISION_FALLBACK``     ``0`` stops the automatic swap to an installed vision model
+                                      when the configured one cannot take images (default: swap).
 
 Never raises: every failure path returns a verdict with ``error`` set and ``jackpot`` False, so a
 model that is down or slow can only cost the follow-up message, never the card itself.
@@ -103,6 +105,85 @@ def _api_key() -> str:
     ).strip()
 
 
+def _ollama_root() -> str:
+    """Ollama's native API root behind the OpenAI-compatible base (``…/v1`` → ``…``)."""
+    base = _api_base()
+    return base[:-3].rstrip("/") if base.endswith("/v1") else base
+
+
+def _looks_like_ollama() -> bool:
+    base = _api_base().lower()
+    return "11434" in base or "ollama" in base or "127.0.0.1" in base or "localhost" in base
+
+
+def _ollama_json(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """One short call to Ollama's own API; ``None`` when it is not reachable / not Ollama."""
+    try:
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(
+            f"{_ollama_root()}{path}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST" if data else "GET",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        return body if isinstance(body, dict) else None
+    except Exception:  # noqa: BLE001 - a probe that fails just means "cannot tell"
+        return None
+
+
+_VISION_CAP: dict[str, bool | None] = {}
+
+
+def _model_has_vision(model: str) -> bool | None:
+    """
+    ``True`` / ``False`` from Ollama's ``/api/show`` capabilities, ``None`` when it cannot be asked
+    (a different server, or one that is down — then we send the image and let it answer).
+    """
+    name = (model or "").strip()
+    if not name:
+        return None
+    if name in _VISION_CAP:
+        return _VISION_CAP[name]
+    verdict: bool | None = None
+    if _looks_like_ollama():
+        body = _ollama_json("/api/show", {"model": name})
+        if body is not None:
+            caps = body.get("capabilities")
+            verdict = ("vision" in caps) if isinstance(caps, list) else None
+    _VISION_CAP[name] = verdict
+    return verdict
+
+
+def _installed_vision_model() -> str:
+    """First installed model that Ollama reports as vision-capable (``""`` when none)."""
+    body = _ollama_json("/api/tags")
+    for entry in (body or {}).get("models") or []:
+        name = str(entry.get("name") or "").strip()
+        if name and _model_has_vision(name):
+            return name
+    return ""
+
+
+def _vision_model_to_use(preferred: str) -> tuple[str, str]:
+    """
+    ``(model, note)``. When ``preferred`` cannot take images, swap in an installed vision model so
+    the reading still happens — the alternative is failing on every screenshot. Turn the swap off
+    with ``CHECKCREDIT_VISION_FALLBACK=0`` to get a plain error instead.
+    """
+    if _model_has_vision(preferred) is not False:
+        return preferred, ""            # capable, or we could not ask
+    if (os.getenv("CHECKCREDIT_VISION_FALLBACK") or "1").strip().lower() in (
+        "0", "false", "no", "off"
+    ):
+        return preferred, ""
+    alt = _installed_vision_model()
+    if not alt or alt == preferred:
+        return preferred, ""
+    return alt, f"{preferred} has no vision capability here; used {alt}"
+
+
 def _parse_verdict(text: str) -> dict[str, Any]:
     """First JSON object in the reply; a bare yes/no sentence is accepted as a fallback."""
     # Thinking models can wrap the answer in <think>…</think> even with reasoning off.
@@ -142,6 +223,15 @@ def _ask_about_image(
     model = _model()
     if not model:
         return "", "", "no vision model configured (BOT_CHAT_MODEL)"
+    model, swap_note = _vision_model_to_use(model)
+    if swap_note:
+        print(f"[vision] {swap_note}", flush=True)
+    if _model_has_vision(model) is False:
+        return "", model, (
+            f"model `{model}` on {_api_base()} cannot accept images "
+            "(no vision capability) — set CHECKCREDIT_JACKPOT_MODEL or BOT_CHAT_VISION_MODEL "
+            "to a vision model, e.g. one from `ollama list` whose `ollama show` lists `vision`"
+        )
     api_key = _api_key()
     if not api_key:
         return "", model, "no API key (BOT_CHAT_API_KEY)"
@@ -187,13 +277,13 @@ def _ask_about_image(
             detail = exc.read().decode("utf-8", errors="replace")[:300]
         except Exception:
             pass
-        return "", model, f"HTTP {exc.code}: {detail or exc.reason}"
+        return "", model, f"HTTP {exc.code} from model `{model}`: {detail or exc.reason}"
     except Exception as exc:  # noqa: BLE001 - a reading must never break its caller
-        return "", model, f"request failed: {exc!r}"
+        return "", model, f"request to model `{model}` failed: {exc!r}"
 
     choices = body.get("choices") or []
     if not choices:
-        return "", model, "no choices in model response"
+        return "", model, f"no choices in the response from model `{model}`"
     content = (choices[0].get("message") or {}).get("content")
     if isinstance(content, list):  # some servers return content parts
         content = " ".join(str(p.get("text") or "") for p in content if isinstance(p, dict))
@@ -241,7 +331,7 @@ def read_machine_credit(png_bytes: bytes, *, machine_display: str = "") -> dict[
 
     Returns ``{"credit", "machine_credit", "screen_credit", "raw", "error", "model"}`` where
     ``credit`` is the **Machine Credit** field when the model could read it, else the on-screen
-    CREDIT counter, else ``None``. ``/showurl`` matches the recharge Detail amount against it.
+    CREDIT counter, else ``None``. ``/url`` matches the recharge Detail amount against it.
     """
     out: dict[str, Any] = {
         "credit": None, "machine_credit": None, "screen_credit": None,

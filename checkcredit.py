@@ -2099,7 +2099,7 @@ def build_machine_screenshot_card(
 ) -> dict[str, Any]:
     """
     Card 2.0 holding one machine's screenshot and nothing else: the machine name is the header,
-    the image is the body. Used by ``/showurl``, which posts one of these per machine.
+    the image is the body. Used by ``/url``, which posts one of these per machine.
     """
     md = (machine_display or "").strip() or "Machine"
     elements: list[dict[str, Any]] = []
@@ -3951,7 +3951,7 @@ def _np_detail_matches_credit_and_machine_id(
     is credit going into the cabinet, so it is the wrong Detail however well it matches otherwise.
 
     ``expected_credit_any``: accept the row when the amount is within eps of **any** value in the
-    list, and ignore ``expected_credit`` for the comparison. ``/showurl`` passes the machine credit
+    list, and ignore ``expected_credit`` for the comparison. ``/url`` passes the machine credit
     read off the cabinet plus its x2 / /2 forms
     (:func:`machine_credit_amount_candidates`).
     """
@@ -5163,7 +5163,7 @@ def screenshot_np_recharge_detail(
     the cash-out (``NP_BACKEND_REQUIRE_POSITIVE_AMOUNT=0`` restores the old, sign-blind match).
 
     ``expected_credit_any``: when given, the Detail ``amount`` must equal one of these values and
-    the log credit is not consulted for the amount at all — ``/showurl`` passes the credit read off
+    the log credit is not consulted for the amount at all — ``/url`` passes the credit read off
     the cabinet's own screen with its x2 / /2 forms. The machine-only magnitude fallback is skipped
     then: a band that accepts 0.2x-5x would defeat an explicit candidate set.
     **Header Request Time is not used to reject** (avoids closing valid dialogs when UI text

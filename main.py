@@ -29,7 +29,7 @@ This is a self-contained bot that ONLY does the machine + encoder flows mirrored
   - ``/stuckcredit <machine> [date]``          stuck credit: log + Third Http transfer-out check
   - ``/npthirdhttp <player_id> [date time]``   NP/WF/DHS/NCH/CP/OSM/MDR/TBP Third Http Detail
   - ``/cctvshot <machine>``                    EGM CCTV screenshot · ``/al [DD/MM]`` Amount Loss
-  - ``/showurl <machine(s)> [YYYY-MM-DD]``     recharge Detail per machine, one card each
+  - ``/url <machine(s)> [YYYY-MM-DD]``     recharge Detail per machine, one card each
   - ``/main /pool /cctv /minipc <machine(s)>`` one stream only (MAIN/POOL/CCTV/Mini PC)
   - ``@bot NWR2205`` (no command)              tagged with just machine name(s) → all its IPs
   - reply **1**–**4** after an NP prompt · **Missing Credit** alert paste → checkcredit card
@@ -1997,7 +1997,7 @@ def run_cctv_screenshot_job(chat_id: str, machine_query: str) -> None:
 
 def _parse_machine_list(text: str, cmd: str) -> list[str]:
     """
-    Machines given after a command word — one per line (the ``/showurl`` shape) or separated by
+    Machines given after a command word — one per line (the ``/url`` shape) or separated by
     spaces/commas on one line. Order is kept and repeats dropped, so a pasted list with a
     duplicate does not screenshot the same cabinet twice.
     """
@@ -2016,14 +2016,16 @@ def _parse_machine_list(text: str, cmd: str) -> list[str]:
     return out
 
 
-def _showurl_max_machines() -> int:
+def _url_max_machines() -> int:
+    """``URL_MAX_MACHINES`` (was ``SHOWURL_MAX_MACHINES``, still honoured)."""
+    raw = (os.getenv("URL_MAX_MACHINES") or os.getenv("SHOWURL_MAX_MACHINES") or "10").strip()
     try:
-        return max(1, int((os.getenv("SHOWURL_MAX_MACHINES") or "10").strip()))
+        return max(1, int(raw))
     except ValueError:
         return 10
 
 
-def _showurl_pick_player(np_followup: dict) -> Optional[dict]:
+def _url_pick_player(np_followup: dict) -> Optional[dict]:
     """
     The player ``/checkcredit``'s **first** button would open: latest in the log with a credit
     time. Rows without one cannot drive a Detail at all, and a player the backend bounced to
@@ -2040,20 +2042,20 @@ def _showurl_pick_player(np_followup: dict) -> Optional[dict]:
     return None
 
 
-def _showurl_short(text: str, limit: int = 160) -> str:
+def _url_short(text: str, limit: int = 160) -> str:
     """One-line, length-capped reason for a card (Playwright errors run to many lines)."""
     s = " ".join(str(text or "").split())
     return s if len(s) <= limit else s[: limit - 1] + "…"
 
 
-def _showurl_fmt(value: Optional[float]) -> str:
+def _url_fmt(value: Optional[float]) -> str:
     """``3822.0`` -> ``3,822``; ``1911.5`` keeps the halves."""
     if not isinstance(value, (int, float)):
         return "n/a"
     return f"{int(value):,}" if float(value) == int(value) else f"{float(value):,.2f}"
 
 
-def _showurl_expected_credit(choice: dict) -> Optional[float]:
+def _url_expected_credit(choice: dict) -> Optional[float]:
     """``credit_value`` when the log parsed one, else the printed credit — used to match the row."""
     val = choice.get("credit_value")
     if isinstance(val, (int, float)):
@@ -2067,12 +2069,12 @@ def _showurl_expected_credit(choice: dict) -> Optional[float]:
         return None
 
 
-def _showurl_machine_credit(machine_display: str, machine_substr: Optional[str]) -> dict:
+def _url_machine_credit(machine_display: str, machine_substr: Optional[str]) -> dict:
     """
     Screenshot the cabinet's operation window and read its **Machine Credit** with the vision
     model. Returns the ``jackpotvision.read_machine_credit`` dict, or one carrying ``error``.
 
-    This is the number ``/showurl`` matches the recharge Detail against, so it is read from the
+    This is the number ``/url`` matches the recharge Detail against, so it is read from the
     machine itself rather than trusted from the log.
     """
     fail = {"credit": None, "error": "", "model": ""}
@@ -2105,9 +2107,9 @@ def _showurl_machine_credit(machine_display: str, machine_substr: Optional[str])
     return jackpotvision.read_machine_credit(png, machine_display=machine_display)
 
 
-def run_showurl_job(chat_id: str, machines: list[str], date_iso: str = "") -> None:
+def run_url_job(chat_id: str, machines: list[str], date_iso: str = "") -> None:
     """
-    ``/showurl`` — for each machine: read the day's logic log, take the player ``/checkcredit``
+    ``/url`` — for each machine: read the day's logic log, take the player ``/checkcredit``
     would put on button **1**, read the cabinet's **Machine Credit** off its own operation window
     (vision model), and screenshot the Third Http **recharge Detail** whose amount matches that
     credit — as shown, doubled or halved, since cabinets differ on denomination.
@@ -2147,13 +2149,13 @@ def run_showurl_job(chat_id: str, machines: list[str], date_iso: str = "") -> No
         return
 
     wanted = list(machines or [])
-    cap_n = _showurl_max_machines()
+    cap_n = _url_max_machines()
     dropped = wanted[cap_n:]
     wanted = wanted[:cap_n]
     total = len(wanted)
     send_message(
         chat_id,
-        f"⏳ `/showurl` — {total} machine(s) on `{base_day.isoformat()}`: "
+        f"⏳ `/url` — {total} machine(s) on `{base_day.isoformat()}`: "
         + ", ".join(f"`{m}`" for m in wanted)
         + (
             f"\n⚠️ Only the first {cap_n} run in one go; skipped: "
@@ -2181,7 +2183,7 @@ def run_showurl_job(chat_id: str, machines: list[str], date_iso: str = "") -> No
             day = base_day
             out = _read_log(mq, day)
             np_fu = out.get("np_followup") or {}
-            choice = _showurl_pick_player(np_fu)
+            choice = _url_pick_player(np_fu)
             looked_at = [day]
             if choice is None:
                 # Same reason /checkcredit looks back a day: an empty day usually means the
@@ -2190,7 +2192,7 @@ def run_showurl_job(chat_id: str, machines: list[str], date_iso: str = "") -> No
                 looked_at.append(prev)
                 out_prev = _read_log(mq, prev)
                 np_prev = out_prev.get("np_followup") or {}
-                choice_prev = _showurl_pick_player(np_prev)
+                choice_prev = _url_pick_player(np_prev)
                 if choice_prev is not None:
                     day, np_fu, choice = prev, np_prev, choice_prev
             if choice is None:
@@ -2207,14 +2209,14 @@ def run_showurl_job(chat_id: str, machines: list[str], date_iso: str = "") -> No
             time_short = str(choice.get("time_short") or "").strip()
             day_iso = str(np_fu.get("target_date") or day.isoformat()).strip()
 
-            log_credit = _showurl_expected_credit(choice)
-            read = _showurl_machine_credit(md, ms)
+            log_credit = _url_expected_credit(choice)
+            read = _url_machine_credit(md, ms)
             credit = read.get("credit")
             read_err = str(read.get("error") or "")
             if read_err:
                 raw_reply = str(read.get("raw") or "").strip()
                 print(
-                    f"[showurl] {md}: credit read failed: {read_err}"
+                    f"[url] {md}: credit read failed: {read_err}"
                     + (f" | model said: {raw_reply[:200]!r}" if raw_reply else ""),
                     flush=True,
                 )
@@ -2227,7 +2229,7 @@ def run_showurl_job(chat_id: str, machines: list[str], date_iso: str = "") -> No
                 credit = log_credit
             candidates = checkcredit.machine_credit_amount_candidates(credit)
             print(
-                f"[showurl] {md}: credit={credit} from={credit_from} "
+                f"[url] {md}: credit={credit} from={credit_from} "
                 f"candidates={candidates} (log credit {log_credit})",
                 flush=True,
             )
@@ -2253,8 +2255,8 @@ def run_showurl_job(chat_id: str, machines: list[str], date_iso: str = "") -> No
             )
             if candidates:
                 where = "machine credit" if credit_from == "machine" else "log credit"
-                also = " / ".join(f"`{_showurl_fmt(c)}`" for c in candidates[1:])
-                caption += f"\n💰 Matched to {where} `{_showurl_fmt(credit)}`"
+                also = " / ".join(f"`{_url_fmt(c)}`" for c in candidates[1:])
+                caption += f"\n💰 Matched to {where} `{_url_fmt(credit)}`"
                 if also:
                     caption += f" — also accepting {also}"
                 # Why the machine's own credit was not the one used. Without the reason on the
@@ -2265,20 +2267,20 @@ def run_showurl_job(chat_id: str, machines: list[str], date_iso: str = "") -> No
                     )
                 elif credit_from == "log_unread":
                     why = read_err or "no number in the model reply"
-                    caption += f"\n⚠️ Could not read the machine credit: {_showurl_short(why)}"
+                    caption += f"\n⚠️ Could not read the machine credit: {_url_short(why)}"
             sent = False
             if callable(build_card):
                 card = build_card(machine_display=md, image_key=key, subtitle=caption)
                 resp = send_message(chat_id, json.dumps(card), msg_type="interactive")
                 sent = isinstance(resp, dict) and resp.get("code") == 0
                 if not sent:
-                    print(f"[showurl] card rejected for {md}: {resp!r}", flush=True)
+                    print(f"[url] card rejected for {md}: {resp!r}", flush=True)
             if not sent:
                 send_message(chat_id, caption)
                 send_image_message(chat_id, key)
         except Exception as e:
             send_message(chat_id, f"❌ `{mq}` ({idx}/{total}) — recharge Detail failed: {e}")
-            print(f"[showurl] {mq}: {e!r}", flush=True)
+            print(f"[url] {mq}: {e!r}", flush=True)
         finally:
             if path and os.path.isfile(path):
                 try:
@@ -3117,7 +3119,7 @@ _HELP_TEXT = (
     "• `/stuckcredit <machine> [date]` — stuck credit + Third Http transfer-out check\n"
     "• `/npthirdhttp <player_id> [YYYY-MM-DD HH:MM:SS.mmm]` — Third Http Detail\n"
     "• `/cctvshot <machine>` — EGM CCTV screenshot · `/al [DD/MM]` — Amount Loss\n"
-    "• `/showurl <machine(s)> [date]` — recharge Detail of each machine's latest player\n"
+    "• `/url <machine(s)> [date]` — recharge Detail of each machine's latest player\n"
     "• reply **1**–**4** after an NP prompt · paste a **Missing Credit** alert to auto-fill\n"
     "• `/main /pool /cctv /minipc <machine(s)>` — only that stream\n"
     "• tag the bot with just machine name(s) — `@bot NWR2205` — for all of its IPs\n"
@@ -3579,10 +3581,12 @@ def _handle_machine_message(
         start_lark_background_thread(run_cctv_screenshot_job, chat_id, m_cv.group(1))
         return
 
-    # /showurl <machine> [more…] — recharge Detail per machine, one card each. Machines may be
+    # /url <machine> [more…] — recharge Detail per machine, one card each. Machines may be
     # listed one per line under the command (so read the multi-line body, not the collapsed one).
-    if re.match(r"^/showurl\b", ct, re.I):
-        tokens_su = _parse_machine_list(clean_text_multiline or ct, "/showurl")
+    # `/showurl` was the original name and still answers, so old messages do not break.
+    m_url = re.match(r"^(/(?:url|showurl))\b", ct, re.I)
+    if m_url:
+        tokens_su = _parse_machine_list(clean_text_multiline or ct, m_url.group(1))
         date_su = ""
         machines_su = []
         for tok in tokens_su:
@@ -3593,13 +3597,13 @@ def _handle_machine_message(
         if not machines_su:
             send_message(
                 chat_id,
-                "❌ Usage: `/showurl <machine(s)>` — Third Http **recharge Detail** of each "
+                "❌ Usage: `/url <machine(s)>` — Third Http **recharge Detail** of each "
                 "machine's latest player, one card each (no button to tap).\n"
                 "One machine per line, or all on one line; add `YYYY-MM-DD` for another day:\n"
-                "```\n/showurl\nNWR2096\nNCH1498\nNWR2110\n```",
+                "```\n/url\nNWR2096\nNCH1498\nNWR2110\n```",
             )
             return
-        start_lark_background_thread(run_showurl_job, chat_id, machines_su, date_su)
+        start_lark_background_thread(run_url_job, chat_id, machines_su, date_su)
         return
 
     # /npthirdhttp <player_id> [date time]
