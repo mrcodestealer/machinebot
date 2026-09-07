@@ -1467,10 +1467,19 @@ def _start_jackpot_vision_check(
             return
         print(
             f"[jackpot] {machine_display}: jackpot={verdict.get('jackpot')} "
-            f"win={verdict.get('win')!r} credit={verdict.get('credit')!r} "
+            f"win={verdict.get('win')!r} bet={verdict.get('bet')!r} "
+            f"credit={verdict.get('credit')!r} model={verdict.get('model')!r} "
             f"reason={verdict.get('reason')!r}",
             flush=True,
         )
+        # A model that said jackpot but whose own counters say otherwise: worth seeing in the
+        # log, since it is the difference between a tuned gate and a silently broken one.
+        if verdict.get("vetoed"):
+            print(
+                f"[jackpot] {machine_display}: suppressed — {verdict['vetoed']} "
+                f"(model said jackpot: {verdict.get('reason')!r})",
+                flush=True,
+            )
         if not verdict.get("jackpot"):
             return
         _checkcredit_send(

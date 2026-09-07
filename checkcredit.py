@@ -4774,7 +4774,10 @@ def screenshot_egm_status_window(
             dlg.scroll_into_view_if_needed(timeout=min(15_000, timeout_ms))
             _egm_expand_operation_dialog_for_capture(page, dlg)
             # Capture only the small operation window (same as user screenshot), not whole page.
-            dlg.screenshot(path=out_path, animations="disabled", scale="css")
+            # scale="device" keeps the 2x device_scale_factor pixels instead of throwing them
+            # away: the vision model reads the game screen's bottom-bar CREDIT/BET/WIN counters
+            # off this PNG, and at 1x those digits are too small to be read reliably.
+            dlg.screenshot(path=out_path, animations="disabled", scale="device")
         finally:
             browser.close()
     return out_path

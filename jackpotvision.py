@@ -23,6 +23,16 @@ Env:
   ``CHECKCREDIT_JACKPOT_TIMEOUT``     seconds to wait for the model (default 180).
   ``CHECKCREDIT_VISION_FALLBACK``     ``0`` stops the automatic swap to an installed vision model
                                       when the configured one cannot take images (default: swap).
+                                      The swap picks whichever vision model Ollama lists first,
+                                      so pin ``BOT_CHAT_VISION_MODEL`` rather than rely on it.
+  ``CHECKCREDIT_JACKPOT_MIN_BET_MULTIPLE``
+                                      a WIN below this multiple of the BET is not a jackpot,
+                                      whatever the model says (default 100; ``0`` disables).
+
+A positive verdict is never taken on the model's word alone: :func:`_numeric_veto` re-checks it
+against the counters the model itself reported, because the failure mode here is not a model
+that is down — it is a small model reading a payout animation over the reels as a jackpot and
+answering confidently. Ordinary wins pay themselves into CREDIT and need no attendant.
 
 Never raises: every failure path returns a verdict with ``error`` set and ``jackpot`` False, so a
 model that is down or slow can only cost the follow-up message, never the card itself.
@@ -49,21 +59,35 @@ except ImportError:
 
 _PROMPT = (
     "You are inspecting a screenshot of one slot machine's operation window from a casino "
-    "back-office tool. The lower half of the image is the live game screen, with counters such "
-    "as BET, WIN and CREDIT along the bottom, and sometimes a banner (\"Feature Completed\", a "
-    "jackpot celebration, or a line about an amount being paid).\n\n"
-    "Decide whether this screen shows a JACKPOT or an unusually large win that a floor "
-    "attendant should check by hand.\n\n"
-    "Answer jackpot = true when any of these is visible:\n"
-    "- a WIN counter far larger than the CREDIT and BET counters "
-    "(for example WIN 1010089 with BET 38 and CREDIT 872);\n"
-    "- a jackpot / grand / major / minor banner or a celebration overlay;\n"
-    "- a line saying an amount was paid, or a hand pay prompt.\n\n"
-    "Answer jackpot = false for an ordinary spin, an idle or attract screen, a game with no win "
-    "shown, a blank/black screen, or when you cannot read the counters.\n\n"
+    "back-office tool. The lower half of the image is the live game screen.\n\n"
+    "WHERE THE NUMBERS ARE. The only counters that count are the ones in the STATUS BAR along "
+    "the very bottom of the game screen, each behind its own label: CREDIT, BET and WIN. Read "
+    "those three, and only those three. Amounts drawn ANYWHERE ELSE are not counters: a glowing "
+    "or animated amount over the reels, a \"PAID\" tag, a payline total, a prize table — ignore "
+    "all of them. If the WIN label in the bottom bar shows 0, then WIN is 0, no matter how large "
+    "an amount is painted across the middle of the screen.\n\n"
+    "Decide whether this screen shows a JACKPOT that a floor attendant must settle by hand. "
+    "Ordinary wins pay themselves into CREDIT automatically and need nobody — they are NOT "
+    "what you are looking for.\n\n"
+    "Answer jackpot = true ONLY when at least one of these is visible:\n"
+    "- the bottom-bar WIN counter is enormous next to BET — hundreds of times the BET, and "
+    "larger than CREDIT (for example WIN 1010089 with BET 38 and CREDIT 872);\n"
+    "- text naming a jackpot tier in words: JACKPOT, GRAND, MAJOR, MINOR or MEGA. The word "
+    "itself must be legible on screen; a gold/flashing animation with no such word is not one;\n"
+    "- a hand pay prompt: text asking to CALL / SEE an ATTENDANT, or saying HAND PAY, "
+    "JACKPOT PAYOUT or the machine is locked awaiting payment.\n\n"
+    "Answer jackpot = false for all of these, which are ordinary and very common:\n"
+    "- a win amount animating over the reels, however large or celebratory it looks;\n"
+    "- a \"PAID\" tag or any line saying an amount was paid — routine payout text, not a hand pay;\n"
+    "- \"Game Over\", \"Feature Completed\", or a finished free-spin round;\n"
+    "- a bottom-bar WIN of 0, or a WIN smaller than CREDIT;\n"
+    "- an idle or attract screen, a blank/black screen, or counters you cannot read.\n\n"
+    "When in doubt, answer false. A wrong true sends someone to the wrong machine.\n\n"
     "Reply with ONE line of JSON and nothing else:\n"
-    '{"jackpot": true or false, "win": "<WIN counter exactly as shown, else empty>", '
-    '"credit": "<CREDIT counter, else empty>", "reason": "<at most 15 words>"}'
+    '{"jackpot": true or false, "win": "<bottom-bar WIN counter, digits only, else empty>", '
+    '"bet": "<bottom-bar BET counter, digits only, else empty>", '
+    '"credit": "<bottom-bar CREDIT counter, digits only, else empty>", '
+    '"reason": "<at most 15 words, and quote the on-screen text you relied on>"}'
 )
 
 
@@ -184,26 +208,45 @@ def _vision_model_to_use(preferred: str) -> tuple[str, str]:
     return alt, f"{preferred} has no vision capability here; used {alt}"
 
 
+def _affirmative(val: Any) -> bool:
+    """
+    Strict reading of the model's ``jackpot`` field.
+
+    ``bool()`` would say True for every non-empty string, so ``{"jackpot": "false"}`` — which
+    small models do emit — used to post a jackpot notice. Only a real ``true`` counts.
+    """
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return val == 1
+    return str(val or "").strip().lower() in ("true", "yes", "1")
+
+
 def _parse_verdict(text: str) -> dict[str, Any]:
-    """First JSON object in the reply; a bare yes/no sentence is accepted as a fallback."""
+    """
+    First JSON object in the reply.
+
+    A reply with no JSON in it is an error, not a verdict: the old prose fallback keyed on any
+    line starting with "yes"/"true"/"jackpot", so the model's own denial ("Jackpot: not visible")
+    came back as a positive.
+    """
     # Thinking models can wrap the answer in <think>…</think> even with reasoning off.
     raw = re.sub(r"<think>.*?</think>", " ", (text or "").strip(), flags=re.S | re.I).strip()
     obj = _first_json_object(raw)
     if obj is not None:
         return {
-            "jackpot": bool(obj.get("jackpot")),
+            "jackpot": _affirmative(obj.get("jackpot")),
             "win": str(obj.get("win") or "").strip(),
+            "bet": str(obj.get("bet") or "").strip(),
             "credit": str(obj.get("credit") or "").strip(),
             "reason": str(obj.get("reason") or "").strip(),
             "raw": raw[:600],
             "error": "",
         }
-    low = raw.lower()
-    if low.startswith(("yes", "true", "jackpot")):
-        return {"jackpot": True, "win": "", "credit": "", "reason": raw[:120],
-                "raw": raw[:600], "error": ""}
-    return {"jackpot": False, "win": "", "credit": "", "reason": "",
-            "raw": raw[:600], "error": "" if raw else "empty model reply"}
+    snippet = " ".join(raw.split())[:120]
+    return {"jackpot": False, "win": "", "bet": "", "credit": "", "reason": "",
+            "raw": raw[:600],
+            "error": f"model reply was not JSON ({snippet!r})" if snippet else "empty model reply"}
 
 
 def _ask_about_image(
@@ -360,16 +403,65 @@ def read_machine_credit(png_bytes: bytes, *, machine_display: str = "") -> dict[
     return out
 
 
-def detect_jackpot(png_bytes: bytes, *, machine_display: str = "") -> dict[str, Any]:
+def _min_bet_multiple() -> float:
+    """
+    How many times the BET a win must be before it counts as jackpot-sized (default 100).
+
+    ``CHECKCREDIT_JACKPOT_MIN_BET_MULTIPLE=0`` turns the numeric gate off and trusts the model
+    alone — which is what the code did before, and how an ordinary ₱200 line win on a ₱176 bet
+    came to be announced as a jackpot.
+    """
+    try:
+        return max(0.0, float((os.getenv("CHECKCREDIT_JACKPOT_MIN_BET_MULTIPLE") or "100").strip()))
+    except ValueError:
+        return 100.0
+
+
+def _numeric_veto(verdict: dict[str, Any], known_credit: float | None = None) -> str:
+    """
+    Reason to overrule a positive verdict on the numbers alone, or ``""`` to let it stand.
+
+    The model's own counters are checked against the prompt's own headline rule — a jackpot is a
+    win that dwarfs the bet. A win the model itself reports as small is not a jackpot however
+    confidently it says otherwise, and this costs nothing when the counters are unreadable: an
+    empty WIN leaves the banner / hand-pay criteria to stand on their own.
+    """
+    win = _as_float(verdict.get("win"))
+    if win is None:
+        return ""
+    if win <= 0:
+        return "WIN counter reads 0"
+    bet = _as_float(verdict.get("bet"))
+    mult = _min_bet_multiple()
+    if mult <= 0:
+        return ""
+    if bet is not None and bet > 0:
+        if win < bet * mult:
+            return f"WIN {win:g} is only {win / bet:.1f}x BET {bet:g} (jackpot needs {mult:g}x)"
+        return ""
+    credit = known_credit if known_credit is not None else _as_float(verdict.get("credit"))
+    if credit is not None and win <= credit:
+        return f"WIN {win:g} is not above CREDIT {credit:g}"
+    return ""
+
+
+def detect_jackpot(
+    png_bytes: bytes,
+    *,
+    machine_display: str = "",
+    known_credit: float | None = None,
+) -> dict[str, Any]:
     """
     Ask the vision model whether this operation-window screenshot shows a jackpot.
 
-    Returns ``{"jackpot", "win", "credit", "reason", "raw", "error", "model"}``; ``jackpot`` is
-    False whenever anything went wrong (``error`` says what).
+    Returns ``{"jackpot", "win", "bet", "credit", "reason", "raw", "error", "model", "vetoed"}``;
+    ``jackpot`` is False whenever anything went wrong (``error`` says what) or when the model's
+    own counters contradict it (``vetoed`` says why). ``known_credit`` is the cabinet's Machine
+    Credit when the caller already has it, used as a fallback when BET cannot be read.
     """
     out: dict[str, Any] = {
-        "jackpot": False, "win": "", "credit": "", "reason": "",
-        "raw": "", "error": "", "model": "",
+        "jackpot": False, "win": "", "bet": "", "credit": "", "reason": "",
+        "raw": "", "error": "", "model": "", "vetoed": "",
     }
     prompt = _PROMPT
     md = (machine_display or "").strip()
@@ -382,6 +474,12 @@ def detect_jackpot(png_bytes: bytes, *, machine_display: str = "") -> dict[str, 
         return out
     verdict = _parse_verdict(text)
     verdict["model"] = model
+    verdict.setdefault("vetoed", "")
+    if verdict.get("jackpot"):
+        veto = _numeric_veto(verdict, known_credit)
+        if veto:
+            verdict["jackpot"] = False
+            verdict["vetoed"] = veto
     return verdict
 
 
@@ -395,6 +493,9 @@ def format_jackpot_notice(verdict: dict[str, Any], *, machine_display: str = "")
     win = str(verdict.get("win") or "").strip()
     if win:
         bits.append(f"WIN `{win}`")
+    bet = str(verdict.get("bet") or "").strip()
+    if bet:
+        bits.append(f"BET `{bet}`")
     credit = str(verdict.get("credit") or "").strip()
     if credit:
         bits.append(f"CREDIT `{credit}`")
