@@ -9,7 +9,8 @@ Flow
    ``Selected Set Maintenance`` / ``Selected Set Maintenance and Test`` / ``Selected Set Test``.
    Typed machine names and the picked date/time are preserved across a toggle.
 3. **Confirm** validates the form and resolves every machine against ``webmachine_data.json``.
-   * any unknown name → ``{machine} is not detected. Try again.`` (nothing is scheduled)
+   * any name that does not resolve → the form comes back with a banner naming **every** failing
+     token, and each candidate's venue (``belongs``); nothing is scheduled
    * all found → a **review card** listing every machine for a second confirmation
 4. Confirming the review card schedules **both**: a reminder 10 minutes before, and the action
    itself to run automatically at the chosen time.
@@ -57,7 +58,13 @@ _SESSIONS: dict[str, dict[str, Any]] = {}
 _SESSIONS_LOCK = threading.Lock()
 _SESSION_TTL_SEC = 7200
 
-_MACHINE_SPLIT_RE = re.compile(r"[,\n;&]+")
+_MACHINE_SPLIT_RE = re.compile(r"[,\n;]+")
+
+# ``&`` is a documented shorthand separator (``NWR2113 & NWR2114``) but it also occurs inside real
+# game titles (``Lock & Roll-0112``, ``Wheel of Fortune 3 Reel & 5 Reel-0107``), where splitting on
+# it unconditionally produced two tokens that matched nothing — or worse, matched the wrong cabinet
+# by trailing digits. Split only when every piece is a bare asset ref.
+_BARE_REF_RE = re.compile(r"^[A-Za-z]{0,7}\s*-?\s*\d{2,6}$")
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +379,15 @@ def _confirm_rows(sid: str, *, with_back: bool = False) -> list[dict]:
     return _btn_rows(buttons)
 
 
-def build_form_card(sid: str, session: dict[str, Any]) -> dict:
+def build_form_card(sid: str, session: dict[str, Any], *, error: str = "") -> dict:
+    """
+    The ``/sst`` form card. ``error`` renders a banner above the form.
+
+    Resolution failures come back as a banner rather than a toast: ``_toast`` truncates to 180
+    characters (see :func:`_toast`), which silently ate the per-candidate detail an operator needs
+    to tell the collision shapes apart. Re-rendering the form keeps every field, since they are all
+    seeded from the session.
+    """
     maint = bool(session.get("maint"))
     test = bool(session.get("test"))
     date_v = str(session.get("date") or "").strip()
@@ -523,64 +538,188 @@ def build_form_card(sid: str, session: dict[str, Any]) -> dict:
         "config": {"update_multi": True, "width_mode": "fill"},
         "header": {"template": "orange",
                    "title": {"tag": "plain_text", "content": "🧪 Scheduled Set Maintenance / Test"}},
-        "body": {"elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": hint}},
-            {"tag": "form", "name": "sst_form", "elements": form_elements},
-        ]},
+        "body": {"elements": (
+            ([{"tag": "div", "text": {"tag": "lark_md", "content": error}}, {"tag": "hr"}]
+             if error else [])
+            + [
+                {"tag": "div", "text": {"tag": "lark_md", "content": hint}},
+                {"tag": "form", "name": "sst_form", "elements": form_elements},
+            ]
+        )},
     }
 
 
 # ---------------------------------------------------------------------------
 # machine resolution against webmachine_data.json
 # ---------------------------------------------------------------------------
+def _split_ampersand(part: str) -> list[str]:
+    """
+    Split ``a & b`` only when **every** piece is a bare asset ref (``NWR2113 & NWR2114``).
+
+    Game titles carry ampersands, so an unconditional split shredded ``Lock & Roll-0112`` into
+    ``Lock`` (matches nothing) and ``Roll-0112`` (matches by trailing digits — possibly the wrong
+    cabinet). See :data:`_BARE_REF_RE`.
+    """
+    if "&" not in part:
+        return [part]
+    pieces = [p.strip() for p in part.split("&")]
+    if all(p and _BARE_REF_RE.match(p) for p in pieces):
+        return pieces
+    return [part]
+
+
 def parse_machine_lines(raw: str) -> list[str]:
-    """Split the textarea into machine tokens (newline / comma / ; / & separated)."""
+    """
+    Split the textarea into machine tokens.
+
+    Newline / comma / ``;`` always separate; ``&`` only between bare asset refs
+    (:func:`_split_ampersand`).
+    """
     out: list[str] = []
     for part in _MACHINE_SPLIT_RE.split(raw or ""):
-        tok = part.strip()
-        if tok:
-            out.append(tok)
+        for piece in _split_ampersand(part):
+            tok = piece.strip()
+            if tok:
+                out.append(tok)
     return out
 
 
-def resolve_machines(tokens: list[str]) -> tuple[list[dict], list[str], list[dict]]:
+def _row_name_key(name: str) -> str:
+    """Normalised identity of a display name — ``Echo Fortunes-0096(TEST)`` -> ``echofortunes0096``."""
+    return _norm_key(re.sub(r"\(TEST\)\s*$", "", (name or "").strip(), flags=re.I))
+
+
+def _exact_name_hits(tok: str, rows: list[dict]) -> list[dict]:
+    """
+    Rows whose display name **is** the token, ignoring case, punctuation and a ``(TEST)`` suffix.
+
+    The only safe way to resolve a name that carries no environment letters: identity, not fuzzy
+    trailing digits. More than one hit means the same name exists under two ``belongs`` values —
+    a genuine ambiguity for the caller to report. Output shape matches
+    ``smmachine.resolve_prod_batch_token_hits`` exactly.
+    """
+    want = _row_name_key(tok)
+    if not want:
+        return []
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        name = str(row.get("name") or row.get("machine") or "").strip()
+        if not name or _row_name_key(name) != want:
+            continue
+        belongs = str(row.get("belongs") or "").strip()
+        key = (belongs.upper(), name)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "belongs": belongs,
+            "machine": name,
+            "status": str(row.get("status") or "").strip(),
+            "online": str(row.get("online") or "").strip(),
+            "is_test": bool(row.get("is_test")),
+        })
+    return out
+
+
+def resolve_machines(
+    tokens: list[str],
+    *,
+    env_hint: str = "",
+) -> tuple[list[dict], list[dict]]:
     """
     Look every token up in ``webmachine_data.json`` (PROD rows only).
 
     Reuses ``smmachine.resolve_prod_batch_token_hits`` so the returned dicts are exactly the shape
     the prod-batch runner consumes (``belongs`` / ``machine`` / ``status`` / ``online``).
-    The environment is inferred per token from its own name, so one form may mix sites.
 
-    Returns ``(found, missing_tokens, ambiguous)``.
+    Environment scoping, in priority order:
+
+    1. the token's own name (``Echo-TBP8671`` -> ``TBP``) — the most specific signal, and what lets
+       one paste still mix sites;
+    2. ``env_hint`` — an environment the operator has explicitly chosen;
+    3. for a **bare asset id** only (``8671``), the single environment shared by the other prefixed
+       tokens in the same paste. It is withheld from prefix-less *display names* on purpose: a
+       guessed site would hand ``Echo Fortunes-0096`` to the trailing-digit fallback inside the
+       wrong venue and resolve it to whatever cabinet ends in 0096 there.
+
+    A token with no environment after that is resolved by **exact display name only** — it is never
+    widened to every site.
+
+    Why the widening had to go: ``_env_from_machine_name`` returns ``None`` for the CP/OSM naming
+    style, which carries no env letters (``Echo Fortunes-0096``, ``Dragons-0181``). Passing that
+    empty code on made ``smmachine._prod_batch_row_matches_env(row, "")`` return ``True`` for
+    *every* row, and ``_row_text_matches``'s trailing-asset-digit fallback then matched any machine
+    ending in the same four digits at any venue — its ``_env_prefixes_conflict`` guard cannot fire
+    when one side has no prefix. That produced the visible failure ("matches several machines",
+    which no amount of "be more specific" could fix, because the pasted name *was* the full name)
+    and a silent one: a lone cross-site hit carried its own ``belongs`` through to the runner and
+    scheduled a real maintenance flip on the wrong venue. An exact full-name match is an
+    unambiguous identity, so it is safe without an environment; fuzzy digits are not.
+
+    Returns ``(found, problems)``, where ``problems`` is
+    ``[{"token": str, "kind": "missing" | "ambiguous", "candidates": [hit, ...]}]`` — one entry per
+    unresolved token, so the caller can report all of them instead of only the first.
     """
     import smmachine
-    from maintenancemachineagent import load_webmachine_rows, _env_from_machine_name
+    from maintenancemachineagent import (
+        load_webmachine_rows,
+        _env_from_machine_name,
+        _normalize_env_code,
+    )
 
     rows = [r for r in load_webmachine_rows()
             if str(r.get("environment") or "PROD").strip().upper() == "PROD"]
 
-    found: list[dict] = []
-    missing: list[str] = []
-    ambiguous: list[dict] = []
-    seen: set[tuple[str, str]] = set()
+    hint = _normalize_env_code(env_hint or "")
+    token_envs = [_normalize_env_code(_env_from_machine_name(t) or "") for t in tokens]
+    shared = sorted({e for e in token_envs if e})
 
-    for tok in tokens:
-        env_code = (_env_from_machine_name(tok) or "").strip().upper()
-        hits = smmachine.resolve_prod_batch_token_hits(env_code, tok, rows)
+    found: list[dict] = []
+    problems: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    # A token pasted twice is one problem, not two identical blocks in the report.
+    reported: set[str] = set()
+
+    def _problem(tok: str, kind: str, candidates: list[dict]) -> None:
+        key = _row_name_key(tok) or tok.strip().lower()
+        if key in reported:
+            return
+        reported.add(key)
+        problems.append({"token": tok, "kind": kind, "candidates": candidates})
+
+    def _accept(hit: dict, tok: str) -> None:
+        entry = dict(hit)
+        dedupe = (str(entry.get("belongs") or "").upper(), str(entry.get("machine") or ""))
+        if dedupe in seen:
+            return
+        seen.add(dedupe)
+        entry["token"] = tok
+        found.append(entry)
+
+    for tok, tok_env in zip(tokens, token_envs):
+        # The guessed shared env is for bare asset ids only — see the docstring.
+        bare_id = _norm_key(tok).isdigit()
+        env_code = tok_env or hint or (shared[0] if (bare_id and len(shared) == 1) else "")
+        if env_code:
+            hits = smmachine.resolve_prod_batch_token_hits(env_code, tok, rows)
+        else:
+            hits = _exact_name_hits(tok, rows)
         if not hits:
-            missing.append(tok)
+            _problem(tok, "missing", [])
             continue
         if len(hits) > 1:
-            ambiguous.append({"token": tok, "candidates": hits})
+            # An exact display-name hit outranks the fuzzy ones it came bundled with: a pasted
+            # full name identifies one cabinet, even when the digit fallback dragged in others.
+            want = _row_name_key(tok)
+            exact = [h for h in hits if _row_name_key(h.get("machine")) == want]
+            if len(exact) == 1:
+                _accept(exact[0], tok)
+                continue
+            _problem(tok, "ambiguous", hits)
             continue
-        hit = dict(hits[0])
-        dedupe = (str(hit.get("belongs") or "").upper(), str(hit.get("machine") or ""))
-        if dedupe in seen:
-            continue
-        seen.add(dedupe)
-        hit["token"] = tok
-        found.append(hit)
-    return found, missing, ambiguous
+        _accept(hits[0], tok)
+    return found, problems
 
 
 # ---------------------------------------------------------------------------
@@ -1095,15 +1234,65 @@ def resolve_session_target(session: dict[str, Any]) -> tuple[list[dict], str]:
     tokens = parse_machine_lines(str(session.get("machines_text") or ""))
     if not tokens:
         return [], "Kindly type at least one machine (one per line)."
-    found, missing, ambiguous = resolve_machines(tokens)
-    if missing:
-        return [], f"{missing[0]} is not detected. Try again."
-    if ambiguous:
-        names = ", ".join(c["machine"] for c in ambiguous[0]["candidates"][:4])
-        return [], f"{ambiguous[0]['token']} matches several machines ({names}). Be more specific."
+    found, problems = resolve_machines(tokens, env_hint=str(session.get("env_code") or ""))
+    if problems:
+        return [], problem_report_md(problems, found)
     if not found:
         return [], "No machines resolved. Try again."
     return found, ""
+
+
+def problem_report_md(problems: list[dict], found: list[dict], *, max_chars: int = 8_000) -> str:
+    """
+    Report **every** token that failed to resolve, with each candidate's ``belongs``.
+
+    The old message named ``missing[0]`` or ``ambiguous[0]`` only, capped the candidate list at
+    four and dropped ``belongs`` entirely — so the one fact needed to tell the collision shapes
+    apart (the same cabinet under two venues / the same name at another venue / an unrelated game
+    sharing the trailing digits) never reached the operator, and a paste with eighteen bad names
+    had to be fixed one round trip at a time.
+
+    The remedy is deliberately **not** "add an env prefix": ``_prod_batch_row_matches_env``'s NWR
+    branch (smmachine.py) tests the row *name*, not ``belongs``, and NWR rows carry
+    ``belongs == "NP"`` — so advising ``Echo Fortunes-NWR0096`` would only turn this error into a
+    false "not detected".
+    """
+    missing = [p["token"] for p in problems if p.get("kind") == "missing"]
+    ambiguous = [p for p in problems if p.get("kind") == "ambiguous"]
+
+    # Counted separately, not as "N of M": duplicate tokens collapse into one ``found`` entry, so
+    # ``len(problems) + len(found)`` is not the number of lines the operator typed.
+    noun = "name" if len(problems) == 1 else "names"
+    head = f"⚠️ **{len(problems)} machine {noun} did not resolve** — nothing was scheduled."
+    if found:
+        head += f" ({len(found)} resolved.)"
+    lines = [head]
+    if missing:
+        lines += ["", "**Not detected:**"] + [f"• `{t}`" for t in missing]
+        if any(t.strip().isdigit() for t in missing):
+            lines += ["", "A bare asset id does not say which venue. Paste the full display name, "
+                          "or prefix the site (e.g. `CP0096`)."]
+    for item in ambiguous:
+        cands = item.get("candidates") or []
+        lines += ["", f"**`{item.get('token') or ''}`** matched {len(cands)} machines:"]
+        for c in cands[:8]:
+            lines.append(f"• {c.get('belongs') or '—'} — `{c.get('machine') or ''}`")
+        if len(cands) > 8:
+            lines.append(f"• … {len(cands) - 8} more")
+    lines += ["", "Correct the names above (paste them exactly as the dashboard shows them), "
+                  "or tap **Back** and use **Game Type** to target a whole game type."]
+
+    txt = "\n".join(lines)
+    if len(txt) <= max_chars:
+        return txt
+    kept: list[str] = []
+    used = 0
+    for ln in lines:
+        if used + len(ln) + 1 > max_chars:
+            break
+        kept.append(ln)
+        used += len(ln) + 1
+    return "\n".join(kept) + "\n… report truncated (message size limit)"
 
 
 def _toast(kind: str, content: str) -> dict:
@@ -1229,7 +1418,8 @@ def handle_card_callback(
 
         found, err = resolve_session_target(session)
         if err:
-            return _toast("error", err)
+            # Banner on the form, not a toast: the report is multi-line and _toast cuts at 180.
+            return _card_reply(build_form_card(sid, session, error=err))
         return _card_reply(build_review_card(sid, session, found, when))
 
     if act == "schedule":
@@ -1238,7 +1428,7 @@ def handle_card_callback(
             return _toast("error", "Kindly pick both the date and the time.")
         found, err = resolve_session_target(session)
         if err:
-            return _toast("error", err)
+            return _card_reply(build_form_card(sid, session, error=err))
         ok, msg = schedule_session(
             sid, session, found, when,
             scheduler=scheduler, send_card=send_card, run_batch=run_batch,
