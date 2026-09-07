@@ -60,11 +60,18 @@ _SESSION_TTL_SEC = 7200
 
 _MACHINE_SPLIT_RE = re.compile(r"[,\n;]+")
 
-# ``&`` is a documented shorthand separator (``NWR2113 & NWR2114``) but it also occurs inside real
-# game titles (``Lock & Roll-0112``, ``Wheel of Fortune 3 Reel & 5 Reel-0107``), where splitting on
-# it unconditionally produced two tokens that matched nothing — or worse, matched the wrong cabinet
-# by trailing digits. Split only when every piece is a bare asset ref.
-_BARE_REF_RE = re.compile(r"^[A-Za-z]{0,7}\s*-?\s*\d{2,6}$")
+# Within one line, whitespace / ``&`` / nothing-at-all also separate machine refs — but only when
+# every piece is a *bare* asset ref. Display names contain both spaces and ampersands
+# (``5 Dragons-NWR2113``, ``Echo Fortunes-0096``, ``Lock & Roll-0112``), and splitting those yields
+# pieces like ``5`` or ``Lock`` that match nothing — or match the wrong cabinet by trailing digits.
+# Longest-first alternation so ``WINFORD8145`` is not read as ``WF`` (mirrors smmachine's
+# ``_ENV_PREFIX_RE``).
+_ENV_PREFIX_ALT = "WINFORD|NWR|NCH|TBR|TBP|MDR|DHS|OSM|DYB|NP|NC|CP|WF"
+# An env prefix and/or digits and nothing else: ``DHS3106``, ``0253``, ``WINFORD-8145``, ``NWR 2113``.
+_BARE_REF_RE = re.compile(rf"^(?:{_ENV_PREFIX_ALT})?\s*-?\s*\d{{2,6}}$", re.I)
+# One env-prefixed ref, used to unpack a run typed with no separator (``DHS3106DHS3107``).
+_CONCAT_REF_RE = re.compile(rf"(?:{_ENV_PREFIX_ALT})\s*-?\s*\d{{2,6}}", re.I)
+_RUN_SPLIT_RE = re.compile(r"[&\s]+")
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +498,8 @@ def build_form_card(sid: str, session: dict[str, Any], *, error: str = "") -> di
             ]),
         ]
     elif mode == "machines":
-        hint = "Paste the machines (one per line), then tap **Confirm**."
+        hint = ("Paste the machines — one per line, or several on one line "
+                "(`DHS3106 DHS3107`, `DHS3106,DHS3107`) — then tap **Confirm**.")
         form_elements += [
             {"tag": "div", "text": {"tag": "lark_md", "content": "**Target:** Machines"}},
             machines_el,
@@ -552,35 +560,56 @@ def build_form_card(sid: str, session: dict[str, Any], *, error: str = "") -> di
 # ---------------------------------------------------------------------------
 # machine resolution against webmachine_data.json
 # ---------------------------------------------------------------------------
-def _split_ampersand(part: str) -> list[str]:
+def _split_concat_refs(tok: str) -> list[str]:
     """
-    Split ``a & b`` only when **every** piece is a bare asset ref (``NWR2113 & NWR2114``).
+    Unpack a run typed with no separator: ``DHS3106DHS3107`` -> ``["DHS3106", "DHS3107"]``.
 
-    Game titles carry ampersands, so an unconditional split shredded ``Lock & Roll-0112`` into
-    ``Lock`` (matches nothing) and ``Roll-0112`` (matches by trailing digits — possibly the wrong
-    cabinet). See :data:`_BARE_REF_RE`.
+    Only when the refs account for **every** character of the token. That coverage check is what
+    keeps a display name intact: ``Echo-TBP8671`` yields one ref whose characters do not cover
+    ``ECHOTBP8671``, so it is left alone.
     """
-    if "&" not in part:
-        return [part]
-    pieces = [p.strip() for p in part.split("&")]
-    if all(p and _BARE_REF_RE.match(p) for p in pieces):
-        return pieces
-    return [part]
+    tok = tok.strip()
+    if not tok:
+        return []
+    refs = _CONCAT_REF_RE.findall(tok)
+    if len(refs) < 2 or _norm_key("".join(refs)) != _norm_key(tok):
+        return [tok]
+    return refs
+
+
+def _split_bare_refs(part: str) -> list[str]:
+    """
+    Break one line into several tokens when — and only when — every piece is a bare asset ref.
+
+    Covers the three shorthands operators actually type on one line::
+
+        DHS3106 DHS3107 DHS3108     whitespace
+        DHS3106 & DHS3107           ampersand
+        DHS3106DHS3107              no separator at all
+
+    Guarded on purpose: see :data:`_BARE_REF_RE`. ``5 Dragons-NWR2113`` and ``Lock & Roll-0112``
+    have a piece (``5``, ``Lock``) that is not a bare ref, so they stay whole.
+    """
+    part = (part or "").strip()
+    if not part:
+        return []
+    pieces = [p for p in _RUN_SPLIT_RE.split(part) if p]
+    if len(pieces) > 1 and all(_BARE_REF_RE.match(p) for p in pieces):
+        return [ref for piece in pieces for ref in _split_concat_refs(piece)]
+    return _split_concat_refs(part)
 
 
 def parse_machine_lines(raw: str) -> list[str]:
     """
     Split the textarea into machine tokens.
 
-    Newline / comma / ``;`` always separate; ``&`` only between bare asset refs
-    (:func:`_split_ampersand`).
+    Newline / comma / ``;`` always separate. Within a line, whitespace, ``&`` and even no separator
+    at all separate too — but only between bare asset refs, so display names survive intact
+    (:func:`_split_bare_refs`).
     """
     out: list[str] = []
     for part in _MACHINE_SPLIT_RE.split(raw or ""):
-        for piece in _split_ampersand(part):
-            tok = piece.strip()
-            if tok:
-                out.append(tok)
+        out.extend(_split_bare_refs(part))
     return out
 
 
