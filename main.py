@@ -1803,6 +1803,11 @@ def run_check_machine_log_job(
             cr_s = str(cr) if cr is not None else "n/a"
             ts = str(pick.get("time_short") or "").strip()
             md = str(pick.get("machine_display") or machine_query).strip()
+            not_found_caption = (
+                f"⚠️ **Third Http ({be})** — **no transfer-out record** for player `{uid}` "
+                f"(log credit `{cr_s}` @ `{ts}` on `{md}`). The transfer likely never completed.\n"
+                f"⚠️ Third Http **查无转出记录** — 玩家 **`{uid}`** 的转出可能未完成。"
+            )
             if stuck_credit:
                 _cml_send(
                     f"📋 **Stuck credit** on `{md}` — last player **`{uid}`** (credit `{cr_s}` @ `{ts}`).\n"
@@ -1813,6 +1818,13 @@ def run_check_machine_log_job(
                     f"✅ **Third Http ({be})** — player `{uid}` **transferred out credit** successfully "
                     f"(log credit `{cr_s}` @ `{ts}`).\n"
                     f"✅ Third Http 有匹配记录 — 玩家 **`{uid}`** 额度应已成功转出（卡机可清）。"
+                )
+                not_found_caption = (
+                    f"⚠️ **Third Http ({be})** — **no transfer-out record** for player `{uid}` "
+                    f"(log credit `{cr_s}` @ `{ts}` on `{md}`).\n"
+                    f"The credit looks **genuinely stuck**: the rows near this time are credit-**in** "
+                    f"legs, so nothing was cashed out. Settle it by hand.\n"
+                    f"⚠️ Third Http **查无转出记录** — 玩家 **`{uid}`** 额度**仍卡在机台**（附近仅有转入记录），请人工处理。"
                 )
             else:
                 err_p = str(pick.get("error_player_id") or "").strip()
@@ -1850,6 +1862,7 @@ def run_check_machine_log_job(
                 machine_display=str(pick.get("machine_display") or "").strip() or None,
                 thread_root=thread_root,
                 success_caption=success_caption,
+                not_found_caption=not_found_caption,
                 time_short_candidates=pick.get("time_short_candidates"),
             )
     except Exception as e:
@@ -2436,9 +2449,17 @@ def _np_run_screenshot_worker(
     machine_display: Optional[str] = None,
     thread_root: Optional[str] = None,
     success_caption: Optional[str] = None,
+    not_found_caption: Optional[str] = None,
     time_short_candidates: Optional[list[str]] = None,
 ) -> None:
-    """NP / WF / DHS / NCH / CP / OSM / MDR / TBP Log Third Http → `recharge` Detail screenshot. Always **headless** on server."""
+    """
+    NP / WF / DHS / NCH / CP / OSM / MDR / TBP Log Third Http → `recharge` Detail screenshot.
+    Always **headless** on server.
+
+    ``not_found_caption``: what "no matching Detail" *means* for the caller's question. The search
+    itself succeeded there, so ``/stuckcredit`` reports "never transferred out" instead of a red
+    failure; the scan detail still follows, for when the window really was too narrow.
+    """
     root = (thread_root or _get_checkcredit_thread_root(chat_id) or "").strip() or None
 
     def _np_send(text, **kwargs):
@@ -2499,6 +2520,14 @@ def _np_run_screenshot_worker(
             _np_send(f"❌ Failed to send image: {r}")
     except Exception as e:
         err_s = str(e)
+        not_found = isinstance(e, getattr(checkcredit, "NpDetailNotFound", ()))
+        if not_found and (not_found_caption or "").strip():
+            # The scan worked and answered "no such record" — that is the result, not an error.
+            print(f"[npthirdhttp] no matching Detail: {err_s}", flush=True)
+            _np_send(
+                f"{not_found_caption.strip()}\n\n_Scan detail: {err_s}_"
+            )
+            return
         if "No Log Third Http rows" in err_s or "empty table after Search" in err_s:
             tip = (
                 "\n💡 **No Third Http rows** for this UserId/time window — transfer likely **did not complete** "

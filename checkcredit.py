@@ -3159,6 +3159,41 @@ except ValueError:
     NP_BACKEND_MAX_PAGES = 20
 
 
+class NpDetailNotFound(RuntimeError):
+    """
+    The Third Http search ran fine, rows were read, and **no** recharge Detail matched.
+
+    A finding, not a fault: for ``/stuckcredit`` it is the answer — the player never transferred
+    the credit out. Callers should say so rather than report a failure.
+    """
+
+
+def _np_reference_direction(blob: str) -> str:
+    """
+    ``"in"`` / ``"out"`` / ``""`` from the Request ``reference``, whose suffix names the leg:
+    ``"bzzf00011135296821a084fafac9-in"`` is credit into the cabinet,
+    ``"superburstlink31081210884041a0686afcac-ou"`` is the cash-out.
+
+    This is the reliable direction signal. The amount sign agrees with it on the backends seen so
+    far (in -> negative, out -> positive), but the reference states it outright.
+    """
+    if not blob:
+        return ""
+    m = re.search(
+        r"""["']?reference["']?\s*:\s*["']([^"']*)["']""",
+        _np_normalize_jsonish_quotes(blob),
+        re.I,
+    )
+    if not m:
+        return ""
+    ref = m.group(1).strip().lower()
+    if ref.endswith("-in"):
+        return "in"
+    if ref.endswith("-ou") or ref.endswith("-out"):
+        return "out"
+    return ""
+
+
 def _np_require_positive_amount() -> bool:
     """
     A recharge Detail must have a **positive** Request ``amount``.
@@ -4233,7 +4268,10 @@ def _np_try_screenshot_matching_detail(
         blob = _np_detail_request_section(full_txt)
         mid_p, amt_p = _np_parse_machine_amount_from_request_blob(blob or layers or full_txt)
         if scan_stats is not None and len(scan_stats.get("sample_mids") or []) < 8:
-            scan_stats.setdefault("sample_mids", []).append((mid_p, amt_p))
+            # Direction too: "@-1010.0" alone looks like a bug, "@-1010.0 (in)" explains itself.
+            scan_stats.setdefault("sample_mids", []).append(
+                (mid_p, amt_p, _np_reference_direction(blob or layers or full_txt))
+            )
         # Same layer order as before, but remember *which* text matched so the reported
         # machineId / amount come from the layer the decision was made on — not from a
         # different layer that happened to parse first.
