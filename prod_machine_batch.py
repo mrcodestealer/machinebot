@@ -2960,6 +2960,7 @@ class _ProdEnvWarm:
             box["fail"] = fail
             shots: list[dict[str, Any]] = []
             shot_errs: list[dict[str, Any]] = []
+
             # Not gated on fast mode: skipping the in-run capture does not save the work, it
             # moves it to smmachine's background fallback, which launches a SECOND Chromium and
             # re-logs-in to the same backend. Capturing here reuses this warm, logged-in page.
@@ -3176,6 +3177,48 @@ def prewarm_prod_env_pool_on_startup() -> None:
         print(f"[prod-warm] startup pre-warm failed: {ex!r}", flush=True)
 
 
+def build_job_summary(
+    action: str,
+    machines: list[dict],
+    all_ok: list[dict],
+    all_fail: list[dict],
+    shot_list: list[dict] | None = None,
+    shot_errs: list[dict] | None = None,
+) -> dict[str, Any]:
+    """
+    The job summary, reconciled against what was REQUESTED.
+
+    Several paths can drop a machine from both lists (an env thread dying, a cancel mid-loop, an
+    empty display name), and the card renders green whenever `failed` is empty -- so a dropped
+    machine used to show as an unqualified success. Never report a machine we cannot account for.
+    Built by a function because the summary is now emitted TWICE: once before screenshots are
+    captured (so the card lands immediately) and once as the return value.
+    """
+    accounted = {str(x.get("machine") or "").strip() for x in all_ok}
+    accounted |= {str(x.get("machine") or "").strip() for x in all_fail}
+    for m in machines:
+        nm = _machine_display_name(m)
+        if nm and nm not in accounted:
+            all_fail.append(
+                {
+                    "belongs": m.get("belongs", ""),
+                    "machine": nm,
+                    "error": "not reported by any environment (unverified -- please re-check)",
+                }
+            )
+            accounted.add(nm)
+    return {
+        "action": action,
+        "success": all_ok,
+        "failed": all_fail,
+        "requested": len([m for m in machines if _machine_display_name(m)]),
+        "ok": [f"{x['belongs']}::{x['machine']}" for x in all_ok],
+        "failed_keys": [f"{x['belongs']}::{x['machine']}" for x in all_fail],
+        "screenshots": list(shot_list or []),
+        "screenshot_errors": list(shot_errs or []),
+    }
+
+
 def run_prod_batch_job(
     action: str,
     machines: list[dict],
@@ -3187,6 +3230,7 @@ def run_prod_batch_job(
     on_phase_retry: Optional[Callable[[str, int, list[dict], list[dict]], None]] = None,
     on_phase_continue: Optional[Callable[[str, str, list[dict], list[dict]], None]] = None,
     on_env_start: Optional[Callable[[str, int], None]] = None,
+    on_summary_ready: Optional[Callable[[dict[str, Any]], None]] = None,
     capture_screenshots: bool | None = None,
 ) -> dict[str, Any]:
     """
@@ -3211,6 +3255,7 @@ def run_prod_batch_job(
     all_fail: list[dict] = []
     shot_list: list[dict[str, Any]] = []
     shot_errs: list[dict[str, Any]] = []
+    summary_emitted = False
     want_shots = capture_screenshots if capture_screenshots is not None else prod_batch_screenshots_enabled()
 
     timeout_ms = _default_timeout_ms()
@@ -3240,15 +3285,22 @@ def run_prod_batch_job(
                 all_fail.extend(box.get("fail") or [])
                 shot_list.extend(box.get("shots") or [])
                 shot_errs.extend(box.get("shot_errs") or [])
-            return {
-                "action": action,
-                "success": all_ok,
-                "failed": all_fail,
-                "ok": [f"{x['belongs']}::{x['machine']}" for x in all_ok],
-                "failed_keys": [f"{x['belongs']}::{x['machine']}" for x in all_fail],
-                "screenshots": shot_list,
-                "screenshot_errors": shot_errs,
-            }
+            # NOTE: the warm workers capture screenshots inline, so on this path the summary
+            # cannot be published before them -- it is emitted here only to keep the
+            # `summary_already_sent` contract identical for both paths.
+            if on_summary_ready is not None:
+                try:
+                    on_summary_ready(
+                        build_job_summary(action, machines, all_ok, all_fail, shot_list, shot_errs)
+                    )
+                    summary_emitted = True
+                except Exception:
+                    logger.exception("on_summary_ready callback failed")
+            warm_summary = build_job_summary(
+                action, machines, all_ok, all_fail, shot_list, shot_errs
+            )
+            warm_summary["summary_already_sent"] = summary_emitted
+            return warm_summary
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -3283,6 +3335,16 @@ def run_prod_batch_job(
                 all_ok.extend(ok)
                 all_fail.extend(fail)
 
+            # Every machine is verified at this point; the screenshot pass is a separate,
+            # slower walk of the table. Emit the summary NOW so the card lands immediately
+            # instead of after every screenshot has been captured.
+            if on_summary_ready is not None:
+                try:
+                    on_summary_ready(build_job_summary(action, machines, all_ok, all_fail))
+                    summary_emitted = True
+                except Exception:
+                    logger.exception("on_summary_ready callback failed")
+
             # See the warm-path note above: gating this on fast mode pushed the capture onto a
             # second cold Chromium + login instead of reusing this already-logged-in page.
             if want_shots and machines and not cancel_check():
@@ -3300,34 +3362,11 @@ def run_prod_batch_job(
                 pass
             browser.close()
 
-    # Reconcile against what was REQUESTED. Several paths can drop a machine from both lists
-    # (an env thread dying, a cancel mid-loop, an empty display name, an unreachable action) --
-    # and because the card colours itself green whenever `failed` is empty, a dropped machine
-    # used to render as an unqualified "Success". Never report a machine we cannot account for.
-    _accounted = {str(x.get("machine") or "").strip() for x in all_ok}
-    _accounted |= {str(x.get("machine") or "").strip() for x in all_fail}
-    for _m in machines:
-        _nm = _machine_display_name(_m)
-        if _nm and _nm not in _accounted:
-            all_fail.append(
-                {
-                    "belongs": _m.get("belongs", ""),
-                    "machine": _nm,
-                    "error": "not reported by any environment (unverified -- please re-check)",
-                }
-            )
-            _accounted.add(_nm)
-
-    return {
-        "action": action,
-        "success": all_ok,
-        "failed": all_fail,
-        "requested": len([m for m in machines if _machine_display_name(m)]),
-        "ok": [f"{x['belongs']}::{x['machine']}" for x in all_ok],
-        "failed_keys": [f"{x['belongs']}::{x['machine']}" for x in all_fail],
-        "screenshots": shot_list,
-        "screenshot_errors": shot_errs,
-    }
+    summary = build_job_summary(action, machines, all_ok, all_fail, shot_list, shot_errs)
+    # Tell the caller whether the card was already sent from the callback above, so it does not
+    # send a second identical summary.
+    summary["summary_already_sent"] = summary_emitted
+    return summary
 
 
 def live_verify_prod_machines(
