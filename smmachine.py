@@ -4364,10 +4364,13 @@ def _run_prod_batch_bot_job_thread(
         from prod_machine_batch import (
             PHASE_LABELS,
             _failure_is_game_running,
-            _max_phase_retries,
+            applicable_max_retries,
         )
 
-        max_r = _max_phase_retries()
+        # The cap depends on WHY these machines failed: "game currently running" is waited out
+        # with a much larger budget. Use the same function the retry loop uses, so the card can
+        # never advertise a limit the loop does not honour.
+        max_r = applicable_max_retries(failed)
         done = done or []
         is_final = attempt >= max_r
         game_running = bool(failed) and all(
@@ -4467,9 +4470,9 @@ def _run_prod_batch_bot_job_thread(
         ok_n = len(summary.get("success") or [])
         fail_n = len(summary.get("failed") or [])
         failed = list(summary.get("failed") or [])
-        from prod_machine_batch import _failure_is_game_running, _max_phase_retries
+        from prod_machine_batch import _failure_is_game_running, applicable_max_retries
 
-        max_r = _max_phase_retries()
+        max_r = applicable_max_retries(failed)
         all_game_running = bool(failed) and all(
             _failure_is_game_running(str(m.get("error") or ""), m.get("live")) for m in failed
         )

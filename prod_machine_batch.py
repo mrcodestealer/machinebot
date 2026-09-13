@@ -2391,6 +2391,32 @@ def _failure_is_permanent(entry: dict[str, Any]) -> bool:
     return bool(_PERMANENT_FAIL_PAT.search(err))
 
 
+def _game_running_max_retries() -> int:
+    """
+    Retry budget for machines failing ONLY with "game currently running".
+
+    Waiting is the whole point there -- a player finishes and the set succeeds -- so this gets a
+    much larger budget than the general cap, which exists to stop pointless re-scans for failures
+    that re-running cannot change. Override with ``PROD_SET_GAME_RUNNING_MAX_RETRIES``.
+    """
+    try:
+        return max(1, int((os.environ.get("PROD_SET_GAME_RUNNING_MAX_RETRIES") or "50").strip()))
+    except ValueError:
+        return 50
+
+
+def all_failures_game_running(failures: list[dict]) -> bool:
+    """True when every remaining failure is the waitable "game currently running" case."""
+    return bool(failures) and all(
+        _failure_is_game_running(str(f.get("error") or ""), f.get("live")) for f in failures
+    )
+
+
+def applicable_max_retries(failures: list[dict]) -> int:
+    """The retry cap that applies to this set of failures (used for the loop AND the Lark card)."""
+    return _game_running_max_retries() if all_failures_game_running(failures) else _max_phase_retries()
+
+
 def _retry_backoff_sec(attempt: int) -> float:
     """Sleep before the next retry pass. ``PROD_SET_RETRY_BACKOFF_SEC=0`` disables it."""
     try:
@@ -2438,7 +2464,9 @@ def _run_step_with_retries(
             for m in pending
         ], []
 
-    for attempt in range(1, max_r + 1):
+    # Loop to the widest possible budget; the per-attempt check below applies the cap that
+    # actually fits the failures we are looking at.
+    for attempt in range(1, max(max_r, _game_running_max_retries()) + 1):
         if cancel_check() or manual_stop_check():
             return False, pending, done_so_far
 
@@ -2492,10 +2520,18 @@ def _run_step_with_retries(
                 belongs, step_verify, attempt, len(blocked),
             )
             return False, blocked, done_so_far
-        if attempt < max_r:
-            delay = _retry_backoff_sec(attempt)
-            if delay:
-                time.sleep(delay)
+
+        # "game currently running" gets the long budget; anything else stops at the normal cap.
+        cap = applicable_max_retries(retryable)
+        if attempt >= cap:
+            logger.info(
+                "prod-set: %s %s stopping at attempt %d/%d (%d still failing)",
+                belongs, step_verify, attempt, cap, len(retryable),
+            )
+            return False, retryable + blocked, done_so_far
+        delay = _retry_backoff_sec(attempt)
+        if delay:
+            time.sleep(delay)
         pending = retryable
 
     return False, pending + blocked, done_so_far
