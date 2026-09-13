@@ -2154,13 +2154,6 @@ def _url_short(text: str, limit: int = 160) -> str:
     return s if len(s) <= limit else s[: limit - 1] + "…"
 
 
-def _url_fmt(value: Optional[float]) -> str:
-    """``3822.0`` -> ``3,822``; ``1911.5`` keeps the halves."""
-    if not isinstance(value, (int, float)):
-        return "n/a"
-    return f"{int(value):,}" if float(value) == int(value) else f"{float(value):,.2f}"
-
-
 def _url_expected_credit(choice: dict) -> Optional[float]:
     """``credit_value`` when the log parsed one, else the printed credit — used to match the row."""
     val = choice.get("credit_value")
@@ -2334,6 +2327,7 @@ def run_url_job(chat_id: str, machines: list[str], date_iso: str = "") -> None:
                 credit_from = "log_unread" if (read_err or credit is None) else "log_idle"
                 credit = log_credit
             candidates = checkcredit.machine_credit_amount_candidates(credit)
+            windows = checkcredit.machine_credit_amount_windows(credit)
             print(
                 f"[url] {md}: credit={credit} from={credit_from} "
                 f"candidates={candidates} (log credit {log_credit})",
@@ -2346,7 +2340,7 @@ def run_url_job(chat_id: str, machines: list[str], date_iso: str = "") -> None:
                 timeout_ms=120_000,
                 machine_substr=ms,
                 expected_credit=candidates[0] if candidates else log_credit,
-                expected_credit_any=candidates or None,
+                expected_credit_any=windows or None,
                 machine_display=md,
                 headed=False,
             )
@@ -2359,21 +2353,12 @@ def run_url_job(chat_id: str, machines: list[str], date_iso: str = "") -> None:
             caption = (
                 f"🕹️ **{md}**  ·  👤 **`{uid}`**  ·  🕒 **`{day_iso} {time_short}`**"
             )
-            if candidates:
-                where = "machine credit" if credit_from == "machine" else "log credit"
-                also = " / ".join(f"`{_url_fmt(c)}`" for c in candidates[1:])
-                caption += f"\n💰 Matched to {where} `{_url_fmt(credit)}`"
-                if also:
-                    caption += f" — also accepting {also}"
-                # Why the machine's own credit was not the one used. Without the reason on the
-                # card, "unreadable" only sends the reader to the console to find out.
-                if credit_from == "log_idle":
-                    caption += (
-                        "\nℹ️ Machine credit reads `0` (cabinet idle) — used the log credit instead."
-                    )
-                elif credit_from == "log_unread":
-                    why = read_err or "no number in the model reply"
-                    caption += f"\n⚠️ Could not read the machine credit: {_url_short(why)}"
+            # Which amount the Detail was matched against is no longer spelled out on the
+            # card — it is in the [url] log line above. A failed *read* still is: that is a
+            # fault worth seeing, not commentary about a match that worked.
+            if credit_from == "log_unread":
+                why = read_err or "no number in the model reply"
+                caption += f"\n⚠️ Could not read the machine credit: {_url_short(why)}"
             sent = False
             if callable(build_card):
                 card = build_card(machine_display=md, image_key=key, subtitle=caption)

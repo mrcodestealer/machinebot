@@ -3934,6 +3934,39 @@ def _np_machine_id_contains_substr(machine_substr: str | None, machine_id_value:
     return False
 
 
+def _np_scaled_amount_tolerance() -> float:
+    """
+    How far a **derived** (doubled / halved) credit may sit from the booked amount.
+
+    Halving an odd credit gives a .5, and a cabinet booking whole units rounds it; doubling
+    inherits whatever rounding already happened. +-1 covers that. ``NP_BACKEND_SCALED_TOLERANCE``
+    overrides it; the credit as read still uses ``NP_BACKEND_AMOUNT_EPS``.
+    """
+    try:
+        return max(
+            0.0,
+            float(os.environ.get("NP_BACKEND_SCALED_TOLERANCE", "1").strip() or "1"),
+        )
+    except ValueError:
+        return 1.0
+
+
+def machine_credit_amount_windows(credit: float | None) -> list[tuple[float, float]]:
+    """
+    ``[(value, tolerance), ...]`` for the three forms a backend may book the same credit in.
+
+    The credit as shown gets the exact-match eps; doubled and halved get
+    :func:`_np_scaled_amount_tolerance` (default +-1), because those are derived numbers and the
+    cabinet's denomination rounds them.
+    """
+    values = machine_credit_amount_candidates(credit)
+    if not values:
+        return []
+    tol = _np_scaled_amount_tolerance()
+    eps = _np_amount_match_eps()
+    return [(v, eps if i == 0 else tol) for i, v in enumerate(values)]
+
+
 def machine_credit_amount_candidates(credit: float | None) -> list[float]:
     """
     The same cabinet credit written the three ways a backend may record it: as shown, doubled,
@@ -3985,10 +4018,10 @@ def _np_detail_matches_credit_and_machine_id(
     A negative ``amount`` is rejected outright (see :func:`_np_require_positive_amount`): that row
     is credit going into the cabinet, so it is the wrong Detail however well it matches otherwise.
 
-    ``expected_credit_any``: accept the row when the amount is within eps of **any** value in the
-    list, and ignore ``expected_credit`` for the comparison. ``/url`` passes the machine credit
-    read off the cabinet plus its x2 / /2 forms
-    (:func:`machine_credit_amount_candidates`).
+    ``expected_credit_any``: accept the row when the amount matches **any** entry, and ignore
+    ``expected_credit`` for the comparison. Entries are either a bare value (matched to eps) or a
+    ``(value, tolerance)`` pair. ``/url`` passes :func:`machine_credit_amount_windows`, so the
+    credit as read matches exactly while its doubled / halved forms allow +-1.
     """
     mid, amt = _np_parse_machine_amount_from_request_blob(req_blob)
     if mid is None:
@@ -4003,7 +4036,16 @@ def _np_detail_matches_credit_and_machine_id(
             return False
         scaled_any = float(amt) / (amount_scale if amount_scale and amount_scale > 0 else 1.0)
         eps = _np_amount_match_eps()
-        return any(abs(scaled_any - float(c)) <= eps for c in candidates)
+        for cand in candidates:
+            # Either a bare value (eps) or a (value, tolerance) pair from
+            # machine_credit_amount_windows, where derived forms carry a wider band.
+            if isinstance(cand, (tuple, list)) and len(cand) >= 2:
+                want, tol = float(cand[0]), abs(float(cand[1]))
+            else:
+                want, tol = float(cand), eps
+            if abs(scaled_any - want) <= max(tol, eps):
+                return True
+        return False
     if expected_credit is None:
         # Machine-only match (e.g. TBP fallback): accept a missing amount; reject an exactly-zero
         # one (and, above, a negative one).
