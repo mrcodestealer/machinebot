@@ -628,8 +628,13 @@ def _machine_asset_digits_from_name(name: str) -> str | None:
     return None
 
 
+_ASSET_ID_ANYWHERE_RE = re.compile(
+    r"(?:NWR|NCH|NC|NP|TBR|TBP|MDR|DHS|CP|OSM|WF|WINFORD)(\d+)"
+)
+
+
 def _query_asset_digits_from_key(key_alnum: str) -> str | None:
-    """Trailing asset id digits parsed from a user token (``TP8674``, ``8673``, full title, …)."""
+    """Asset id digits parsed from a user token (``TP8674``, ``8673``, ``NCH1122 Blue Festival``)."""
     key_alnum = (key_alnum or "").upper()
     m = re.search(
         r"(?:NWR|NCH|NC|NP|TBR|TBP|MDR|DHS|CP|OSM|WF|WINFORD)(\d+)$",
@@ -637,6 +642,13 @@ def _query_asset_digits_from_key(key_alnum: str) -> str | None:
     )
     if m:
         return m.group(1)
+    # The asset id is not always last. People paste "NCH1122 Blue Festival" while the table
+    # stores "Blue Festival-NCH1122", so neither the substring nor the suffix test can line the
+    # two up and the whole line read as "not detected". A site prefix immediately followed by
+    # digits is a reliable asset id wherever it sits in the token.
+    anywhere = list(_ASSET_ID_ANYWHERE_RE.finditer(key_alnum))
+    if anywhere:
+        return anywhere[-1].group(1)
     m2 = re.search(r"(\d+)$", key_alnum)
     return m2.group(1) if m2 else None
 
