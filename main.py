@@ -23,6 +23,7 @@ This is a self-contained bot that ONLY does the machine + encoder flows mirrored
 …plus the credit / log flows mirrored from ``logcreditbot`` (same Lark app):
 
   - ``/checkcredit <machine> [YYYY-MM-DD]``    log → latest players → NP choice card (Third Http)
+  - ``/checkcredit <machine> <player> [date]`` one player's latest transfer-out Detail (either order)
   - ``/checkcreditdate``                       interactive card (machine + player + date)
   - ``/machineerror <machine> [date]``         latest two players, error context only
   - ``/checkmachinelog <machine> [date]``      logic log → card + AI summary (+ Third Http)
@@ -1909,29 +1910,111 @@ def run_checkcredit_navigator_next_log(chat_id: str) -> None:
     )
 
 
-def run_checkcredit_player_job(chat_id: str, machine: str, player_id: str, date_iso: str) -> None:
-    """OSS log → player credit row → Third Http Detail screenshot (same path as ``/npthirdhttp``)."""
+# Machine vs player ID in a two-argument ``/checkcredit``. Asset numbers stop at six
+# digits (``_TAG_MACHINE_RE`` below), player accounts run seven or more, so the pair
+# reads the same written either way round — anything carrying a letter is the machine
+# label. Only a genuinely ambiguous pair (two bare numbers of the same size class) is
+# refused, and it is refused loudly rather than guessed at.
+_PLAYER_ID_MIN_DIGITS = 7
+
+
+def _split_machine_player_args(tok_a: str, tok_b: str) -> tuple[str, str, str]:
+    """``(machine, player_id, error)`` for ``/checkcredit`` given two args in either order."""
+    a = (tok_a or "").strip()
+    b = (tok_b or "").strip()
+    if not a or not b:
+        return "", "", "Need both a machine and a player ID."
+    a_label = bool(re.search(r"[A-Za-z]", a))
+    b_label = bool(re.search(r"[A-Za-z]", b))
+    if a_label and b_label:
+        return "", "", (
+            f"Both `{a}` and `{b}` look like machine labels — "
+            "one of the two has to be the numeric player ID."
+        )
+    if a_label or b_label:
+        machine, player = (a, b) if a_label else (b, a)
+        if not player.isdigit():
+            return "", "", f"Player ID `{player}` must be digits only."
+        return machine, player, ""
+    # Both bare numbers — length is the only thing that tells them apart.
+    a_player = len(a) >= _PLAYER_ID_MIN_DIGITS
+    b_player = len(b) >= _PLAYER_ID_MIN_DIGITS
+    if a_player and not b_player:
+        return b, a, ""
+    if b_player and not a_player:
+        return a, b, ""
+    return "", "", (
+        f"Cannot tell the machine from the player in `{a} {b}` — write the machine "
+        "with its venue prefix (e.g. `NCH1539 19475859`)."
+    )
+
+
+def run_checkcredit_player_job(
+    chat_id: str,
+    machine: str,
+    player_id: str,
+    date_iso: str,
+    *,
+    thread_root: Optional[str] = None,
+    prev_day_fallback: bool = False,
+) -> None:
+    """OSS log → player credit row → Third Http Detail screenshot (same path as ``/npthirdhttp``).
+
+    ``prev_day_fallback`` belongs to a caller that *defaulted* the date to today rather
+    than being handed one. An empty day usually means the session closed before midnight,
+    so the day before is the honest answer — the same look-back ``/checkcredit`` already
+    does for its player list. An explicit date is a question about that day, so it never
+    falls back.
+    """
+    root = (thread_root or _get_checkcredit_thread_root(chat_id) or "").strip() or None
+    if root:
+        _set_checkcredit_thread_root(chat_id, root)
+
+    def _cc_send(text, **kwargs):
+        return _checkcredit_send(chat_id, text, thread_root=root, **kwargs)
+
     try:
         import checkcredit
         from datetime import datetime as _dt
 
         td = _dt.strptime(date_iso.strip(), "%Y-%m-%d").date()
     except ValueError:
-        _checkcredit_send(chat_id, "❌ Invalid date — use YYYY-MM-DD.")
+        _cc_send("❌ Invalid date — use YYYY-MM-DD.")
         return
     except ImportError as e:
-        _checkcredit_send(chat_id, f"❌ Cannot load checkcredit: {e}")
+        _cc_send(f"❌ Cannot load checkcredit: {e}")
         return
     md, lc, err = checkcredit.resolve_player_log_credit_snapshot(
         machine.strip(), player_id.strip(), td
     )
+    # Only "the log was read and this player is not in it" earns a look at the day before
+    # — the wording is ``resolve_player_log_credit_snapshot``'s own. A ``Log load failed``
+    # means the day was never read at all, and retrying another date would answer a
+    # question nobody asked.
+    if err and prev_day_fallback and "No log block found" in err:
+        prev_td = td - timedelta(days=1)
+        _cc_send(
+            f"ℹ️ Player `{player_id.strip()}` is not in the `{td.isoformat()}` log for "
+            f"`{md or machine.strip()}` — checking the previous day `{prev_td.isoformat()}` …"
+        )
+        md_prev, lc_prev, err_prev = checkcredit.resolve_player_log_credit_snapshot(
+            machine.strip(), player_id.strip(), prev_td
+        )
+        if err_prev:
+            # Report the day the user actually asked about, but do not let the announcement
+            # above imply the previous day held something.
+            err = f"{err} Nothing on `{prev_td.isoformat()}` either."
+        else:
+            md, lc, err = md_prev, lc_prev, err_prev
+            date_iso = prev_td.strftime("%Y-%m-%d")
+            _cc_send(f"ℹ️ Using `{date_iso}` instead.")
     if err:
-        _checkcredit_send(chat_id, f"❌ {err}")
+        _cc_send(f"❌ {err}")
         return
     assert lc is not None
     ts = str(lc.get("time_short") or "").strip()
     if not ts:
-        _checkcredit_send(chat_id, "❌ No credit time in log for this player.")
+        _cc_send("❌ No credit time in log for this player.")
         return
     exp: Optional[float] = None
     v = lc.get("value")
@@ -1950,6 +2033,7 @@ def run_checkcredit_player_job(chat_id: str, machine: str, player_id: str, date_
         machine_substr=ms,
         expected_credit=exp,
         machine_display=display_md,
+        thread_root=root,
     )
 
 
@@ -3151,6 +3235,8 @@ _HELP_TEXT = (
     "• `/checkosmwatch` — check the bot can still access OSM-Watch (Show Qr Code if not)\n"
     "• `/loginosmwatch` — force a fresh OSM-Watch login QR (lab group)\n"
     "• `/checkcredit <machine> [YYYY-MM-DD]` — log → players → NP choice card\n"
+    "• `/checkcredit <machine> <player id> [date]` — that player's latest transfer-out "
+    "Detail; machine and player in either order\n"
     "• `/checkcreditdate` — interactive card (machine + player + date)\n"
     "• `/machineerror <machine> [date]` — latest two players, error context\n"
     "• `/checkmachinelog <machine> [date]` — logic log card + AI summary\n"
@@ -3731,11 +3817,16 @@ def _handle_machine_message(
         )
         return
 
-    # /checkcredit | /checkcreditdate <machine> | /machineerror
+    # /checkcredit | /checkcreditdate <machine> [player id] | /machineerror
     if re.search(r"/(?:checkcreditdate|checkcredit|machineerror)\b", ct, re.I):
         # Longer token first in alternation so `/checkcreditdate` is not parsed as `/checkcredit` + `date`.
+        # Group 3 is the optional second identifier — machine and player ID, written in
+        # either order. Its lookahead keeps a trailing date out of that slot, so the date
+        # stays group 4 whether or not a player was named.
         m_cc = re.search(
-            r"/(checkcreditdate|checkcredit|machineerror)\b\s+(\S+)(?:\s+(\d{4}-\d{2}-\d{2}))?",
+            r"/(checkcreditdate|checkcredit|machineerror)\b\s+(\S+)"
+            r"(?:\s+(?!\d{4}-\d{2}-\d{2})(\S+))?"
+            r"(?:\s+(\d{4}-\d{2}-\d{2}))?",
             ct,
             re.I,
         )
@@ -3743,16 +3834,20 @@ def _handle_machine_message(
             send_message(
                 chat_id,
                 "❌ Usage:\n"
-                "• `/checkcreditdate` — **interactive card**: machine + player + date → Third Http Detail\n"
                 "• `/checkcredit <machine>` — **today** (same as `--date` omitted in CLI)\n"
+                "• `/checkcredit <machine> <player id> [YYYY-MM-DD]` — that player's latest "
+                "transfer-out Detail (machine and player in either order)\n"
+                "• `/checkcreditdate` — **interactive card**: machine + player + date → Third Http Detail\n"
                 "• `/checkcreditdate <machine> [YYYY-MM-DD]` — optional date; omit for today\n"
                 "• `/machineerror <machine> [YYYY-MM-DD]` — latest two players with error only\n"
-                "Examples: `/checkcredit 1171` · `/checkcreditdate 2074 2026-04-27`",
+                "Examples: `/checkcredit 1171` · `/checkcredit NCH1539 19475859` · "
+                "`/checkcreditdate 2074 2026-04-27`",
             )
             return
         cmd_cc = (m_cc.group(1) or "").strip().lower()
         machine_q = m_cc.group(2).strip()
-        date_arg = (m_cc.group(3) or "").strip()
+        player_q = (m_cc.group(3) or "").strip()
+        date_arg = (m_cc.group(4) or "").strip()
         # Only an implicit (defaulted-to-today) date may fall back to the previous day —
         # an explicit date is a question about that day.
         date_explicit = bool(date_arg)
@@ -3762,6 +3857,47 @@ def _handle_machine_message(
             datetime.strptime(date_arg, "%Y-%m-%d")
         except ValueError:
             send_message(chat_id, "❌ Date must be `YYYY-MM-DD` (e.g. `2026-04-27`).")
+            return
+        # Only a token that could actually BE an identifier opens the two-argument form.
+        # Trailing chatter — "please", "thanks", a stray word from a sentence that happens
+        # to carry the command — is ignored here exactly as it was before that form existed.
+        if player_q and not (player_q.isdigit() or _TAG_MACHINE_RE.match(player_q)):
+            player_q = ""
+        # `/machineerror` is a whole-machine question — it has no player slot, so a second
+        # identifier there is a misunderstanding worth saying out loud rather than dropping.
+        if player_q and cmd_cc == "machineerror":
+            send_message(
+                chat_id,
+                f"❌ `/machineerror` takes one machine only — drop `{player_q}`, or use "
+                f"`/checkcredit {machine_q} {player_q}` to ask about that one player.",
+            )
+            return
+        if player_q:
+            machine_cc, player_cc, split_err = _split_machine_player_args(machine_q, player_q)
+            if split_err:
+                send_message(
+                    chat_id,
+                    f"❌ {split_err}\n"
+                    "Usage: `/checkcredit <machine> <player id> [YYYY-MM-DD]` — "
+                    "e.g. `/checkcredit NCH1539 19475859`.",
+                )
+                return
+            thread_root = _checkcredit_begin_thread(chat_id, message_id)
+            _checkcredit_send(
+                chat_id,
+                f"⏳ Machine `{machine_cc}` · player `{player_cc}` · `{date_arg}` — reading the "
+                "logic log, then Third Http → that player's latest transfer-out Detail…",
+                thread_root=thread_root,
+            )
+            start_lark_background_thread(
+                run_checkcredit_player_job,
+                chat_id,
+                machine_cc,
+                player_cc,
+                date_arg,
+                thread_root=thread_root,
+                prev_day_fallback=not date_explicit,
+            )
             return
         try:
             import checkcredit
