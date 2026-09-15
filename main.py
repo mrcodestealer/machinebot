@@ -3248,6 +3248,33 @@ _WHOAMI_RE = re.compile(
     re.I,
 )
 
+# `/secret1 @user` — somebody ELSE's open_id, read straight off the @mention Lark attaches to the
+# message. Deliberately absent from _HELP_TEXT: it is the "fill in a config value" tool
+# (OSMWATCH_ALERT_TAG_OPEN_ID, DEPLOY_ALLOWED_OPEN_IDS …), not an everyday command. `who am i`
+# stays the answer for your own id.
+_OPEN_ID_ARG_RE = re.compile(r"\b((?:ou|on)_[0-9a-z]+)\b")
+
+
+def _lark_mentions_of(incoming_message_obj) -> "list[dict]":
+    """The raw ``message.mentions`` list of an im.message.receive_v1 event."""
+    if not isinstance(incoming_message_obj, dict):
+        return []
+    return [m for m in (incoming_message_obj.get("mentions") or []) if isinstance(m, dict)]
+
+
+def _mention_open_id(mention: dict) -> str:
+    """The open_id of one ``message.mentions`` entry.
+
+    ``id`` is normally the three-id dict (open_id / user_id / union_id); only open_id is read, since
+    the other two are enterprise directory identifiers this command has no reason to hand out. Some
+    payload shapes carry a bare open_id string there instead — accepted as well.
+    """
+    mid = mention.get("id")
+    if isinstance(mid, dict):
+        return str(mid.get("open_id") or "").strip()
+    return str(mid or "").strip()
+
+
 # Encoder-stream commands: `/encoder` shows all of MAIN/POOL/CCTV; the others filter to one stream.
 # NOTE: `/cctv` here is the CCTV *encoder* stream; the EGM CCTV screenshot moved to `/cctvshot`.
 # `/minipc` asks for both Mini PC columns of the OSM Machine List sheet: the plain one, which
@@ -3408,6 +3435,45 @@ def _handle_machine_message(
             chat_id,
             f"{_at}Your open_id: `{_uid or 'unknown'}`\nchat_id: `{chat_id}`",
         )
+        return
+
+    # ---- /secret1 @user … — the open_id of whoever is @mentioned (hidden; see _OPEN_ID_ARG_RE) ----
+    if cmd == "/secret1":
+        rows: list[str] = []
+        seen_ids: set[str] = set()
+        for _m in _lark_mentions_of(incoming_message_obj):
+            _oid = _mention_open_id(_m)
+            # The @bot that had to be tagged to reach us in a group is never the subject.
+            if not _oid or _oid in seen_ids or _oid == BOT_OPEN_ID:
+                continue
+            seen_ids.add(_oid)
+            # A display name is user-controlled and Lark renders <at …> inside a text message, so
+            # scrub tags out of it the same way the inbound path does before echoing it back.
+            _nm = re.sub(r"<[^>]+>", "", str(_m.get("name") or "")).strip()
+            rows.append(f"👤 {_nm or '(name unavailable)'}\nopen_id: `{_oid}`")
+
+        # No real @mention (e.g. the id was pasted, or typed from another chat) — echo back any
+        # ou_/on_ token in the text so it can still be confirmed and copied. on_ is a union_id, not
+        # an open_id: label it as what it is, or it gets pasted into an open_id config key.
+        if not rows:
+            for _oid in _OPEN_ID_ARG_RE.findall(ct):
+                if _oid in seen_ids or _oid == BOT_OPEN_ID:
+                    continue
+                seen_ids.add(_oid)
+                _lbl = "union_id" if _oid.startswith("on_") else "open_id"
+                rows.append(f"👤 (pasted)\n{_lbl}: `{_oid}`")
+
+        if not rows:
+            _uid = (sender_id or "").strip()
+            send_message(
+                chat_id,
+                "❌ Usage: `/secret1 @user` — tag the person whose open_id you need.\n"
+                "In a group tag the bot too: `@bot /secret1 @user`.\n\n"
+                f"Your own open_id: `{_uid or 'unknown'}`\nchat_id: `{chat_id}`",
+            )
+            return
+
+        send_message(chat_id, "\n\n".join(rows) + f"\n\nchat_id: `{chat_id}`")
         return
 
     def _thread_root_for_prod_batch() -> Optional[str]:
