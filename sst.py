@@ -99,6 +99,8 @@ def new_session(chat_id: str, *, thread_root: str | None = None) -> str:
             "mode": "",
             "env_code": "",
             "game_type": "",
+            # venue inside a split environment: "" (not chosen) | "NCH" | "DYB" | "ALL"
+            "venue": "",
             "machines_text": "",
             "ts": time.time(),
         }
@@ -152,9 +154,48 @@ def selection_action(maint: bool, test: bool) -> str | None:
 # ---------------------------------------------------------------------------
 SST_ENV_CODES: tuple[str, ...] = ("NWR", "NCH", "TBR", "TBP", "MDR", "DHS", "CP", "WF")
 
+# One backend, two physical venues. DYB cabinets (``Blue Festival-DYB0001``) are rows on the NCH
+# backend — ``maintenancemachineagent._env_from_machine_name`` and
+# ``smmachine._prod_batch_machine_env_from_name`` both fold DYB into NCH — so picking a game type
+# in NCH silently swept up the other venue's cabinets too. A game type that spans both now asks
+# which venue to set. Every other environment is a single venue and skips the step.
+SST_VENUE_SPLITS: dict[str, tuple[str, ...]] = {"NCH": ("NCH", "DYB")}
+SST_VENUE_ALL = "ALL"
+
 
 def _norm_key(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def _is_dyb_machine(name: str) -> bool:
+    """The same DYB test the batch runner uses (``smmachine._prod_batch_machine_env_from_name``)."""
+    alnum = re.sub(r"[^A-Za-z0-9]", "", name or "").upper()
+    return alnum.startswith("DYB") or bool(re.search(r"DYB[0-9]", alnum))
+
+
+def _machine_venue(env_code: str, machine_name: str) -> str:
+    """Venue a machine sits at inside ``env_code``; the environment itself when it is not split."""
+    env = (env_code or "").strip().upper()
+    if env != "NCH":
+        return env
+    return "DYB" if _is_dyb_machine(machine_name) else "NCH"
+
+
+def _filter_by_venue(env_code: str, machines: list[dict], venue: str) -> list[dict]:
+    """``machines`` narrowed to one venue. Empty venue and :data:`SST_VENUE_ALL` keep everything."""
+    want = (venue or "").strip().upper()
+    if not want or want == SST_VENUE_ALL:
+        return list(machines)
+    return [m for m in machines
+            if _machine_venue(env_code, str(m.get("machine") or "")) == want]
+
+
+def _venue_label(env_code: str, venue: str) -> str:
+    """``NCH`` / ``DYB`` / ``NCH + DYB`` — how the choice reads on the cards."""
+    want = (venue or "").strip().upper()
+    if want == SST_VENUE_ALL:
+        return " + ".join(SST_VENUE_SPLITS.get((env_code or "").strip().upper(), ())) or want
+    return want
 
 
 def _prod_rows() -> list[dict]:
@@ -222,9 +263,9 @@ def machine_lines(machines: list[dict], *, detail: bool = False, max_chars: int 
     return "\n".join(kept) + f"\n… {len(lines) - len(kept)} more not shown (message size limit)"
 
 
-def machines_for_game_type(env_code: str, game_type: str) -> list[dict]:
+def machines_for_game_type(env_code: str, game_type: str, *, venue: str = "") -> list[dict]:
     """
-    Machines of one environment + game type.
+    Machines of one environment + game type, optionally narrowed to one ``venue``.
 
     Matched on a normalised key so ``Rising Rockets`` finds ``RISINGROCKETS``. Unlike the
     free-text group flow this never falls back to "all machines in the environment" — an
@@ -233,9 +274,10 @@ def machines_for_game_type(env_code: str, game_type: str) -> list[dict]:
     want = _norm_key(game_type)
     if not want:
         return []
+    env = (env_code or "").strip().upper()
     out: list[dict] = []
     seen: set[tuple[str, str]] = set()
-    for r in _env_rows(env_code):
+    for r in _env_rows(env):
         if _norm_key(str(r.get("game_type") or "")) != want:
             continue
         m = _row_to_machine(r)
@@ -244,7 +286,33 @@ def machines_for_game_type(env_code: str, game_type: str) -> list[dict]:
             continue
         seen.add(key)
         out.append(m)
-    return sorted(out, key=lambda x: x["machine"].lower())
+    return _filter_by_venue(env, sorted(out, key=lambda x: x["machine"].lower()), venue)
+
+
+def venues_for_game_type(
+    env_code: str,
+    game_type: str,
+    machines: list[dict] | None = None,
+) -> list[tuple[str, int]]:
+    """
+    ``[(venue, machine_count)]`` — but only when this game type spans **more than one** venue.
+
+    Returns ``[]`` for an unsplit environment, and for a game type that happens to live at a single
+    venue, so the extra step never appears when there is nothing to choose. Pass ``machines`` to
+    reuse a list already loaded; ``load_webmachine_rows`` re-reads the file on every call.
+    """
+    env = (env_code or "").strip().upper()
+    order = SST_VENUE_SPLITS.get(env)
+    if not order:
+        return []
+    if machines is None:
+        machines = machines_for_game_type(env, game_type)
+    counts: dict[str, int] = {}
+    for m in machines:
+        v = _machine_venue(env, str(m.get("machine") or ""))
+        counts[v] = counts.get(v, 0) + 1
+    present = [(v, counts[v]) for v in order if counts.get(v)]
+    return present if len(present) > 1 else []
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +553,14 @@ def build_form_card(sid: str, session: dict[str, Any], *, error: str = "") -> di
     mode = str(session.get("mode") or "")
     env_code = str(session.get("env_code") or "").strip().upper()
     game_type = str(session.get("game_type") or "").strip()
+    venue = str(session.get("venue") or "").strip().upper()
     hint = "Pick **date** and **time**, choose **Maintenance** / **Test**, then choose a target."
+
+    # Loaded once and reused by both the venue step and the review list: every call re-reads
+    # webmachine_data.json from disk.
+    game_machines = (machines_for_game_type(env_code, game_type)
+                     if (mode == "game" and env_code and game_type) else [])
+    venue_choices = venues_for_game_type(env_code, game_type, game_machines)
 
     if not mode:
         form_elements += [
@@ -530,14 +605,32 @@ def build_form_card(sid: str, session: dict[str, Any], *, error: str = "") -> di
                 for j, (gt, n) in enumerate(chunk)
             ]))
         form_elements.append(_back_row(sid))
+    elif venue_choices and not venue:
+        # Only reached when the game type really does span both venues — venues_for_game_type
+        # returns [] otherwise, so single-venue game types go straight to the review list.
+        names = " + ".join(v for v, _ in venue_choices)
+        total = sum(n for _, n in venue_choices)
+        hint = f"**{game_type}** has machines at more than one venue — pick which to set."
+        form_elements.append({"tag": "div", "text": {"tag": "lark_md",
+                              "content": f"**Environment:** {env_code}\n**Game type:** {game_type}\n\n"
+                                         f"Select the **venue**:"}})
+        form_elements += _btn_rows(
+            [_form_button(f"{v} ({n})", f"sst_venue_{v}", {"a": "venue", "s": sid, "v": v},
+                          kind="primary")
+             for v, n in venue_choices]
+            + [_form_button(f"{names} ({total})", "sst_venue_all",
+                            {"a": "venue", "s": sid, "v": SST_VENUE_ALL})]
+        )
+        form_elements.append(_back_row(sid))
     else:
-        machines = machines_for_game_type(env_code, game_type)
+        machines = _filter_by_venue(env_code, game_machines, venue)
         hint = "Review the machines, then tap **Confirm**."
-        body = (f"**Environment:** {env_code}\n**Game type:** {game_type}\n"
-                f"**Machines:** {len(machines)}\n\n{machine_lines(machines)}")
+        head = f"**Environment:** {env_code}\n**Game type:** {game_type}\n"
+        if venue:
+            head += f"**Venue:** {_venue_label(env_code, venue)}\n"
+        body = f"{head}**Machines:** {len(machines)}\n\n{machine_lines(machines)}"
         if not machines:
-            body = (f"**Environment:** {env_code}\n**Game type:** {game_type}\n\n"
-                    f"⚠️ No machines found for this game type.")
+            body = f"{head}\n⚠️ No machines found for this game type."
         form_elements.append({"tag": "div", "text": {"tag": "lark_md", "content": body}})
         form_elements += _confirm_rows(sid, with_back=True)
 
@@ -813,7 +906,11 @@ def build_review_card(sid: str, session: dict[str, Any], found: list[dict], when
         f"**Action:** Set {_action_words(maint, test)}",
     ]
     if session.get("game_type"):
-        lines.append(f"**Game type:** {session.get('env_code')} · {session.get('game_type')}")
+        where = str(session.get("env_code") or "")
+        venue = str(session.get("venue") or "").strip().upper()
+        if venue:
+            where += f" ({_venue_label(session.get('env_code') or '', venue)})"
+        lines.append(f"**Game type:** {where} · {session.get('game_type')}")
     lines += [
         f"**Reminder:** {SST_REMINDER_LEAD_MIN} min before "
         f"({(when - timedelta(minutes=SST_REMINDER_LEAD_MIN)).strftime('%I:%M%p')})",
@@ -1253,11 +1350,20 @@ def resolve_session_target(session: dict[str, Any]) -> tuple[list[dict], str]:
     if mode == "game":
         env_code = str(session.get("env_code") or "").strip().upper()
         game_type = str(session.get("game_type") or "").strip()
+        venue = str(session.get("venue") or "").strip().upper()
         if not (env_code and game_type):
             return [], "Kindly select the environment and game type."
-        found = machines_for_game_type(env_code, game_type)
+        all_machines = machines_for_game_type(env_code, game_type)
+        choices = venues_for_game_type(env_code, game_type, all_machines)
+        if choices and not venue:
+            # Reachable only from a stale card: the venue step renders no Confirm button. Refuse
+            # rather than default to both venues — that guess is the whole bug.
+            return [], ("Kindly select the venue ("
+                        + " / ".join(v for v, _ in choices) + ").")
+        found = _filter_by_venue(env_code, all_machines, venue)
         if not found:
-            return [], f"{game_type} is not detected in {env_code}. Try again."
+            where = env_code + (f" ({_venue_label(env_code, venue)})" if venue else "")
+            return [], f"{game_type} is not detected in {where}. Try again."
         return found, ""
 
     tokens = parse_machine_lines(str(session.get("machines_text") or ""))
@@ -1416,25 +1522,36 @@ def handle_card_callback(
         m = str(parsed.get("m") or "").strip().lower()
         if m not in ("game", "machines"):
             return _toast("error", "Unknown target type.")
-        session = update_session(sid, mode=m, env_code="", game_type="") or session
+        session = update_session(sid, mode=m, env_code="", game_type="", venue="") or session
         return _card_reply(build_form_card(sid, session))
 
     if act == "back":
-        session = update_session(sid, mode="", env_code="", game_type="") or session
+        session = update_session(sid, mode="", env_code="", game_type="", venue="") or session
         return _card_reply(build_form_card(sid, session))
 
     if act == "env":
         code = str(parsed.get("e") or "").strip().upper()
         if code not in SST_ENV_CODES:
             return _toast("error", f"Unknown environment: {code}")
-        session = update_session(sid, env_code=code, game_type="") or session
+        session = update_session(sid, env_code=code, game_type="", venue="") or session
         return _card_reply(build_form_card(sid, session))
 
     if act == "gt":
         gt = str(parsed.get("g") or "").strip()
         if not gt:
             return _toast("error", "Unknown game type.")
-        session = update_session(sid, game_type=gt) or session
+        # Clear the venue: which venues exist is per game type, so a carried-over choice could
+        # silently target a venue this game type has none of.
+        session = update_session(sid, game_type=gt, venue="") or session
+        return _card_reply(build_form_card(sid, session))
+
+    if act == "venue":
+        v = str(parsed.get("v") or "").strip().upper()
+        env_code = str(session.get("env_code") or "").strip().upper()
+        allowed = set(SST_VENUE_SPLITS.get(env_code, ())) | {SST_VENUE_ALL}
+        if v not in allowed:
+            return _toast("error", f"Unknown venue: {v}")
+        session = update_session(sid, venue=v) or session
         return _card_reply(build_form_card(sid, session))
 
     if act == "confirm":
