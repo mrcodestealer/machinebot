@@ -654,6 +654,28 @@ def _checkcredit_send_image(chat_id: str, image_key: str, *, thread_root: Option
     return send_image_message(chat_id, image_key)
 
 
+# What still has to happen by hand once the recharge Detail is on screen. The screenshot only
+# *shows* that the credit left the cabinet — somebody still has to clear it and restart the
+# machine, and that ask was being typed out after every one of these cards.
+_CASHOUT_REBOOT_NOTICE = "Kindly manual cashout the credit and reboot the machine Thank you"
+
+
+def _cashout_reboot_notice() -> str:
+    """
+    The follow-up posted after a recharge Detail screenshot from ``/checkcredit`` (and
+    ``/checkcreditdate``) or ``/url`` (``/showurl``) — the two commands whose answer is "here is
+    the record, now go settle it".
+
+    ``/machineerror``, ``/checkmachinelog``, ``/stuckcredit`` and ``/npthirdhttp`` deliberately
+    stay silent: they answer a different question, and ``/stuckcredit`` already says in its own
+    words when the credit is genuinely stuck.
+
+    ``CASHOUT_REBOOT_NOTICE`` overrides the wording; set it empty to post nothing at all.
+    """
+    raw = os.getenv("CASHOUT_REBOOT_NOTICE")
+    return _CASHOUT_REBOOT_NOTICE if raw is None else raw.strip()
+
+
 def _set_checkcredit_np_pending(
     chat_id: str,
     payload: dict,
@@ -1735,6 +1757,12 @@ def run_checkcredit_finderror(
             _cc_send(text if text else "(no output)")
 
         if isinstance(np, dict):
+            # Which question this card answers, remembered for the buttons on it: /checkcredit
+            # and /checkcreditdate both arrive as "default" and end in "now clear it by hand";
+            # /machineerror is the same card shape asking about errors, and says nothing of the
+            # sort. The dispatcher collapses the command name into `mode`, so `mode` is all
+            # there is to tell them apart — and it is enough.
+            np["cashout_notice"] = str(mode or "").strip().lower() != "error_only"
             _set_checkcredit_np_pending(chat_id, np, thread_root=thread_root)
         # After the card, never before it: the model needs tens of seconds.
         jackpot_md = str(machine_query).strip()
@@ -2034,6 +2062,7 @@ def run_checkcredit_player_job(
         expected_credit=exp,
         machine_display=display_md,
         thread_root=root,
+        cashout_notice=True,
     )
 
 
@@ -2368,7 +2397,15 @@ def run_url_job(chat_id: str, machines: list[str], date_iso: str = "") -> None:
                     print(f"[url] card rejected for {md}: {resp!r}", flush=True)
             if not sent:
                 send_message(chat_id, caption)
-                send_image_message(chat_id, key)
+                img = send_image_message(chat_id, key)
+                sent = isinstance(img, dict) and img.get("code") == 0
+            # Per machine, right under its own card — a list of machines interleaves, so one
+            # notice at the end of the run would not say which cabinet it is about. Only once
+            # the Detail is on screen: a notice under a rejected send would be telling someone
+            # to act on a screenshot they never got.
+            notice = _cashout_reboot_notice() if sent else ""
+            if notice:
+                send_message(chat_id, notice)
         except Exception as e:
             send_message(chat_id, f"❌ `{mq}` ({idx}/{total}) — recharge Detail failed: {e}")
             print(f"[url] {mq}: {e!r}", flush=True)
@@ -2520,6 +2557,7 @@ def _np_run_screenshot_worker(
     success_caption: Optional[str] = None,
     not_found_caption: Optional[str] = None,
     time_short_candidates: Optional[list[str]] = None,
+    cashout_notice: bool = False,
 ) -> None:
     """
     NP / WF / DHS / NCH / CP / OSM / MDR / TBP Log Third Http → `recharge` Detail screenshot.
@@ -2528,6 +2566,10 @@ def _np_run_screenshot_worker(
     ``not_found_caption``: what "no matching Detail" *means* for the caller's question. The search
     itself succeeded there, so ``/stuckcredit`` reports "never transferred out" instead of a red
     failure; the scan detail still follows, for when the window really was too narrow.
+
+    ``cashout_notice``: post :func:`_cashout_reboot_notice` once the screenshot lands. Opt-in
+    because every command below shares this worker and only the ``/checkcredit`` family ends with
+    "now clear it by hand" — see the docstring there for who is deliberately left out.
     """
     root = (thread_root or _get_checkcredit_thread_root(chat_id) or "").strip() or None
 
@@ -2587,6 +2629,12 @@ def _np_run_screenshot_worker(
             r = send_image_message(chat_id, key)
         if r.get("code") != 0:
             _np_send(f"❌ Failed to send image: {r}")
+        elif cashout_notice:
+            # Only once the Detail is actually on screen — a notice under a failed send would be
+            # telling someone to act on a screenshot they never got.
+            notice = _cashout_reboot_notice()
+            if notice:
+                _np_send(notice)
     except Exception as e:
         err_s = str(e)
         not_found = isinstance(e, getattr(checkcredit, "NpDetailNotFound", ()))
@@ -2720,6 +2768,11 @@ def run_np_third_http_by_choice(chat_id: str, choice_idx: int) -> None:
         machine_substr=ms,
         expected_credit=exp,
         machine_display=md,
+        # Stamped when the card was built (default → /checkcredit family, error_only →
+        # /machineerror). Every card that reaches here today carries the flag; the default
+        # only covers a future producer that forgets to stamp one, and /checkcredit is the
+        # answer that fits every card this button belongs to.
+        cashout_notice=bool(pend.get("cashout_notice", True)),
     )
 
 

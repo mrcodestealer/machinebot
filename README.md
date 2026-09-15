@@ -29,11 +29,19 @@ Runs on its own Lark app in **persistent connection** mode (Subscription mode �
 | `/checkmachinelog <machine> [date]` | logic-log card + AI summary (+ Third Http follow-up) |
 | `/stuckcredit <machine> [date]` | stuck credit: log + Third Http transfer-out check |
 | `/npthirdhttp <player_id> [YYYY-MM-DD HH:MM:SS.mmm]` | NP/WF/DHS/NCH/CP/OSM/MDR/TBP Third Http Detail screenshot |
+| `/url <machine(s)> [YYYY-MM-DD]` (`/showurl`) | Third Http recharge Detail of each machine's latest player, one card each |
 | `/cctvshot <machine>` | EGM CCTV screenshot (no credit check) — `/cctv` is the CCTV **encoder** stream |
 | `/al [DD/MM]` | Amount Loss (CHECKLOG) card + copy-for-sheet TSV |
 | reply `1`–`4` after an NP prompt | Third Http Detail for the picked player |
 | paste a **Missing Credit** alert (@bot) | parses account/amount/date → checkcredit form card |
 | `/deploy` (or "git pull origin main and restart service") | git pull + restart the `machine` systemd unit |
+
+After `/checkcredit` (and `/checkcreditdate`) or `/url` posts a recharge Detail
+screenshot, the bot follows it with **"Kindly manual cashout the credit and reboot the
+machine Thank you"** — the screenshot only shows that the credit left the cabinet, someone
+still has to clear it and restart the machine. `CASHOUT_REBOOT_NOTICE` in `.env` changes the
+wording; set it empty to post nothing. `/machineerror`, `/checkmachinelog`, `/stuckcredit`
+and `/npthirdhttp` answer a different question and stay silent.
 
 The `/wm` machine dashboard (webmachine blueprint) is served on the bot's Flask port
 (`PORT`, default 5010) with a background scrape loop that rewrites `webmachine_data.json`.
