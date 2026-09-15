@@ -628,8 +628,13 @@ def _machine_asset_digits_from_name(name: str) -> str | None:
     return None
 
 
+_ASSET_ID_ANYWHERE_RE = re.compile(
+    r"(?:NWR|NCH|NC|NP|TBR|TBP|MDR|DHS|CP|OSM|WF|WINFORD)(\d+)"
+)
+
+
 def _query_asset_digits_from_key(key_alnum: str) -> str | None:
-    """Trailing asset id digits parsed from a user token (``TP8674``, ``8673``, full title, …)."""
+    """Asset id digits parsed from a user token (``TP8674``, ``8673``, ``NCH1122 Blue Festival``)."""
     key_alnum = (key_alnum or "").upper()
     m = re.search(
         r"(?:NWR|NCH|NC|NP|TBR|TBP|MDR|DHS|CP|OSM|WF|WINFORD)(\d+)$",
@@ -637,6 +642,13 @@ def _query_asset_digits_from_key(key_alnum: str) -> str | None:
     )
     if m:
         return m.group(1)
+    # The asset id is not always last. People paste "NCH1122 Blue Festival" while the table
+    # stores "Blue Festival-NCH1122", so neither the substring nor the suffix test can line the
+    # two up and the whole line read as "not detected". A site prefix immediately followed by
+    # digits is a reliable asset id wherever it sits in the token.
+    anywhere = list(_ASSET_ID_ANYWHERE_RE.finditer(key_alnum))
+    if anywhere:
+        return anywhere[-1].group(1)
     m2 = re.search(r"(\d+)$", key_alnum)
     return m2.group(1) if m2 else None
 
@@ -4138,6 +4150,107 @@ def _prod_batch_cleanup_screenshot_paths(paths: list[str]) -> None:
             pass
 
 
+def _prod_batch_render_summary_card(
+    summary: dict,
+    *,
+    action: str,
+    chat_id: str,
+    machines: list,
+    send_message,
+    with_screenshots: bool = True,
+) -> None:
+    """
+    Render + send the job SUMMARY card.
+
+    Split out so it can be sent from `on_summary_ready` -- i.e. as soon as every machine is
+    verified -- instead of only after the screenshot pass, which is a separate and much
+    slower walk of the EGM table. `with_screenshots` is False on that early call; the
+    screenshots are sent afterwards by the caller.
+    """
+    from prod_machine_batch import ACTION_LABELS
+
+    ok_n = len(summary.get("success") or [])
+    fail_n = len(summary.get("failed") or [])
+    failed = list(summary.get("failed") or [])
+    from prod_machine_batch import _failure_is_game_running, applicable_max_retries
+
+    max_r = applicable_max_retries(failed)
+    all_game_running = bool(failed) and all(
+        _failure_is_game_running(str(m.get("error") or ""), m.get("live")) for m in failed
+    )
+
+    if fail_n and action == "set_maint" and all_game_running:
+        lines = [
+            f"❌ **Set maintenance** failed after **{max_r}** attempts.",
+            f"All **{max_r}** attempts were **game currently running**.",
+            "",
+        ]
+        if ok_n:
+            lines.append(f"✅ **Done ({ok_n}):**")
+            for m in (summary.get("success") or [])[:30]:
+                lines.append(f"✓ {m.get('belongs')} — {m.get('machine')}")
+            if ok_n > 30:
+                lines.append(f"... and {ok_n - 30} more done")
+            lines.append("")
+            lines.append(f"❌ **Still failed ({fail_n}):**")
+        for m in failed[:30]:
+            lines.append(f"• {m.get('belongs')} — {m.get('machine')}")
+        if fail_n > 30:
+            lines.append(f"... and {fail_n - 30} more")
+        _prod_batch_send_lark_md(
+            chat_id,
+            "Failed — game currently running",
+            "\n".join(lines),
+            send_message,
+            header_template="red",
+        )
+        _prod_batch_send_machine_screenshots_background(chat_id, machines, summary, send_message)
+        return
+
+    lines = [
+        f"**SUMMARY — {ACTION_LABELS.get(action, action)}**",
+        f"Success: {ok_n}",
+        f"Failed: {fail_n}",
+    ]
+    # Show the requested total whenever it does not equal ok+failed, so a machine that fell
+    # out of both lists is visible instead of silently rendering as a clean success.
+    req_n = int(summary.get("requested") or 0)
+    unaccounted = req_n - (ok_n + fail_n) if req_n else 0
+    if unaccounted:
+        lines.append(f"Requested: {req_n}  ⚠️ **{unaccounted} unaccounted**")
+    lines.append("")
+    for m in (summary.get("success") or [])[:30]:
+        # A machine that already satisfied the request was never clicked — say so, rather
+        # than showing it identically to one the bot actually changed.
+        if m.get("skipped"):
+            why = str(m.get("skip_reason") or "already in the requested state")
+            lines.append(
+                f"✓ {m.get('belongs')} — {m.get('machine')}  ({why}) will skip this machine"
+            )
+        else:
+            lines.append(f"✓ {m.get('belongs')} — {m.get('machine')}")
+    if ok_n > 30:
+        lines.append(f"... and {ok_n - 30} more done")
+    if fail_n:
+        lines.append("")
+        lines.append("**Still failed:**")
+    for m in (summary.get("failed") or [])[:30]:
+        err = (m.get("error") or "").strip()
+        suffix = f" ({err})" if err else ""
+        lines.append(f"✗ {m.get('belongs')} — {m.get('machine')}{suffix}")
+    if fail_n > 30:
+        lines.append(f"... and {fail_n - 30} more failed")
+    tpl = "red" if (fail_n or unaccounted) else "green"
+    title = (
+        f"Failed — {ACTION_LABELS.get(action, action)}"
+        if fail_n
+        else f"Success — {ACTION_LABELS.get(action, action)}"
+    )
+    _prod_batch_send_lark_md(chat_id, title, "\n".join(lines), send_message, header_template=tpl)
+    if with_screenshots:
+        _prod_batch_send_machine_screenshots_background(chat_id, machines, summary, send_message)
+
+
 def _prod_batch_send_machine_screenshots_background(
     chat_id: str,
     machines: list[dict],
@@ -4352,10 +4465,13 @@ def _run_prod_batch_bot_job_thread(
         from prod_machine_batch import (
             PHASE_LABELS,
             _failure_is_game_running,
-            _max_phase_retries,
+            applicable_max_retries,
         )
 
-        max_r = _max_phase_retries()
+        # The cap depends on WHY these machines failed: "game currently running" is waited out
+        # with a much larger budget. Use the same function the retry loop uses, so the card can
+        # never advertise a limit the loop does not honour.
+        max_r = applicable_max_retries(failed)
         done = done or []
         is_final = attempt >= max_r
         game_running = bool(failed) and all(
@@ -4428,6 +4544,25 @@ def _run_prod_batch_bot_job_thread(
         )
 
     cancelled = False
+
+    def _send_summary_card(summ: dict) -> None:
+        """Render + send the SUMMARY card. Called from `on_summary_ready` so the result lands
+        BEFORE the screenshot walk (which is a second, slower pass over the table) instead of
+        after every screenshot has been captured."""
+        _prod_batch_render_summary_card(
+            summ, action=action, chat_id=chat_id, machines=machines,
+            send_message=send_message, with_screenshots=False,
+        )
+
+    def on_summary_ready(summ: dict) -> None:
+        try:
+            with _PROD_BATCH_JOBS_LOCK:
+                if _PROD_BATCH_JOBS.get(job_id, {}).get("cancel_requested"):
+                    return
+            _send_summary_card(summ)
+        except Exception:
+            logger.exception("prod-batch early summary card failed for %s", job_id)
+
     try:
         summary = run_prod_batch_job(
             action,
@@ -4439,6 +4574,7 @@ def _run_prod_batch_bot_job_thread(
             on_phase_retry=on_phase_retry,
             on_phase_continue=on_phase_continue,
             on_env_start=on_env_start,
+            on_summary_ready=on_summary_ready,
         )
         with _PROD_BATCH_JOBS_LOCK:
             cancelled = bool(_PROD_BATCH_JOBS.get(job_id, {}).get("cancel_requested"))
@@ -4452,84 +4588,14 @@ def _run_prod_batch_bot_job_thread(
             _prod_batch_send_cancel_live_summary(job_id, send_message)
             return
 
-        ok_n = len(summary.get("success") or [])
-        fail_n = len(summary.get("failed") or [])
-        failed = list(summary.get("failed") or [])
-        from prod_machine_batch import _failure_is_game_running, _max_phase_retries
-
-        max_r = _max_phase_retries()
-        all_game_running = bool(failed) and all(
-            _failure_is_game_running(str(m.get("error") or ""), m.get("live")) for m in failed
-        )
-
-        if fail_n and action == "set_maint" and all_game_running:
-            lines = [
-                f"❌ **Set maintenance** failed after **{max_r}** attempts.",
-                f"All **{max_r}** attempts were **game currently running**.",
-                "",
-            ]
-            if ok_n:
-                lines.append(f"✅ **Done ({ok_n}):**")
-                for m in (summary.get("success") or [])[:30]:
-                    lines.append(f"✓ {m.get('belongs')} — {m.get('machine')}")
-                if ok_n > 30:
-                    lines.append(f"... and {ok_n - 30} more done")
-                lines.append("")
-                lines.append(f"❌ **Still failed ({fail_n}):**")
-            for m in failed[:30]:
-                lines.append(f"• {m.get('belongs')} — {m.get('machine')}")
-            if fail_n > 30:
-                lines.append(f"... and {fail_n - 30} more")
-            _prod_batch_send_lark_md(
-                chat_id,
-                "Failed — game currently running",
-                "\n".join(lines),
-                send_message,
-                header_template="red",
+        if summary.get("summary_already_sent"):
+            # The card went out from on_summary_ready before the screenshot pass.
+            pass
+        else:
+            _prod_batch_render_summary_card(
+                summary, action=action, chat_id=chat_id, machines=machines,
+                send_message=send_message, with_screenshots=False,
             )
-            _prod_batch_send_machine_screenshots_background(chat_id, machines, summary, send_message)
-            return
-
-        lines = [
-            f"**SUMMARY — {ACTION_LABELS.get(action, action)}**",
-            f"Success: {ok_n}",
-            f"Failed: {fail_n}",
-        ]
-        # Show the requested total whenever it does not equal ok+failed, so a machine that fell
-        # out of both lists is visible instead of silently rendering as a clean success.
-        req_n = int(summary.get("requested") or 0)
-        unaccounted = req_n - (ok_n + fail_n) if req_n else 0
-        if unaccounted:
-            lines.append(f"Requested: {req_n}  ⚠️ **{unaccounted} unaccounted**")
-        lines.append("")
-        for m in (summary.get("success") or [])[:30]:
-            # A machine that already satisfied the request was never clicked — say so, rather
-            # than showing it identically to one the bot actually changed.
-            if m.get("skipped"):
-                why = str(m.get("skip_reason") or "already in the requested state")
-                lines.append(
-                    f"✓ {m.get('belongs')} — {m.get('machine')}  ({why}) will skip this machine"
-                )
-            else:
-                lines.append(f"✓ {m.get('belongs')} — {m.get('machine')}")
-        if ok_n > 30:
-            lines.append(f"... and {ok_n - 30} more done")
-        if fail_n:
-            lines.append("")
-            lines.append("**Still failed:**")
-        for m in (summary.get("failed") or [])[:30]:
-            err = (m.get("error") or "").strip()
-            suffix = f" ({err})" if err else ""
-            lines.append(f"✗ {m.get('belongs')} — {m.get('machine')}{suffix}")
-        if fail_n > 30:
-            lines.append(f"... and {fail_n - 30} more failed")
-        tpl = "red" if (fail_n or unaccounted) else "green"
-        title = (
-            f"Failed — {ACTION_LABELS.get(action, action)}"
-            if fail_n
-            else f"Success — {ACTION_LABELS.get(action, action)}"
-        )
-        _prod_batch_send_lark_md(chat_id, title, "\n".join(lines), send_message, header_template=tpl)
         _prod_batch_send_machine_screenshots_background(chat_id, machines, summary, send_message)
     except Exception as exc:
         logger.exception("prod-batch bot job %s failed", job_id)

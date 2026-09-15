@@ -3159,6 +3159,41 @@ except ValueError:
     NP_BACKEND_MAX_PAGES = 20
 
 
+class NpDetailNotFound(RuntimeError):
+    """
+    The Third Http search ran fine, rows were read, and **no** recharge Detail matched.
+
+    A finding, not a fault: for ``/stuckcredit`` it is the answer — the player never transferred
+    the credit out. Callers should say so rather than report a failure.
+    """
+
+
+def _np_reference_direction(blob: str) -> str:
+    """
+    ``"in"`` / ``"out"`` / ``""`` from the Request ``reference``, whose suffix names the leg:
+    ``"bzzf00011135296821a084fafac9-in"`` is credit into the cabinet,
+    ``"superburstlink31081210884041a0686afcac-ou"`` is the cash-out.
+
+    This is the reliable direction signal. The amount sign agrees with it on the backends seen so
+    far (in -> negative, out -> positive), but the reference states it outright.
+    """
+    if not blob:
+        return ""
+    m = re.search(
+        r"""["']?reference["']?\s*:\s*["']([^"']*)["']""",
+        _np_normalize_jsonish_quotes(blob),
+        re.I,
+    )
+    if not m:
+        return ""
+    ref = m.group(1).strip().lower()
+    if ref.endswith("-in"):
+        return "in"
+    if ref.endswith("-ou") or ref.endswith("-out"):
+        return "out"
+    return ""
+
+
 def _np_require_positive_amount() -> bool:
     """
     A recharge Detail must have a **positive** Request ``amount``.
@@ -3899,6 +3934,39 @@ def _np_machine_id_contains_substr(machine_substr: str | None, machine_id_value:
     return False
 
 
+def _np_scaled_amount_tolerance() -> float:
+    """
+    How far a **derived** (doubled / halved) credit may sit from the booked amount.
+
+    Halving an odd credit gives a .5, and a cabinet booking whole units rounds it; doubling
+    inherits whatever rounding already happened. +-1 covers that. ``NP_BACKEND_SCALED_TOLERANCE``
+    overrides it; the credit as read still uses ``NP_BACKEND_AMOUNT_EPS``.
+    """
+    try:
+        return max(
+            0.0,
+            float(os.environ.get("NP_BACKEND_SCALED_TOLERANCE", "1").strip() or "1"),
+        )
+    except ValueError:
+        return 1.0
+
+
+def machine_credit_amount_windows(credit: float | None) -> list[tuple[float, float]]:
+    """
+    ``[(value, tolerance), ...]`` for the three forms a backend may book the same credit in.
+
+    The credit as shown gets the exact-match eps; doubled and halved get
+    :func:`_np_scaled_amount_tolerance` (default +-1), because those are derived numbers and the
+    cabinet's denomination rounds them.
+    """
+    values = machine_credit_amount_candidates(credit)
+    if not values:
+        return []
+    tol = _np_scaled_amount_tolerance()
+    eps = _np_amount_match_eps()
+    return [(v, eps if i == 0 else tol) for i, v in enumerate(values)]
+
+
 def machine_credit_amount_candidates(credit: float | None) -> list[float]:
     """
     The same cabinet credit written the three ways a backend may record it: as shown, doubled,
@@ -3950,10 +4018,10 @@ def _np_detail_matches_credit_and_machine_id(
     A negative ``amount`` is rejected outright (see :func:`_np_require_positive_amount`): that row
     is credit going into the cabinet, so it is the wrong Detail however well it matches otherwise.
 
-    ``expected_credit_any``: accept the row when the amount is within eps of **any** value in the
-    list, and ignore ``expected_credit`` for the comparison. ``/url`` passes the machine credit
-    read off the cabinet plus its x2 / /2 forms
-    (:func:`machine_credit_amount_candidates`).
+    ``expected_credit_any``: accept the row when the amount matches **any** entry, and ignore
+    ``expected_credit`` for the comparison. Entries are either a bare value (matched to eps) or a
+    ``(value, tolerance)`` pair. ``/url`` passes :func:`machine_credit_amount_windows`, so the
+    credit as read matches exactly while its doubled / halved forms allow +-1.
     """
     mid, amt = _np_parse_machine_amount_from_request_blob(req_blob)
     if mid is None:
@@ -3968,7 +4036,16 @@ def _np_detail_matches_credit_and_machine_id(
             return False
         scaled_any = float(amt) / (amount_scale if amount_scale and amount_scale > 0 else 1.0)
         eps = _np_amount_match_eps()
-        return any(abs(scaled_any - float(c)) <= eps for c in candidates)
+        for cand in candidates:
+            # Either a bare value (eps) or a (value, tolerance) pair from
+            # machine_credit_amount_windows, where derived forms carry a wider band.
+            if isinstance(cand, (tuple, list)) and len(cand) >= 2:
+                want, tol = float(cand[0]), abs(float(cand[1]))
+            else:
+                want, tol = float(cand), eps
+            if abs(scaled_any - want) <= max(tol, eps):
+                return True
+        return False
     if expected_credit is None:
         # Machine-only match (e.g. TBP fallback): accept a missing amount; reject an exactly-zero
         # one (and, above, a negative one).
@@ -4233,7 +4310,10 @@ def _np_try_screenshot_matching_detail(
         blob = _np_detail_request_section(full_txt)
         mid_p, amt_p = _np_parse_machine_amount_from_request_blob(blob or layers or full_txt)
         if scan_stats is not None and len(scan_stats.get("sample_mids") or []) < 8:
-            scan_stats.setdefault("sample_mids", []).append((mid_p, amt_p))
+            # Direction too: "@-1010.0" alone looks like a bug, "@-1010.0 (in)" explains itself.
+            scan_stats.setdefault("sample_mids", []).append(
+                (mid_p, amt_p, _np_reference_direction(blob or layers or full_txt))
+            )
         # Same layer order as before, but remember *which* text matched so the reported
         # machineId / amount come from the layer the decision was made on — not from a
         # different layer that happened to parse first.

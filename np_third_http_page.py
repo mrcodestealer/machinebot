@@ -339,12 +339,17 @@ def np_third_http_run_search_and_screenshot(
                 )
             samples = scan_stats.get("sample_mids") or []
             if samples:
+                def _sample(entry) -> str:
+                    mid_s, amt_s = entry[0], entry[1]
+                    direction = entry[2] if len(entry) > 2 else ""
+                    return f"{mid_s or '?'}@{amt_s}" + (f" ({direction})" if direction else "")
+
                 hint += " Sample Detail machineId/amount: " + ", ".join(
-                    f"{m or '?'}@{a}" for m, a in samples[:5]
+                    _sample(e) for e in samples[:5]
                 ) + "."
             elif int(scan_stats.get("recharge_rows") or 0) == 0:
                 hint += " No recharge rows in table — check date/UserId filters or stale warm browser."
-            raise RuntimeError(
+            raise cc.NpDetailNotFound(
                 f"No {_log_http_backend_tag} Detail on pages 1–{cc.NP_BACKEND_MAX_PAGES} with {crit}.{hint} "
                 "Increase NP_BACKEND_MAX_PAGES or NP_BACKEND_WINDOW_MINUTES."
             )

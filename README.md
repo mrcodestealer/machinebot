@@ -23,6 +23,7 @@ Runs on its own Lark app in **persistent connection** mode (Subscription mode �
 | `/osmwatch [url]` | OSM-Watch dashboard screenshot (warm browser) |
 | `/loginosmwatch` | force a fresh OSM-Watch login QR (posted to the lab group) |
 | `/checkcredit <machine> [YYYY-MM-DD]` | today's/dated log → latest players → NP choice card (Third Http) |
+| `/checkcredit <machine> <player id> [YYYY-MM-DD]` | one player's latest transfer-out Detail — machine and player may be written in either order |
 | `/checkcreditdate` | interactive card: machine + player + date → Third Http Detail |
 | `/machineerror <machine> [date]` | latest two players, error context screenshots only |
 | `/checkmachinelog <machine> [date]` | logic-log card + AI summary (+ Third Http follow-up) |
