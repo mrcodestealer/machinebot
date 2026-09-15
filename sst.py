@@ -50,9 +50,39 @@ SST_ALLOWED_CHAT_IDS: tuple[str, ...] = tuple(
 # Fallback target when a stored schedule predates per-chat tracking.
 SST_ALLOWED_CHAT_ID = SST_ALLOWED_CHAT_IDS[0]
 
+# A **private** chat is narrower than a group: in the designated groups the team can see each
+# other's cards and catch a mistake, while a PM is unwitnessed, so it is restricted to named
+# operators. Override with ``SST_ALLOWED_PM_OPEN_IDS`` (comma/space separated open_ids).
+_DEFAULT_ALLOWED_PM_OPEN_IDS = ("ou_25f5d54bda075158f85c0272c602a0a0",)
+
+SST_ALLOWED_PM_OPEN_IDS: tuple[str, ...] = tuple(
+    x for x in re.split(r"[,\s;]+", _os.environ.get("SST_ALLOWED_PM_OPEN_IDS", "").strip()) if x
+) or _DEFAULT_ALLOWED_PM_OPEN_IDS
+
 
 def chat_allowed(chat_id: str) -> bool:
+    """One of the designated group chats — anyone in them may drive ``/sst``."""
     return (chat_id or "").strip() in SST_ALLOWED_CHAT_IDS
+
+
+def pm_allowed(sender_id: str) -> bool:
+    """This operator may drive ``/sst`` from a private chat."""
+    return (sender_id or "").strip() in SST_ALLOWED_PM_OPEN_IDS
+
+
+def access_allowed(chat_id: str, *, sender_id: str = "", is_pm: bool = False) -> bool:
+    """
+    Who may drive ``/sst``: a designated group (anyone in it) or a private chat (named operators).
+
+    A private chat carries its own ``oc_`` id exactly like a group does, so p2p cannot be told from
+    the chat id — callers pass ``is_pm`` from the message event's ``chat_type``. Card callbacks get
+    no ``chat_type`` from Lark at all, which is why the button gate is written as
+    ``chat_allowed(chat) or pm_allowed(sender)``: in a group that is today's behaviour unchanged,
+    and in a PM the chat is not on the list so only the operator's own open_id passes.
+    """
+    if is_pm:
+        return pm_allowed(sender_id)
+    return chat_allowed(chat_id)
 
 _SESSIONS: dict[str, dict[str, Any]] = {}
 _SESSIONS_LOCK = threading.Lock()
@@ -1447,6 +1477,7 @@ def handle_card_callback(
     send_card: Callable[[str, dict], Any],
     send_text: Callable[[str, str], Any],
     run_batch: Callable[[str, str, list[dict]], Any],
+    sender_id: str = "",
 ) -> dict[str, Any] | None:
     """
     Handle every ``/sst`` button. Returns the synchronous card.callback body, or ``None`` when the
@@ -1457,8 +1488,10 @@ def handle_card_callback(
     act = str(parsed.get("a") or "").strip().lower()
     sid = str(parsed.get("s") or "").strip()
 
-    if not chat_allowed(chat_id):
-        return _toast("error", "/sst is only available in the designated group.")
+    # Buttons carry the same gate as the command — a check only the command honours is no check
+    # at all, since the card is what actually schedules the change. See :func:`access_allowed`.
+    if not (chat_allowed(chat_id) or pm_allowed(sender_id)):
+        return _toast("error", "You are not allowed to use /sst here.")
 
     # Delete from /sstlist — operates on the persisted store, not a live form session.
     if act == "del":

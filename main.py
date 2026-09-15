@@ -3530,8 +3530,11 @@ def _handle_machine_message(
         try:
             import sst as _sst_mod
 
-            if not _sst_mod.chat_allowed(chat_id):
-                send_message(chat_id, "🚫 `/sst` is only available in the designated group.")
+            _sst_is_pm = (chat_type == "p2p")
+            if not _sst_mod.access_allowed(chat_id, sender_id=sender_id or "", is_pm=_sst_is_pm):
+                send_message(chat_id, "🚫 `/sst` is not available in this private chat."
+                             if _sst_is_pm else
+                             "🚫 `/sst` is only available in the designated group.")
                 return
             _sst_sid = _sst_mod.new_session(chat_id, thread_root=_thread_root_for_prod_batch())
             _sst_sess = _sst_mod.get_session(_sst_sid) or {}
@@ -3553,8 +3556,11 @@ def _handle_machine_message(
         try:
             import sst as _sst_mod
 
-            if not _sst_mod.chat_allowed(chat_id):
-                send_message(chat_id, "🚫 `/sstlist` is only available in the designated group.")
+            _sl_is_pm = (chat_type == "p2p")
+            if not _sst_mod.access_allowed(chat_id, sender_id=sender_id or "", is_pm=_sl_is_pm):
+                send_message(chat_id, "🚫 `/sstlist` is not available in this private chat."
+                             if _sl_is_pm else
+                             "🚫 `/sstlist` is only available in the designated group.")
                 return
             send_message(
                 chat_id, json.dumps(_sst_mod.build_list_card()), msg_type="interactive"
@@ -4271,6 +4277,7 @@ def lark_webhook():
                         send_card=_sst_send_card,
                         send_text=send_message,
                         run_batch=_sst_run_batch,
+                        sender_id=sender_id_ca or "",
                     )
                     if _sst_resp is not None:
                         if eid_ca:
