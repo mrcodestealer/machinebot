@@ -3262,6 +3262,7 @@ _HELP_TEXT = (
     "• `/sm` — set-machine wizard (env → action → machines)\n"
     "• `/sst` — scheduled set maintenance/test form (date + time, auto-runs; one group only)\n"
     "• `/sstlist` — pending scheduled runs, with a Delete button each\n"
+    "• `/setgt` — set maintenance/test for a whole **game type**, runs now (no date/time)\n"
     "• `/stresstest <paste announcement>` — one-time reminder 10 min before the set time\n"
     "• paste a maintenance schedule (with @bot) — auto reminder 10 min before\n"
     "• `machine status NWR2008` — read-only status from the live scrape\n"
@@ -3600,6 +3601,35 @@ def _handle_machine_message(
             print(f"❌ sst: {_sst_err!r}", flush=True)
             try:
                 send_message(chat_id, f"❌ /sst failed: {_sst_err}")
+            except Exception:
+                pass
+        return
+
+    # ---- /setgt — immediate Set Maintenance / Test by game type (no date/time) ----
+    # Same gate as /sst: it makes the same PROD change, only without the scheduler in between.
+    # In a group the bot only sees the message when it is @mentioned, so "tag the bot and send
+    # /setgt" is already what reaching this branch means.
+    if cmd in ("/setgt", "/setgametype"):
+        try:
+            import setgt as _setgt_mod
+
+            _gt_is_pm = (chat_type == "p2p")
+            if not _setgt_mod.access_allowed(chat_id, sender_id=sender_id or "", is_pm=_gt_is_pm):
+                send_message(chat_id, "🚫 `/setgt` is not available in this private chat."
+                             if _gt_is_pm else
+                             "🚫 `/setgt` is only available in the designated group.")
+                return
+            _gt_sid = _setgt_mod.new_session(chat_id, thread_root=_thread_root_for_prod_batch())
+            _gt_sess = _setgt_mod.get_session(_gt_sid) or {}
+            send_message(
+                chat_id,
+                json.dumps(_setgt_mod.build_form_card(_gt_sid, _gt_sess)),
+                msg_type="interactive",
+            )
+        except Exception as _gt_err:
+            print(f"❌ setgt: {_gt_err!r}", flush=True)
+            try:
+                send_message(chat_id, f"❌ /setgt failed: {_gt_err}")
             except Exception:
                 pass
         return
@@ -4338,6 +4368,26 @@ def lark_webhook():
                         return _lark_http_card_callback_response(_sst_resp)
             except Exception as _sst_sync_err:
                 print(f"❌ sst card callback failed: {_sst_sync_err!r}", flush=True)
+
+            # /setgt buttons update the card IN-PLACE — same 3s window as /sst. The card carries
+            # no form, so there is no form_value to fold back in: every choice is a button.
+            try:
+                import setgt as _setgt_sync
+
+                if str(parsed_sync.get("k") or "").strip().lower() == _setgt_sync.SETGT_CARD_KEY:
+                    _gt_resp = _setgt_sync.handle_card_callback(
+                        parsed_sync,
+                        chat_id=chat_id_ca or "",
+                        send_card=_sst_send_card,
+                        run_batch=_sst_run_batch,
+                        sender_id=sender_id_ca or "",
+                    )
+                    if _gt_resp is not None:
+                        if eid_ca:
+                            _remember_processed_message_id(str(eid_ca))
+                        return _lark_http_card_callback_response(_gt_resp)
+            except Exception as _gt_sync_err:
+                print(f"❌ setgt card callback failed: {_gt_sync_err!r}", flush=True)
 
             # /sm wizard env pick updates the card IN-PLACE — must answer inside the 3s window.
             try:
