@@ -1,24 +1,28 @@
 """
-``/setgt`` — **immediate** Set-Maintenance / Set-Test for one game type.
+``/setgt`` and ``/set`` — **immediate** Set-Maintenance / Set-Test.
 
-The sibling of :mod:`sst`, with the scheduling removed. ``/sst`` asks for a date and a time
-because it parks the work on the scheduler; ``/setgt`` runs the moment the second confirmation is
-tapped, so a date/time picker would be noise — and the target is **always** a game type, never a
-pasted machine list.
+Both are :mod:`sst` with the scheduling removed. ``/sst`` asks for a date and a time because it
+parks the work on the scheduler; these run the moment the second confirmation is tapped, so a
+date/time picker would be noise. They differ only in what they target:
+
+* ``/setgt`` — one **game type**: environment → game type → venue wizard, all buttons.
+* ``/set``   — a pasted **machine list**: one textarea, the same one ``/sst`` uses, so
+  ``NWR2000-NWR2020`` ranges, ``DHS3106 DHS3107`` runs and full display names all work
+  identically in both.
 
 Flow
 ----
-1. ``@bot /setgt`` posts a form card: **Maintenance** / **Test** toggle buttons and the game-type
-   wizard (environment → game type → venue, when the game type spans two venues).
+1. ``@bot /setgt`` (or ``@bot /set``) posts a form card: **Maintenance** / **Test** toggle
+   buttons plus the game-type wizard or the machines box.
 2. Every button updates the card in place inside Lark's 3 s card-callback window.
-3. **Confirm** resolves the game type against ``webmachine_data.json`` and shows a **review card**
+3. **Confirm** resolves the target against ``webmachine_data.json`` and shows a **review card**
    listing every machine that will be changed.
 4. Confirming the review card posts the "Now will start set …" card and fires the prod-batch job
    immediately — nothing is persisted, because there is no future run to survive a restart.
 
-The environment / game-type / venue catalogue, the machine renderer and the access gate are all
-reused from :mod:`sst` so the two commands can never drift apart on what a game type means or on
-who is allowed to drive a PROD change.
+The catalogue, the machine tokenizer/resolver, the renderer and the access gate are all reused
+from :mod:`sst`, so the three commands can never drift apart on what a game type or a machine
+reference means, or on who is allowed to drive a PROD change.
 """
 
 from __future__ import annotations
@@ -42,6 +46,13 @@ venues_for_game_type = _sst.venues_for_game_type
 machine_lines = _sst.machine_lines
 selection_text = _sst.selection_text
 selection_action = _sst.selection_action
+# /set reuses /sst's tokenizer wholesale — ranges, concatenated runs and display names included.
+parse_machine_lines_with_ranges = _sst.parse_machine_lines_with_ranges
+resolve_machines = _sst.resolve_machines
+
+# What a session targets.
+TARGET_GAME = "game"
+TARGET_MACHINES = "machines"
 
 
 def chat_allowed(chat_id: str) -> bool:
@@ -77,15 +88,21 @@ def _cleanup_sessions() -> None:
             _SESSIONS.pop(sid, None)
 
 
-def new_session(chat_id: str, *, thread_root: str | None = None) -> str:
+def new_session(chat_id: str, *, target: str = TARGET_GAME,
+                thread_root: str | None = None) -> str:
+    """``target`` is fixed for the life of the session — it is which command was typed."""
     _cleanup_sessions()
     sid = uuid.uuid4().hex[:12]
     with _SESSIONS_LOCK:
         _SESSIONS[sid] = {
             "chat_id": chat_id,
             "thread_root": (thread_root or "").strip() or None,
+            # "game" (/setgt) | "machines" (/set) — never changes; there is no target picker,
+            # because the command the operator typed already said which one they meant.
+            "target": TARGET_MACHINES if target == TARGET_MACHINES else TARGET_GAME,
             "maint": False,
             "test": False,
+            "machines_text": "",
             "env_code": "",
             "game_type": "",
             # venue inside a split environment: "" (not chosen) | "NCH" | "DYB" | "ALL"
@@ -207,13 +224,96 @@ def _back_row(sid: str) -> dict:
     ])
 
 
+# The machines box is the one place this card needs a Lark ``form`` container, and inside a form
+# every interactive component must carry a ``name`` and a ``form_action_type`` or Lark rejects the
+# whole card. ``submit`` (not a plain button) is what makes the typed text reach the callback as
+# ``form_value`` — without it a toggle would re-render the card with an empty box. Mirrors
+# :func:`sst._form_button`.
+def _form_button(label: str, name: str, value: dict, *, kind: str = "default") -> dict:
+    return {
+        "tag": "button",
+        "name": name,
+        "text": {"tag": "plain_text", "content": label[:60]},
+        "type": kind,
+        "form_action_type": "submit",
+        "behaviors": [{"type": "callback", "value": {"k": SETGT_CARD_KEY, **value}}],
+    }
+
+
+def _form_toggle_button(label: str, *, on: bool, sid: str, which: str) -> dict:
+    return _form_button(("✅ " if on else "") + label, f"setgt_toggle_{which}",
+                        {"a": "toggle", "s": sid, "w": which},
+                        kind="primary" if on else "default")
+
+
+def _machines_input(value: str) -> dict:
+    el: dict[str, Any] = {
+        "tag": "input",
+        "name": "setgt_machines",
+        "input_type": "multiline_text",
+        "rows": 8,
+        "auto_resize": True,
+        "max_rows": 20,
+        "width": "fill",
+        "label": {"tag": "plain_text", "content": "Machines (one per line)"},
+        "label_position": "top",
+        "placeholder": {"tag": "plain_text",
+                        "content": "NWR2205\nNWR2206\nNWR2000-NWR2020"},
+        # Not ``required``: the toggles submit this form, and Lark would block the toggle while
+        # the box is still empty. Confirm validates it instead.
+        "required": False,
+        # Lark hard-caps form input max_length at 1000; anything larger fails the whole card.
+        "max_length": 1000,
+    }
+    if value:
+        el["default_value"] = value
+    return el
+
+
+def _build_machines_card(sid: str, session: dict[str, Any], *, error: str = "") -> dict:
+    """``/set`` — the toggles and one machines box, inside a form so the text reaches us."""
+    maint = bool(session.get("maint"))
+    test = bool(session.get("test"))
+    form_elements: list[dict] = [
+        {"tag": "div", "text": {"tag": "lark_md", "content": "**What to set** — tap to select:"}},
+        _btn_row([
+            _form_toggle_button("Maintenance", on=maint, sid=sid, which="maint"),
+            _form_toggle_button("Test", on=test, sid=sid, which="test"),
+        ]),
+        {"tag": "div", "text": {"tag": "lark_md", "content": selection_text(maint, test)}},
+        _machines_input(str(session.get("machines_text") or "")),
+        _btn_row([
+            _form_button("Confirm", "setgt_confirm", {"a": "confirm", "s": sid}, kind="primary"),
+            _form_button("Cancel", "setgt_cancel", {"a": "cancel", "s": sid}, kind="danger"),
+        ]),
+    ]
+    hint = ("Paste the machines — one per line, several on one line (`DHS3106 DHS3107`), or a "
+            "range (`NWR2000-NWR2020`) — then tap **Confirm**. This runs **now**.")
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "width_mode": "fill"},
+        "header": {"template": "orange",
+                   "title": {"tag": "plain_text",
+                             "content": "⚙️ Set Maintenance / Test — Machines"}},
+        "body": {"elements": (
+            ([{"tag": "div", "text": {"tag": "lark_md", "content": error}}, {"tag": "hr"}]
+             if error else [])
+            + [{"tag": "div", "text": {"tag": "lark_md", "content": hint}},
+               {"tag": "form", "name": "setgt_form", "elements": form_elements}]
+        )},
+    }
+
+
 def build_form_card(sid: str, session: dict[str, Any], *, error: str = "") -> dict:
     """
-    The ``/setgt`` form card. ``error`` renders a banner above the form.
+    The ``/setgt`` / ``/set`` form card. ``error`` renders a banner above the form.
 
     A banner rather than a toast: :func:`_toast` truncates at 180 characters, which would eat the
-    machine detail an operator needs to see why a game type resolved to nothing.
+    per-candidate machine detail an operator needs to tell a collision apart.
     """
+    if str(session.get("target") or TARGET_GAME) == TARGET_MACHINES:
+        return _build_machines_card(sid, session, error=error)
+
     maint = bool(session.get("maint"))
     test = bool(session.get("test"))
     env_code = str(session.get("env_code") or "").strip().upper()
@@ -312,6 +412,8 @@ def build_form_card(sid: str, session: dict[str, Any], *, error: str = "") -> di
 # review / run cards
 # ---------------------------------------------------------------------------
 def _where_line(session: dict[str, Any]) -> str:
+    if str(session.get("target") or TARGET_GAME) == TARGET_MACHINES:
+        return "**Target:** pasted machine list"
     env_code = str(session.get("env_code") or "").strip().upper()
     venue = str(session.get("venue") or "").strip().upper()
     where = env_code
@@ -415,7 +517,7 @@ def build_failed_card(session: dict[str, Any], found: list[dict], err: Exception
     }
 
 
-def build_cancelled_card() -> dict:
+def build_cancelled_card(cmd: str = "/setgt") -> dict:
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "width_mode": "fill"},
@@ -423,7 +525,7 @@ def build_cancelled_card() -> dict:
                    "title": {"tag": "plain_text", "content": "🚫 Cancelled"}},
         "body": {"elements": [{"tag": "div", "text": {
             "tag": "lark_md", "content": "Set maintenance/test was **cancelled**. "
-                                         "Send `/setgt` to start again."}}]},
+                                         f"Send `{cmd}` to start again."}}]},
     }
 
 
@@ -432,11 +534,32 @@ def build_cancelled_card() -> dict:
 # ---------------------------------------------------------------------------
 def resolve_session_target(session: dict[str, Any]) -> tuple[list[dict], str]:
     """
-    Resolve the session's game type to machines. Returns ``(found, error_message)``.
+    Resolve the session's target to machines. Returns ``(found, error_message)``.
 
-    Never widens to the whole environment — an unmatched game type is an error, not "every
-    machine at that site".
+    Never widens: an unmatched game type is an error, not "every machine at that site", and an
+    unresolved machine name blocks the whole submission rather than running the rest.
     """
+    if str(session.get("target") or TARGET_GAME) == TARGET_MACHINES:
+        import machine_ranges
+
+        raw_text = str(session.get("machines_text") or "")
+        tokens, ranged = parse_machine_lines_with_ranges(raw_text)
+        if not tokens:
+            return [], "Kindly type at least one machine (one per line)."
+        found, problems = resolve_machines(tokens, optional_tokens=ranged)
+        # A span the expander refused (reversed / cross-environment / too wide) arrives as one
+        # unmatchable name — say why, or it reads as "that machine is missing".
+        hint = machine_ranges.range_hint(tokens)
+        if problems:
+            report = _sst.problem_report_md(problems, found, game_type_hint=False)
+            return [], (f"{hint}\n\n{report}" if hint else report)
+        if not found:
+            if ranged and set(t.strip().upper() for t in tokens) <= ranged:
+                return [], (hint or f"No machines exist in that range ({len(tokens)} checked). "
+                                    f"Check the numbers and try again.")
+            return [], (hint or "No machines resolved. Try again.")
+        return found, ""
+
     env_code = str(session.get("env_code") or "").strip().upper()
     game_type = str(session.get("game_type") or "").strip()
     venue = str(session.get("venue") or "").strip().upper()
@@ -472,14 +595,16 @@ def handle_card_callback(
     chat_id: str,
     send_card: Callable[[str, dict], Any],
     run_batch: Callable[..., Any],
+    form_value: dict[str, Any] | None = None,
     sender_id: str = "",
 ) -> dict[str, Any] | None:
     """
-    Handle every ``/setgt`` button. Returns the synchronous card.callback body, or ``None`` when
-    the callback isn't ours.
+    Handle every ``/setgt`` / ``/set`` button. Returns the synchronous card.callback body, or
+    ``None`` when the callback isn't ours.
 
     ``send_card(chat_id, card)`` must return the posted card's ``message_id``, which becomes the
     thread root so the batch's progress messages and screenshots land inside that card's thread.
+    ``form_value`` carries the ``/set`` machines box; ``/setgt``'s card has no form and sends none.
     """
     if str(parsed.get("k") or "").strip().lower() != SETGT_CARD_KEY:
         return None
@@ -489,11 +614,20 @@ def handle_card_callback(
     # The buttons carry the same gate as the command — the card is what actually changes PROD,
     # so a check only the command honours is no check at all.
     if not (chat_allowed(chat_id) or pm_allowed(sender_id)):
-        return _toast("error", "You are not allowed to use /setgt here.")
+        return _toast("error", "You are not allowed to use this here.")
 
     session = get_session(sid)
     if not session:
-        return _toast("error", "This /setgt form expired. Send /setgt again.")
+        return _toast("error", "This form expired. Send the command again.")
+
+    cmd = "/set" if str(session.get("target") or "") == TARGET_MACHINES else "/setgt"
+
+    # Fold the typed machine list back in before anything reads it: the toggles submit the form,
+    # so without this a toggle would re-render the card with an empty box and Confirm would then
+    # resolve against nothing.
+    fv = form_value if isinstance(form_value, dict) else {}
+    if fv.get("setgt_machines") is not None:
+        session = update_session(sid, machines_text=str(fv.get("setgt_machines") or "")) or session
 
     if act == "cancel":
         # A stale card can still send this after the run fired. Nothing here can stop a running
@@ -501,12 +635,19 @@ def handle_card_callback(
         # flight. Claimed under the session lock so a Cancel racing a Confirm cannot win.
         if not claim_cancel(sid):
             return _toast("info", "Already started — this cannot be cancelled from here.")
-        return _card_reply(build_cancelled_card())
+        return _card_reply(build_cancelled_card(cmd))
 
     # Any change to what is targeted invalidates an approval made before it, so a stale review
-    # card cannot run yesterday's machine list under today's heading.
-    if act in ("toggle", "back", "env", "gt", "venue"):
+    # card cannot run yesterday's machine list under today's heading. A re-submitted machines box
+    # counts as a change: the text may differ from the one that was approved.
+    if act in ("toggle", "back", "env", "gt", "venue") or fv.get("setgt_machines") is not None:
         session = update_session(sid, approved=[], approved_action="") or session
+
+    # The game-type wizard does not exist on the /set card. These can only arrive from a crafted
+    # or cross-wired callback, and silently accepting one would leave the session in a state its
+    # own card cannot render.
+    if act in ("back", "env", "gt", "venue") and str(session.get("target") or "") == TARGET_MACHINES:
+        return _toast("error", "That step does not apply to /set.")
 
     if act == "toggle":
         which = str(parsed.get("w") or "").strip().lower()
@@ -579,10 +720,15 @@ def handle_card_callback(
         run_session = dict(session)
         # An immediate PROD change with no schedule and no reminder leaves no other trace of who
         # ordered it — /sst at least persists ``created_by`` in its store.
-        print(f"[setgt] run by {sender_id or 'unknown'} in {run_chat}: {action} on "
-              f"{len(found)} machine(s) — {run_session.get('env_code')} / "
-              f"{run_session.get('game_type')} / venue={run_session.get('venue') or '-'}",
-              flush=True)
+        if str(run_session.get("target") or "") == TARGET_MACHINES:
+            what = "machines=" + ",".join(str(m.get("machine") or "") for m in found[:20])
+            if len(found) > 20:
+                what += f",… +{len(found) - 20}"
+        else:
+            what = (f"{run_session.get('env_code')} / {run_session.get('game_type')} / "
+                    f"venue={run_session.get('venue') or '-'}")
+        print(f"[setgt] {cmd} run by {sender_id or 'unknown'} in {run_chat}: {action} on "
+              f"{len(found)} machine(s) — {what}", flush=True)
 
         # Posting the start card and starting the job are both network work; Lark gives this
         # callback ~3 s, so they go on their own thread and the card is answered immediately.
@@ -608,4 +754,4 @@ def handle_card_callback(
         threading.Thread(target=_fire, daemon=True).start()
         return _card_reply(build_started_card(session, found))
 
-    return _toast("error", f"Unknown /setgt action: {act}")
+    return _toast("error", f"Unknown {cmd} action: {act}")

@@ -494,6 +494,33 @@ _MACHINE_TOKEN_RE = re.compile(
 )
 
 
+def _expand_ranges_in_line(line: str) -> tuple[str, bool]:
+    """
+    Rewrite ``NWR2000-NWR2020`` into the full run of names. Returns ``(line, expanded)``.
+
+    This has to happen *before* :data:`_MACHINE_TOKEN_RE`, which finds ``NWR2000`` and ``NWR2020``
+    as two separate tokens and strips the hyphen — so without it a typed span quietly sets only
+    its two ends.
+
+    The scan runs over the whole line rather than over whitespace-separated pieces, because the
+    spaced forms (``NWR2000 - NWR2020``, ``NWR2000 to NWR2020``) are no longer spans once split.
+    :func:`machine_ranges.expand_ranges_inline` carries the boundary guards that keep it off a
+    hyphenated display name, and is verified to fire on none of them.
+
+    ``expanded`` matters to the caller: an expanded line consists of exactly its own asset tokens,
+    which trips :func:`extract_machine_lines`'s "clean pasted machine line" branch into keeping
+    the entire run as ONE display name. That resolves, by trailing digits, to a single cabinet —
+    the whole span silently collapsing to its top end.
+
+    A span the expander refuses (reversed, cross-environment, wider than the cap) is left exactly
+    as written, so this only ever adds behaviour. Those still reach the operator as the two ends
+    on the Proceed/Cancel confirm card, which is the review step for this path.
+    """
+    import machine_ranges
+
+    return machine_ranges.expand_ranges_inline(line or "")
+
+
 def extract_machine_lines(text: str) -> list[str]:
     """
     Machine references from the message — two styles supported:
@@ -519,6 +546,8 @@ def extract_machine_lines(text: str) -> list[str]:
         line = re.sub(r"^[-*•·]+\s*", "", line).strip()
         if not line:
             continue
+        # "set maintenance NWR2000-NWR2020" → the whole run, before it is tokenised.
+        line, expanded_range = _expand_ranges_in_line(line)
         is_action_line = bool(
             _SET_RE.search(line) or _UNSET_RE.search(line)
             or _MAINT_KW_RE.search(line) or _TEST_KW_RE.search(line)
@@ -533,7 +562,11 @@ def extract_machine_lines(text: str) -> list[str]:
             line_compact = re.sub(r"[^A-Za-z0-9]", "", line).upper()
             token_compact = "".join(t.upper() for t in tokens)
             # Status / command noise on the same line (e.g. ``nwr2197 machine status``) — asset only.
-            if _STATUS_CHECK_RE.search(line) or (
+            #
+            # ``expanded_range`` first: an expanded span IS exactly its own asset tokens, so
+            # ``line_compact == token_compact`` and the test below would otherwise fall through to
+            # "clean pasted machine line" and keep the whole run as one name.
+            if expanded_range or _STATUS_CHECK_RE.search(line) or (
                 tokens
                 and token_compact
                 and token_compact in line_compact

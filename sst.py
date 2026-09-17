@@ -724,16 +724,81 @@ def _split_bare_refs(part: str) -> list[str]:
 
 def parse_machine_lines(raw: str) -> list[str]:
     """
-    Split the textarea into machine tokens.
+    Split the textarea into machine tokens, expanding any ``NWR2000-NWR2020`` span.
 
     Newline / comma / ``;`` always separate. Within a line, whitespace, ``&`` and even no separator
     at all separate too — but only between bare asset refs, so display names survive intact
     (:func:`_split_bare_refs`).
     """
+    return parse_machine_lines_with_ranges(raw)[0]
+
+
+def parse_machine_lines_with_ranges(raw: str) -> tuple[list[str], set[str]]:
+    """
+    As :func:`parse_machine_lines`, but also returns which tokens came from expanding a range.
+
+    Callers pass that set to :func:`resolve_machines` as ``optional_tokens``: a span means "every
+    cabinet that exists between these two", so a gap inside it is not the operator's mistake the
+    way a mistyped name is. See :func:`resolve_machines`.
+    """
+    import machine_ranges
+
     out: list[str] = []
+    from_range: set[str] = set()
+    seen: set[str] = set()
+
+    def _add(tok: str, *, ranged: bool) -> None:
+        key = tok.strip().upper()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        out.append(tok)
+        if ranged:
+            from_range.add(key)
+
     for part in _MACHINE_SPLIT_RE.split(raw or ""):
-        out.extend(_split_bare_refs(part))
-    return out
+        part = part.strip()
+        if not part:
+            continue
+        # Ranges MUST be expanded before _split_bare_refs sees them: _split_concat_refs reads
+        # "NWR2000-NWR2005" as the concatenated pair NWR2000 + NWR2005 (the hyphen vanishes in
+        # _norm_key), which would silently set the two ends and nothing in between.
+        # Whole-line first, so the spaced forms survive: "NWR2000 - NWR2005", "NWR2000 to
+        # NWR2005". Splitting on whitespace before this would leave three pieces, none of which
+        # is a span on its own. Safe because no real display name matches the range shape whole.
+        whole = machine_ranges.expand_range_token(part)
+        if whole is not None:
+            for mem in whole:
+                _add(mem, ranged=True)
+            continue
+        if machine_ranges.looks_like_range(part):
+            _add(part, ranged=False)          # refused span — see the note below
+            continue
+
+        pieces = [p for p in _RUN_SPLIT_RE.split(part) if p]
+        if not any(machine_ranges.looks_like_range(p) for p in pieces):
+            for tok in _split_bare_refs(part):
+                _add(tok, ranged=False)
+            continue
+        # This line really does hold a span. Verified against every real display name: none has a
+        # whitespace-separated piece matching the range shape, so splitting here cannot break one.
+        for piece in pieces:
+            members = machine_ranges.expand_range_token(piece)
+            if members is not None:
+                for mem in members:
+                    _add(mem, ranged=True)
+            elif machine_ranges.looks_like_range(piece):
+                # A span the expander refused (reversed / cross-environment / too wide). Kept
+                # WHOLE on purpose: handing "NWR2020-NWR2000" to _split_bare_refs would read it as
+                # the concatenated pair NWR2020 + NWR2000 and quietly set just the two ends, which
+                # is the one outcome the operator certainly did not ask for. Unresolvable as a
+                # name, it stops the submission and :func:`machine_ranges.range_hint` says why.
+                _add(piece, ranged=False)
+            else:
+                for tok in _split_bare_refs(piece):
+                    _add(tok, ranged=False)
+
+    return out, from_range
 
 
 def _row_name_key(name: str) -> str:
@@ -778,9 +843,15 @@ def resolve_machines(
     tokens: list[str],
     *,
     env_hint: str = "",
+    optional_tokens: set[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Look every token up in ``webmachine_data.json`` (PROD rows only).
+
+    ``optional_tokens`` (upper-cased) are tokens a range produced. A span means "every cabinet
+    that exists between these two ends", so a number nobody installed is a gap, not a typo — it is
+    skipped instead of blocking the whole submission. A name the operator typed by hand still
+    raises a problem, because there the miss really is a mistake worth stopping for.
 
     Reuses ``smmachine.resolve_prod_batch_token_hits`` so the returned dicts are exactly the shape
     the prod-batch runner consumes (``belongs`` / ``machine`` / ``status`` / ``online``).
@@ -826,6 +897,21 @@ def resolve_machines(
     hint = _normalize_env_code(env_hint or "")
     token_envs = [_normalize_env_code(_env_from_machine_name(t) or "") for t in tokens]
     shared = sorted({e for e in token_envs if e})
+    ranged = {t.strip().upper() for t in (optional_tokens or set())}
+
+    # ``resolve_prod_batch_token_hits`` re-tests ``_prod_batch_row_matches_env`` for every row on
+    # every token, which is the whole cost when a range expands to hundreds of tokens (a 500-wide
+    # span took 9.6 s — three times Lark's card-callback window). Filtering by environment once
+    # per environment and handing over the subset is the identical predicate applied earlier, so
+    # the hits are unchanged; only the redundant re-scan of other sites' rows goes away.
+    _env_rows_cache: dict[str, list[dict]] = {}
+
+    def _rows_for(env_code: str) -> list[dict]:
+        if env_code not in _env_rows_cache:
+            _env_rows_cache[env_code] = [
+                r for r in rows if smmachine._prod_batch_row_matches_env(r, env_code)
+            ]
+        return _env_rows_cache[env_code]
 
     found: list[dict] = []
     problems: list[dict] = []
@@ -854,11 +940,13 @@ def resolve_machines(
         bare_id = _norm_key(tok).isdigit()
         env_code = tok_env or hint or (shared[0] if (bare_id and len(shared) == 1) else "")
         if env_code:
-            hits = smmachine.resolve_prod_batch_token_hits(env_code, tok, rows)
+            hits = smmachine.resolve_prod_batch_token_hits(env_code, tok, _rows_for(env_code))
         else:
             hits = _exact_name_hits(tok, rows)
         if not hits:
-            _problem(tok, "missing", [])
+            # A gap inside a typed range is expected — skip it silently (see ``optional_tokens``).
+            if tok.strip().upper() not in ranged:
+                _problem(tok, "missing", [])
             continue
         if len(hits) > 1:
             # An exact display-name hit outranks the fuzzy ones it came bundled with: a pasted
@@ -1396,18 +1484,33 @@ def resolve_session_target(session: dict[str, Any]) -> tuple[list[dict], str]:
             return [], f"{game_type} is not detected in {where}. Try again."
         return found, ""
 
-    tokens = parse_machine_lines(str(session.get("machines_text") or ""))
+    import machine_ranges
+
+    raw_text = str(session.get("machines_text") or "")
+    tokens, ranged = parse_machine_lines_with_ranges(raw_text)
     if not tokens:
         return [], "Kindly type at least one machine (one per line)."
-    found, problems = resolve_machines(tokens, env_hint=str(session.get("env_code") or ""))
+    found, problems = resolve_machines(
+        tokens, env_hint=str(session.get("env_code") or ""), optional_tokens=ranged,
+    )
+    # A span the expander refused (reversed, cross-environment, too wide) survives tokenising as
+    # one unmatchable name — say why, or it reads as "that machine is missing".
+    hint = machine_ranges.range_hint(tokens)
     if problems:
-        return [], problem_report_md(problems, found)
+        report = problem_report_md(problems, found)
+        return [], (f"{hint}\n\n{report}" if hint else report)
     if not found:
-        return [], "No machines resolved. Try again."
+        # Every token was a range member and none exists — say that, rather than the generic
+        # "no machines", which reads like the paste was malformed.
+        if ranged and set(t.strip().upper() for t in tokens) <= ranged:
+            return [], (hint or f"No machines exist in that range ({len(tokens)} checked). "
+                                f"Check the numbers and try again.")
+        return [], (hint or "No machines resolved. Try again.")
     return found, ""
 
 
-def problem_report_md(problems: list[dict], found: list[dict], *, max_chars: int = 8_000) -> str:
+def problem_report_md(problems: list[dict], found: list[dict], *, max_chars: int = 8_000,
+                      game_type_hint: bool = True) -> str:
     """
     Report **every** token that failed to resolve, with each candidate's ``belongs``.
 
@@ -1444,8 +1547,12 @@ def problem_report_md(problems: list[dict], found: list[dict], *, max_chars: int
             lines.append(f"• {c.get('belongs') or '—'} — `{c.get('machine') or ''}`")
         if len(cands) > 8:
             lines.append(f"• … {len(cands) - 8} more")
-    lines += ["", "Correct the names above (paste them exactly as the dashboard shows them), "
-                  "or tap **Back** and use **Game Type** to target a whole game type."]
+    # /set's card has no Back button and no Game Type step, so pointing at them there would send
+    # the operator looking for controls that are not on their card.
+    tail = "Correct the names above (paste them exactly as the dashboard shows them)"
+    tail += (", or tap **Back** and use **Game Type** to target a whole game type."
+             if game_type_hint else ", or use `/setgt` to target a whole game type.")
+    lines += ["", tail]
 
     txt = "\n".join(lines)
     if len(txt) <= max_chars:

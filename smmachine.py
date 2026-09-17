@@ -2844,16 +2844,47 @@ def _prod_batch_row_matches_env(row: dict, env_code: str) -> bool:
     return belongs == env or _prod_batch_machine_env_from_name(machine) == env
 
 
+def _prod_batch_expand_ranges(line: str) -> list[str] | None:
+    """
+    Expand every ``NWR2000-NWR2020`` span on one line, or ``None`` when the line holds no span.
+
+    ``None`` rather than "the line unchanged" so the caller's existing splitting rules stay in
+    charge of every line that is not a range — this only ever *adds* a case.
+    """
+    import machine_ranges
+
+    parts = [p.strip() for p in re.split(r"[,;&\n]+", line) if p.strip()]
+    if not any(machine_ranges.looks_like_range(p) for p in parts):
+        return None
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        members = machine_ranges.expand_range_token(part)
+        # A refused span (reversed / cross-environment / too wide) is kept whole on purpose: it
+        # then fails to resolve and is reported, instead of quietly setting just the two ends.
+        for tok in (members if members is not None else [part]):
+            if tok.upper() not in seen:
+                seen.add(tok.upper())
+                out.append(tok)
+    return out
+
+
 def _prod_batch_split_target_tokens(line: str) -> list[str]:
     """
     One pasted machine name per line (may contain spaces, e.g. ``5 Dragons-NWR2113``).
 
     Only ``,`` / ``;`` split multiple names on the same line — never split on whitespace
     inside a display name (otherwise ``5`` matches every machine with ``5`` in the title).
+
+    A ``NWR2000-NWR2020`` span is expanded first — see :mod:`machine_ranges` for why the check is
+    strict enough that a hyphenated display name is never mistaken for one.
     """
     line = (line or "").strip()
     if not line:
         return []
+    expanded = _prod_batch_expand_ranges(line)
+    if expanded is not None:
+        return expanded
     if re.search(r"[,;&]", line):
         return [p.strip() for p in re.split(r"[,;&]+", line) if p.strip()]
     # Full display name with spaces + asset digits — keep whole line.
