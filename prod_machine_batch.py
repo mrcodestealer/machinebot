@@ -2426,6 +2426,29 @@ def _retry_backoff_sec(attempt: int) -> float:
     return max(0.0, min(30.0, base * max(1, attempt)))
 
 
+def _sleep_unless_cancelled(
+    seconds: float,
+    cancel_check: Callable[[], bool],
+    manual_stop_check: Callable[[], bool],
+    *,
+    slice_sec: float = 0.5,
+) -> bool:
+    """
+    Sleep ``seconds``, waking early if the job is cancelled. ``True`` means it was.
+
+    The retry backoff grows to 30 s, and "game currently running" can retry 50 times — so a plain
+    ``time.sleep`` left the operator's Cancel unanswered for up to half a minute at a stretch.
+    """
+    waited = 0.0
+    while waited < seconds:
+        if cancel_check() or manual_stop_check():
+            return True
+        nap = min(slice_sec, seconds - waited)
+        time.sleep(nap)
+        waited += nap
+    return cancel_check() or manual_stop_check()
+
+
 def _run_step_with_retries(
     page,
     belongs: str,
@@ -2530,8 +2553,10 @@ def _run_step_with_retries(
             )
             return False, retryable + blocked, done_so_far
         delay = _retry_backoff_sec(attempt)
-        if delay:
-            time.sleep(delay)
+        if delay and _sleep_unless_cancelled(delay, cancel_check, manual_stop_check):
+            # Cancelled mid-backoff. Without the slicing below this slept the full 30 s before
+            # noticing, so the Cancel button on the retry card looked dead for half a minute.
+            return False, retryable + blocked, done_so_far
         pending = retryable
 
     return False, pending + blocked, done_so_far

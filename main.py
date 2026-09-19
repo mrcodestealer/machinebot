@@ -3262,8 +3262,8 @@ _HELP_TEXT = (
     "• `/sm` — set-machine wizard (env → action → machines)\n"
     "• `/sst` — scheduled set maintenance/test form (date + time, auto-runs; one group only)\n"
     "• `/sstlist` — pending scheduled runs, with a Delete button each\n"
-    "• `/setgt` — set maintenance/test for a whole **game type**, runs now (no date/time)\n"
-    "• `/set` — same, for a pasted machine list (`NWR2000-NWR2020` ranges work)\n"
+    "• `/set` — set maintenance/test **now** — same form as `/sst` without the date/time\n"
+    "   (game type or machine list; `NWR2000-NWR2020` ranges work)\n"
     "• `/stresstest <paste announcement>` — one-time reminder 10 min before the set time\n"
     "• paste a maintenance schedule (with @bot) — auto reminder 10 min before\n"
     "• `machine status NWR2008` — read-only status from the live scrape\n"
@@ -3606,47 +3606,42 @@ def _handle_machine_message(
                 pass
         return
 
-    # ---- /setgt (game type) and /set (machine list) — immediate, no date/time ----
-    # Same gate as /sst: they make the same PROD change, only without the scheduler in between.
+    # ---- /set — immediate Set Maintenance / Test (game type or machines; no date/time) ----
+    # Same gate as /sst: it makes the same PROD change, only without the scheduler in between.
     # In a group the bot only sees the message when it is @mentioned, so "tag the bot and send
-    # /setgt" is already what reaching this branch means.
+    # /set" is already what reaching this branch means.
     #
     # ``/set NWR2000-NWR2020`` opens the card with the box already filled. Anything carrying an
     # action word (``/set maintenance NWR2008``) is left alone — the free-text handler further
     # down owns that phrasing, and swallowing it here would break it.
-    _gt_rest = " ".join(cmd_parts[1:]).strip()
-    _gt_is_machine_cmd = cmd in ("/set", "/setmachine")
-    if (cmd in ("/setgt", "/setgametype", "/set", "/setmachine")
-            and (not _gt_rest
-                 or (_gt_is_machine_cmd
-                     and not re.search(r"(?i)\b(?:un)?set\b|\bmaintenance\b|\btest\b", _gt_rest)))):
+    _sn_rest = " ".join(cmd_parts[1:]).strip()
+    if (cmd in ("/set", "/setmachine")
+            and (not _sn_rest
+                 or not re.search(r"(?i)\b(?:un)?set\b|\bmaintenance\b|\btest\b", _sn_rest))):
         try:
-            import setgt as _setgt_mod
+            import setnow as _setnow_mod
 
-            _gt_target = (_setgt_mod.TARGET_MACHINES if _gt_is_machine_cmd
-                          else _setgt_mod.TARGET_GAME)
-            _gt_is_pm = (chat_type == "p2p")
-            if not _setgt_mod.access_allowed(chat_id, sender_id=sender_id or "", is_pm=_gt_is_pm):
-                send_message(chat_id, f"🚫 `{cmd}` is not available in this private chat."
-                             if _gt_is_pm else
-                             f"🚫 `{cmd}` is only available in the designated group.")
+            _sn_is_pm = (chat_type == "p2p")
+            if not _setnow_mod.access_allowed(chat_id, sender_id=sender_id or "", is_pm=_sn_is_pm):
+                send_message(chat_id, "🚫 `/set` is not available in this private chat."
+                             if _sn_is_pm else
+                             "🚫 `/set` is only available in the designated group.")
                 return
-            _gt_sid = _setgt_mod.new_session(
-                chat_id, target=_gt_target, thread_root=_thread_root_for_prod_batch()
+            # A machines argument also picks the Machines target — that is plainly what was meant.
+            _sn_sid = _setnow_mod.new_session(
+                chat_id, machines_text=_sn_rest,
+                thread_root=_thread_root_for_prod_batch(),
             )
-            if _gt_rest and _gt_target == _setgt_mod.TARGET_MACHINES:
-                # Seed the box, don't resolve yet: the operator still reviews and confirms.
-                _setgt_mod.update_session(_gt_sid, machines_text=_gt_rest)
-            _gt_sess = _setgt_mod.get_session(_gt_sid) or {}
+            _sn_sess = _setnow_mod.get_session(_sn_sid) or {}
             send_message(
                 chat_id,
-                json.dumps(_setgt_mod.build_form_card(_gt_sid, _gt_sess)),
+                json.dumps(_setnow_mod.build_form_card(_sn_sid, _sn_sess)),
                 msg_type="interactive",
             )
-        except Exception as _gt_err:
-            print(f"❌ setgt: {_gt_err!r}", flush=True)
+        except Exception as _sn_err:
+            print(f"❌ setnow: {_sn_err!r}", flush=True)
             try:
-                send_message(chat_id, f"❌ {cmd} failed: {_gt_err}")
+                send_message(chat_id, f"❌ /set failed: {_sn_err}")
             except Exception:
                 pass
         return
@@ -4386,20 +4381,18 @@ def lark_webhook():
             except Exception as _sst_sync_err:
                 print(f"❌ sst card callback failed: {_sst_sync_err!r}", flush=True)
 
-            # /setgt buttons update the card IN-PLACE — same 3s window as /sst. The card carries
-            # no form, so there is no form_value to fold back in: every choice is a button.
+            # /set buttons update the card IN-PLACE — same 3s window as /sst, and the machines
+            # box is a form so its text arrives as form_value exactly like /sst's.
             try:
-                import setgt as _setgt_sync
+                import setnow as _setnow_sync
 
-                if str(parsed_sync.get("k") or "").strip().lower() == _setgt_sync.SETGT_CARD_KEY:
-                    # /set's machines box is a form, so its text arrives as form_value exactly
-                    # like /sst's. /setgt's card has no form and simply sends none.
+                if str(parsed_sync.get("k") or "").strip().lower() == _setnow_sync.SETNOW_CARD_KEY:
                     _ev_g = data.get("event") if isinstance(data.get("event"), dict) else {}
                     _act_g = _ev_g.get("action") if isinstance(_ev_g.get("action"), dict) else {}
                     _fv_g = _act_g.get("form_value") if isinstance(_act_g.get("form_value"), dict) else None
                     if _fv_g is None and isinstance(parsed_sync.get("form_value"), dict):
                         _fv_g = parsed_sync.get("form_value")
-                    _gt_resp = _setgt_sync.handle_card_callback(
+                    _gt_resp = _setnow_sync.handle_card_callback(
                         parsed_sync,
                         chat_id=chat_id_ca or "",
                         send_card=_sst_send_card,
@@ -4412,7 +4405,7 @@ def lark_webhook():
                             _remember_processed_message_id(str(eid_ca))
                         return _lark_http_card_callback_response(_gt_resp)
             except Exception as _gt_sync_err:
-                print(f"❌ setgt card callback failed: {_gt_sync_err!r}", flush=True)
+                print(f"❌ set card callback failed: {_gt_sync_err!r}", flush=True)
 
             # /sm wizard env pick updates the card IN-PLACE — must answer inside the 3s window.
             try:

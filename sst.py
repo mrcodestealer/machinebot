@@ -1551,7 +1551,7 @@ def problem_report_md(problems: list[dict], found: list[dict], *, max_chars: int
     # the operator looking for controls that are not on their card.
     tail = "Correct the names above (paste them exactly as the dashboard shows them)"
     tail += (", or tap **Back** and use **Game Type** to target a whole game type."
-             if game_type_hint else ", or use `/setgt` to target a whole game type.")
+             if game_type_hint else ", or use `/set` and choose **Game Type** to target a whole game type.")
     lines += ["", tail]
 
     txt = "\n".join(lines)

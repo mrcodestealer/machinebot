@@ -4528,9 +4528,14 @@ def _run_prod_batch_bot_job_thread(
         )
 
         if step_verify == "set_maint" and game_running:
+            # A card, not plain text: "game currently running" is the one retry that waits out a
+            # real player and can run for the full 50 attempts, so it is exactly the case where an
+            # operator most needs to stop the loop. Plain ``send_message`` carried no Cancel
+            # button, leaving the only cancellable path the one that almost never fires.
             head = (
                 "⚠️ **Game currently running** error occurred — will retry **set maintenance** again.\n"
-                f"Attempt **{attempt}** / **{max_r}**.\n\n"
+                f"Attempt **{attempt}** / **{max_r}**.\n"
+                "Tap **Cancel** below to stop retrying.\n\n"
                 if not is_final
                 else "⚠️ **Game currently running** — attempt "
                 f"**{attempt}** / **{max_r}** was the last, **no more retries** for these machine(s).\n\n"
@@ -4543,7 +4548,16 @@ def _run_prod_batch_bot_job_thread(
                 )
             if len(failed) > 20:
                 body_lines.append(f"... and {len(failed) - 20} more")
-            send_message(chat_id, head + "\n".join(body_lines))
+            _prod_batch_send_lark_md(
+                chat_id,
+                (f"Game currently running — retry {attempt}/{max_r}" if not is_final
+                 else "Game currently running — final attempt failed"),
+                head + "\n".join(body_lines),
+                send_message,
+                header_template="yellow" if not is_final else "red",
+                # job_id is what puts the Cancel button on the card (and only while it is running).
+                job_id=job_id,
+            )
             return
 
         label = PHASE_LABELS.get(step_verify, step_verify)

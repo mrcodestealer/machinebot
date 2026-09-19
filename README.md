@@ -11,8 +11,7 @@ Runs on its own Lark app in **persistent connection** mode (Subscription mode �
 | `set maintenance NWR2008` / `unset test TBP8609 NCH1900` | PROD batch set/unset via the EGM backends (confirm card → Playwright job → per-row screenshots) |
 | `ALL NWR MACHINES <Venue> set maintenance` | venue-wide set/unset expanded from `webmachine_data.json` |
 | `/sm` | set-machine wizard: env picker card → action → machines |
-| `/setgt` | set maintenance/test for a whole **game type**, running **now** — same card as `/sst` minus the date/time (env → game type → venue → review → confirm). Designated group / operator PM only |
-| `/set` | same as `/setgt` but targeting a pasted **machine list** (one box, same tokens as `/sst`). Designated group / operator PM only |
+| `/set` | set maintenance/test running **now** — the same form as `/sst` minus the date/time: **Game Type** (env → game type → venue) or **Machines** (same box and tokens as `/sst`) → review → confirm. `/set NWR2000-NWR2020` pre-fills the box. Designated group / operator PM only |
 | `NWR2000-NWR2020` | a **range** anywhere a machine list is accepted (`/sst`, `/set`, `/sm`, `/nwrsetmaintenance`, `set maintenance …`) expands to every cabinet in the span. Also `NWR2000-2020`, `NWR2000 to NWR2020`. A hyphenated display name is never mistaken for a range — see `machine_ranges.py` |
 | `/stresstest <paste announcement>` | one-time reminder 10 min before the announced set-maintenance time |
 | maintenance schedule paste (@bot) | parses action + future time + machine list → auto reminder 10 min before |
