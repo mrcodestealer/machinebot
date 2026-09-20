@@ -4604,17 +4604,45 @@ def _egm_click_hide_grid_if_shown(dlg: Any, *, timeout_ms: int = 15_000) -> None
         pass
 
 
+def _egm_capture_viewport(width_env: str, height_env: str) -> dict[str, int]:
+    """
+    Viewport for an EGM operation-dialog capture.
+
+    It has to be **tall**, not merely big enough to click things: Element UI derives
+    ``.el-dialog__body``'s max-height from ``100vh``, so a short viewport clips the modal and the
+    game screen comes out cut in half however much the max-height is relaxed afterwards.
+    """
+    def _read(name: str, default: int, floor: int) -> int:
+        try:
+            v = int((os.environ.get(name) or str(default)).strip() or str(default))
+        except ValueError:
+            v = default
+        return max(floor, v)
+
+    return {"width": _read(width_env, 1680, 1280), "height": _read(height_env, 2400, 1200)}
+
+
 def _egm_expand_operation_dialog_for_capture(page: Any, dlg: Any) -> None:
-    """Relax Element UI max-height / overflow so ``locator.screenshot`` includes the full modal body."""
+    """Relax Element UI max-height / overflow so ``locator.screenshot`` includes the full modal body.
+
+    The ``.el-dialog__wrapper`` ancestor is the one that actually scrolls, so it is relaxed too:
+    clipping by an ancestor survives any amount of relaxing on the dialog itself.
+    """
     try:
         dlg.evaluate(
             """el => {
               if (!(el instanceof HTMLElement)) return;
               el.style.maxHeight = 'none';
+              el.style.marginTop = '0';
               const body = el.querySelector('.el-dialog__body');
               if (body instanceof HTMLElement) {
                 body.style.maxHeight = 'none';
+                body.style.height = 'auto';
                 body.style.overflow = 'visible';
+              }
+              const wrapper = el.closest('.el-dialog__wrapper');
+              if (wrapper instanceof HTMLElement) {
+                wrapper.style.overflow = 'visible';
               }
             }"""
         )
@@ -4754,7 +4782,11 @@ def screenshot_egm_status_window(
         browser = p.chromium.launch(headless=headless)
         try:
             context = browser.new_context(
-                viewport={"width": 1600, "height": 900},
+                # Tall on purpose — see _egm_capture_viewport. At 1600x900 the modal body was
+                # capped near 600px and the game screen came out cut in half.
+                viewport=_egm_capture_viewport(
+                    "EGM_STATUS_VIEWPORT_WIDTH", "EGM_STATUS_VIEWPORT_HEIGHT"
+                ),
                 ignore_https_errors=True,
                 device_scale_factor=2,
             )
