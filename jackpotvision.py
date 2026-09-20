@@ -80,11 +80,14 @@ _PROMPT = (
     "Answer jackpot = true ONLY when at least one of these is visible:\n"
     "- the bottom-bar WIN counter is enormous next to BET — hundreds of times the BET, and "
     "larger than CREDIT (for example WIN 1010089 with BET 38 and CREDIT 872);\n"
-    "- text naming a jackpot tier in words: JACKPOT, GRAND, MAJOR, MINOR or MEGA. The word "
-    "itself must be legible on screen; a gold/flashing animation with no such word is not one;\n"
-    "- a hand pay prompt: text asking to CALL / SEE an ATTENDANT, or saying HAND PAY, "
-    "JACKPOT PAYOUT or the machine is locked awaiting payment.\n\n"
+    "- a hand pay prompt: text asking to CALL / SEE an ATTENDANT, or saying HAND PAY, or that "
+    "the machine is locked awaiting payment.\n\n"
     "Answer jackpot = false for all of these, which are ordinary and very common:\n"
+    "- a panel of large amounts labelled FORTUNE, GRAND, MAJOR, MINOR or MINI, usually banded "
+    "across the TOP of the screen above the reels. That is the progressive METER display. It is "
+    "on screen during every single spin of these games, showing what those prizes are currently "
+    "worth — NOT what anybody won. The words GRAND, MAJOR, MINOR, MINI and JACKPOT appearing "
+    "there are labels, and on their own they are never evidence of anything;\n"
     "- a win amount animating over the reels, however large or celebratory it looks;\n"
     "- a \"PAID\" tag or any line saying an amount was paid — routine payout text, not a hand pay;\n"
     "- \"Game Over\", \"Feature Completed\", or a finished free-spin round;\n"
@@ -487,18 +490,63 @@ def _min_bet_multiple() -> float:
         return 100.0
 
 
+# A written instruction to a human, which stands without a counter to back it. Deliberately
+# excludes the bare word "jackpot": it is a progressive meter label on every one of these games.
+_HANDPAY_RE = re.compile(
+    r"hand\s*-?\s*pay|attendant|call\s+(?:staff|service)|locked\s+awaiting|awaiting\s+payment",
+    re.I,
+)
+
+
+def _amt(value: float) -> str:
+    """``1010089.0`` -> ``1,010,089`` — ``:g`` turns jackpot-sized numbers into 1.01009e+06."""
+    return f"{value:,.0f}" if float(value) == int(value) else f"{value:,.2f}"
+
+
+def _numeric_says_jackpot(
+    verdict: dict[str, Any], known_credit: float | None = None
+) -> str:
+    """
+    Reason the **counters** amount to a jackpot, or ``""``.
+
+    The mirror of :func:`_numeric_veto`, and the reason both exist: the model's boolean cannot be
+    trusted either way. It has answered false with "WIN 1010089 with BET 38" in its own reason,
+    so a verdict this clear is taken from the numbers regardless of what it concluded.
+    """
+    win = _as_float(verdict.get("win"))
+    if win is None or win <= 0:
+        return ""
+    bet = _as_float(verdict.get("bet"))
+    mult = _min_bet_multiple()
+    if bet is not None and bet > 0:
+        if mult > 0 and win >= bet * mult:
+            return f"WIN {_amt(win)} is {_amt(win / bet)}x BET {_amt(bet)}"
+        return ""
+    credit = known_credit if known_credit is not None else _as_float(verdict.get("credit"))
+    if credit is not None and credit > 0 and win > credit:
+        return f"WIN {_amt(win)} is above CREDIT {_amt(credit)} with no BET to compare"
+    return ""
+
+
 def _numeric_veto(verdict: dict[str, Any], known_credit: float | None = None) -> str:
     """
     Reason to overrule a positive verdict on the numbers alone, or ``""`` to let it stand.
 
     The model's own counters are checked against the prompt's own headline rule — a jackpot is a
     win that dwarfs the bet. A win the model itself reports as small is not a jackpot however
-    confidently it says otherwise, and this costs nothing when the counters are unreadable: an
-    empty WIN leaves the banner / hand-pay criteria to stand on their own.
+    confidently it says otherwise.
+
+    An unreadable WIN is itself disqualifying. It used to abstain, on the theory that the banner
+    criteria could stand alone — but the thing that reads as a banner on these cabinets is the
+    progressive meter panel, which is on screen every spin, so abstaining just handed the verdict
+    to the weakest evidence there is. A hand pay is the one exception: that is a written
+    instruction to a person, and it does not need a counter to back it up.
     """
     win = _as_float(verdict.get("win"))
     if win is None:
-        return ""
+        if _HANDPAY_RE.search(str(verdict.get("reason") or "")):
+            return ""
+        return "no WIN counter was read, and nothing on screen names a hand pay"
     if win <= 0:
         return "WIN counter reads 0"
     bet = _as_float(verdict.get("bet"))
@@ -507,11 +555,14 @@ def _numeric_veto(verdict: dict[str, Any], known_credit: float | None = None) ->
         return ""
     if bet is not None and bet > 0:
         if win < bet * mult:
-            return f"WIN {win:g} is only {win / bet:.1f}x BET {bet:g} (jackpot needs {mult:g}x)"
+            return (
+                f"WIN {_amt(win)} is only {win / bet:.1f}x BET {_amt(bet)} "
+                f"(jackpot needs {_amt(mult)}x)"
+            )
         return ""
     credit = known_credit if known_credit is not None else _as_float(verdict.get("credit"))
     if credit is not None and win <= credit:
-        return f"WIN {win:g} is not above CREDIT {credit:g}"
+        return f"WIN {_amt(win)} is not above CREDIT {_amt(credit)}"
     return ""
 
 
@@ -545,11 +596,29 @@ def detect_jackpot(
     verdict = _parse_verdict(text)
     verdict["model"] = model
     verdict.setdefault("vetoed", "")
-    if verdict.get("jackpot"):
+
+    # The model reads the screen; this decides what it means. Its own yes/no is the weakest
+    # signal here — it has said false with "WIN 1010089 with BET 38" in its reason, and said
+    # false again while quoting a HAND PAY banner — so it only carries a verdict that the
+    # counters do not already settle.
+    handpay = bool(_HANDPAY_RE.search(str(verdict.get("reason") or "")))
+    numeric = _numeric_says_jackpot(verdict, known_credit)
+    if handpay:
+        verdict["jackpot"] = True
+        verdict["vetoed"] = ""
+        verdict["decided_by"] = "hand pay named on screen"
+    elif numeric:
+        verdict["jackpot"] = True
+        verdict["vetoed"] = ""
+        verdict["decided_by"] = numeric
+    elif verdict.get("jackpot"):
         veto = _numeric_veto(verdict, known_credit)
+        verdict["decided_by"] = "model verdict"
         if veto:
             verdict["jackpot"] = False
             verdict["vetoed"] = veto
+    else:
+        verdict.setdefault("decided_by", "")
     return verdict
 
 
@@ -569,6 +638,9 @@ def format_jackpot_notice(verdict: dict[str, Any], *, machine_display: str = "")
     credit = str(verdict.get("credit") or "").strip()
     if credit:
         bits.append(f"CREDIT `{credit}`")
+    decided = str(verdict.get("decided_by") or "").strip()
+    if decided:
+        bits.append(decided)
     reason = str(verdict.get("reason") or "").strip()
     if reason:
         bits.append(reason)
