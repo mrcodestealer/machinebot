@@ -25,6 +25,13 @@ Env:
                                       when the configured one cannot take images (default: swap).
                                       The swap picks whichever vision model Ollama lists first,
                                       so pin ``BOT_CHAT_VISION_MODEL`` rather than rely on it.
+  ``CHECKCREDIT_VISION_MAX_PX``        longest side of the screenshot handed to the model
+                                      (default 1280). Vision tokens scale with pixels, and the
+                                      full operation-window capture overflows a 4096-token
+                                      context on its own.
+  ``CHECKCREDIT_VISION_NUM_CTX``      ask Ollama for this context size instead of shrinking the
+                                      image (default 0 = leave it alone; not every build honours
+                                      it).
   ``CHECKCREDIT_JACKPOT_MIN_BET_MULTIPLE``
                                       a WIN below this multiple of the BET is not a jackpot,
                                       whatever the model says (default 100; ``0`` disables).
@@ -41,6 +48,7 @@ model that is down or slow can only cost the follow-up message, never the card i
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import re
@@ -127,6 +135,57 @@ def _api_key() -> str:
     return (
         os.getenv("BOT_CHAT_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
     ).strip()
+
+
+def _vision_max_px() -> int:
+    """Longest side handed to the model (``CHECKCREDIT_VISION_MAX_PX``, default 1280)."""
+    try:
+        return max(256, int((os.environ.get("CHECKCREDIT_VISION_MAX_PX") or "1280").strip() or "1280"))
+    except ValueError:
+        return 1280
+
+
+def _vision_num_ctx() -> int:
+    """
+    ``options.num_ctx`` to ask Ollama for (``CHECKCREDIT_VISION_NUM_CTX``; 0 = leave it alone).
+
+    Downscaling is the fix that works everywhere; this is the lever for a host that would rather
+    spend memory than pixels. Not every build honours it, so it is off by default.
+    """
+    try:
+        return max(0, int((os.environ.get("CHECKCREDIT_VISION_NUM_CTX") or "0").strip() or "0"))
+    except ValueError:
+        return 0
+
+
+def _downscale_for_vision(png_bytes: bytes) -> bytes:
+    """
+    Shrink a screenshot so it fits a small model's context window.
+
+    Tokens scale with pixels, not file size, and the operation-window capture is tall: at
+    device_scale_factor=2 it runs ~1868x3058, which alone exceeds a 4096-token context. Capping
+    the longest side keeps the counters legible — the Machine Credit field reads correctly down to
+    768px — at a fraction of the tokens.
+
+    Returns the bytes untouched when Pillow is missing, the image already fits, or anything goes
+    wrong: a model call is worth attempting at full size, never worth losing to a resize.
+    """
+    limit = _vision_max_px()
+    try:
+        from PIL import Image
+    except ImportError:
+        return png_bytes
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as im:
+            if max(im.size) <= limit:
+                return png_bytes
+            shrunk = im.convert("RGB")
+        shrunk.thumbnail((limit, limit), Image.LANCZOS)
+        buf = io.BytesIO()
+        shrunk.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+    except Exception:  # noqa: BLE001 - send the original rather than nothing
+        return png_bytes
 
 
 def _ollama_root() -> str:
@@ -279,7 +338,15 @@ def _ask_about_image(
     if not api_key:
         return "", model, "no API key (BOT_CHAT_API_KEY)"
 
-    b64 = base64.standard_b64encode(png_bytes).decode("ascii")
+    sent_bytes = _downscale_for_vision(png_bytes)
+    if len(sent_bytes) != len(png_bytes):
+        print(
+            f"[vision] screenshot downscaled for the model: "
+            f"{len(png_bytes):,} -> {len(sent_bytes):,} bytes "
+            f"(longest side capped at {_vision_max_px()}px)",
+            flush=True,
+        )
+    b64 = base64.standard_b64encode(sent_bytes).decode("ascii")
     payload: dict[str, Any] = {
         "model": model,
         "messages": [
@@ -298,6 +365,9 @@ def _ask_about_image(
         "max_tokens": max_tokens,
         "temperature": 0,
     }
+    num_ctx = _vision_num_ctx()
+    if num_ctx:
+        payload["options"] = {"num_ctx": num_ctx}
     try:
         from chatagent import enrich_ollama_chat_payload
 

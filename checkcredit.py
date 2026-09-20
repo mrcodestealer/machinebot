@@ -4604,6 +4604,84 @@ def _egm_click_hide_grid_if_shown(dlg: Any, *, timeout_ms: int = 15_000) -> None
         pass
 
 
+def _trim_blank_bottom(
+    path: str,
+    *,
+    keep_px: int = 16,
+    tolerance: int = 6,
+    edge_slack: int = 24,
+) -> str:
+    """
+    Crop trailing rows that draw nothing off the bottom of a screenshot.
+
+    The EGM operation dialog reports a box taller than it draws — something inside it is sized in
+    ``vh``, so the tall capture viewport inflates it — leaving roughly a quarter of the PNG blank
+    under the last card. Trimming the flat rows is cause-agnostic: it fixes the picture whatever
+    the offending element is, and it cannot eat real content, because a row stops counting as
+    blank the moment anything is drawn on it.
+
+    A row is blank when every sampled pixel matches every other within ``tolerance`` **and** the
+    colour is near-white, which is the dialog's background. Judging each row on its own uniformity
+    avoids comparing against a corner pixel, since the corners are exactly where the modal's
+    rounded border and shadow live.
+
+    ``edge_slack`` rows of that border/shadow are stepped over before the scan starts — without it
+    the very first row tested is part of the rounded corner and the scan stops there. ``keep_px``
+    leaves a margin so the result does not look shorn. Returns ``path`` unchanged on any failure:
+    a cosmetic crop must never cost the screenshot. ``EGM_SHOT_TRIM=0`` disables it.
+    """
+    if (os.environ.get("EGM_SHOT_TRIM") or "1").strip().lower() in ("0", "false", "no", "off"):
+        return path
+    try:
+        from PIL import Image
+    except ImportError:
+        return path
+    try:
+        with Image.open(path) as im:
+            rgb = im.convert("RGB")      # convert() loads the data, so the file can close
+        width, height = rgb.size
+        if width < 8 or height < 64:
+            return path
+        px = rgb.load()
+
+        def blank(y: int) -> bool:
+            lo = [255, 255, 255]
+            hi = [0, 0, 0]
+            for x in range(0, width, 3):
+                pix = px[x, y]
+                for i in range(3):
+                    if pix[i] < lo[i]:
+                        lo[i] = pix[i]
+                    if pix[i] > hi[i]:
+                        hi[i] = pix[i]
+            if any(hi[i] - lo[i] > tolerance for i in range(3)):
+                return False
+            return all(lo[i] >= 235 for i in range(3))
+
+        y = height - 1
+        skipped = 0
+        while y >= 0 and skipped < edge_slack and not blank(y):
+            y -= 1
+            skipped += 1
+        if y < 0 or not blank(y):
+            return path                  # nothing blank at the bottom
+        blank_end = y
+        while y >= 0 and blank(y):
+            y -= 1
+        content_bottom = y               # last row that draws something
+        if content_bottom < 0:
+            return path                  # an entirely blank image is not ours to judge
+        if blank_end - content_bottom <= keep_px:
+            return path                  # nothing worth removing
+        bottom = min(height, content_bottom + 1 + keep_px)
+        if bottom >= height:
+            return path
+        rgb.crop((0, 0, width, bottom)).save(path)
+        return path
+    except Exception:  # noqa: BLE001 - never lose a screenshot over a cosmetic crop
+        return path
+
+
 def _egm_capture_viewport(width_env: str, height_env: str) -> dict[str, int]:
     """
     Viewport for an EGM operation-dialog capture.
@@ -4890,6 +4968,9 @@ def screenshot_egm_status_window(
             # away: the vision model reads the game screen's bottom-bar CREDIT/BET/WIN counters
             # off this PNG, and at 1x those digits are too small to be read reliably.
             dlg.screenshot(path=out_path, animations="disabled", scale="device")
+            # The dialog box is taller than it draws (a vh-sized child grows with the tall
+            # viewport), so drop the blank band it leaves under the last card.
+            _trim_blank_bottom(out_path)
         finally:
             browser.close()
     return out_path
