@@ -2235,7 +2235,12 @@ def _url_machine_credit(machine_display: str, machine_substr: Optional[str]) -> 
     return jackpotvision.read_machine_credit(png, machine_display=machine_display)
 
 
-def run_url_job(chat_id: str, machines: list[str], date_iso: str = "") -> None:
+def run_url_job(
+    chat_id: str,
+    machines: list[str],
+    date_iso: str = "",
+    thread_root_message_id: Optional[str] = None,
+) -> None:
     """
     ``/url`` — for each machine: read the day's logic log, take the player ``/checkcredit``
     would put on button **1**, read the cabinet's **Machine Credit** off its own operation window
@@ -2248,11 +2253,22 @@ def run_url_job(chat_id: str, machines: list[str], date_iso: str = "") -> None:
     Each machine gets one card of its own — machine name as the title, the screenshot as the only
     content — posted as soon as it is ready, so a list of machines streams in rather than landing
     all at once. No player card and no buttons: the pick a human would make is made here.
+
+    Everything goes **inside the thread** on the message that asked for it: a ten-machine run is
+    twenty-odd messages, and in the main chat stream that buries whatever else the group is doing.
     """
+    thread_root = (
+        (thread_root_message_id or _get_checkcredit_thread_root(chat_id) or "").strip() or None
+    )
+    if thread_root:
+        _set_checkcredit_thread_root(chat_id, thread_root)
+
+    def _url_send(text: str, **kwargs) -> dict:
+        return _checkcredit_send(chat_id, text, thread_root=thread_root, **kwargs)
     try:
         import checkcredit
     except ImportError as e:
-        send_message(chat_id, f"❌ Cannot load checkcredit module: {e}")
+        _url_send(f"❌ Cannot load checkcredit module: {e}")
         return
     shot = getattr(checkcredit, "screenshot_np_recharge_detail", None)
     if not callable(shot):
@@ -2273,7 +2289,7 @@ def run_url_job(chat_id: str, machines: list[str], date_iso: str = "") -> None:
             else datetime.now().date()
         )
     except ValueError:
-        send_message(chat_id, f"❌ Invalid date `{date_iso}` — use `YYYY-MM-DD`.")
+        _url_send(f"❌ Invalid date `{date_iso}` — use `YYYY-MM-DD`.")
         return
 
     wanted = list(machines or [])
@@ -2281,8 +2297,7 @@ def run_url_job(chat_id: str, machines: list[str], date_iso: str = "") -> None:
     dropped = wanted[cap_n:]
     wanted = wanted[:cap_n]
     total = len(wanted)
-    send_message(
-        chat_id,
+    _url_send(
         f"⏳ `/url` — {total} machine(s) on `{base_day.isoformat()}`: "
         + ", ".join(f"`{m}`" for m in wanted)
         + (
@@ -2325,8 +2340,7 @@ def run_url_job(chat_id: str, machines: list[str], date_iso: str = "") -> None:
                     day, np_fu, choice = prev, np_prev, choice_prev
             if choice is None:
                 days_txt = " or ".join(f"`{d.isoformat()}`" for d in looked_at)
-                send_message(
-                    chat_id,
+                _url_send(
                     f"ℹ️ `{mq}` ({idx}/{total}) — no player with a credit time in the "
                     f"{days_txt} logic logs, so there is no recharge Detail to open.",
                 )
@@ -2375,7 +2389,7 @@ def run_url_job(chat_id: str, machines: list[str], date_iso: str = "") -> None:
             )
             key = upload_image_lark(path) or ""
             if not key:
-                send_message(chat_id, f"❌ `{md}` — screenshot upload failed.")
+                _url_send(f"❌ `{md}` — screenshot upload failed.")
                 continue
             # Which machine / player / moment this Detail belongs to. The date is spelled out
             # because the fallback above may have moved the read to the previous day.
@@ -2391,13 +2405,13 @@ def run_url_job(chat_id: str, machines: list[str], date_iso: str = "") -> None:
             sent = False
             if callable(build_card):
                 card = build_card(machine_display=md, image_key=key, subtitle=caption)
-                resp = send_message(chat_id, json.dumps(card), msg_type="interactive")
+                resp = _url_send(json.dumps(card), msg_type="interactive")
                 sent = isinstance(resp, dict) and resp.get("code") == 0
                 if not sent:
                     print(f"[url] card rejected for {md}: {resp!r}", flush=True)
             if not sent:
-                send_message(chat_id, caption)
-                img = send_image_message(chat_id, key)
+                _url_send(caption)
+                img = _checkcredit_send_image(chat_id, key, thread_root=thread_root)
                 sent = isinstance(img, dict) and img.get("code") == 0
             # Per machine, right under its own card — a list of machines interleaves, so one
             # notice at the end of the run would not say which cabinet it is about. Only once
@@ -2405,9 +2419,9 @@ def run_url_job(chat_id: str, machines: list[str], date_iso: str = "") -> None:
             # to act on a screenshot they never got.
             notice = _cashout_reboot_notice() if sent else ""
             if notice:
-                send_message(chat_id, notice)
+                _url_send(notice)
         except Exception as e:
-            send_message(chat_id, f"❌ `{mq}` ({idx}/{total}) — recharge Detail failed: {e}")
+            _url_send(f"❌ `{mq}` ({idx}/{total}) — recharge Detail failed: {e}")
             print(f"[url] {mq}: {e!r}", flush=True)
         finally:
             if path and os.path.isfile(path):
@@ -3870,16 +3884,20 @@ def _handle_machine_message(
                 date_su = tok          # one optional date applies to every machine in the list
                 continue
             machines_su.append(tok)
+        thread_root_su = _checkcredit_begin_thread(chat_id, message_id)
         if not machines_su:
-            send_message(
+            _checkcredit_send(
                 chat_id,
                 "❌ Usage: `/url <machine(s)>` — Third Http **recharge Detail** of each "
                 "machine's latest player, one card each (no button to tap).\n"
                 "One machine per line, or all on one line; add `YYYY-MM-DD` for another day:\n"
                 "```\n/url\nNWR2096\nNCH1498\nNWR2110\n```",
+                thread_root=thread_root_su,
             )
             return
-        start_lark_background_thread(run_url_job, chat_id, machines_su, date_su)
+        start_lark_background_thread(
+            run_url_job, chat_id, machines_su, date_su, thread_root_su
+        )
         return
 
     # /npthirdhttp <player_id> [date time]
