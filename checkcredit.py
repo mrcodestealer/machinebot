@@ -2709,14 +2709,103 @@ _ERROR_CTX_BG = (244, 244, 244)  # #F4F4F4
 _ERROR_CTX_FG = (0, 0, 0)
 
 
+# Where the chosen font came from, printed once per process. A silent fallback is exactly the
+# bug this used to hide, so the log line is the point, not decoration.
+_ERROR_CTX_FONT_LOGGED = False
+
+
+def _log_error_ctx_font_once(what: str) -> None:
+    global _ERROR_CTX_FONT_LOGGED
+    if not _ERROR_CTX_FONT_LOGGED:
+        _ERROR_CTX_FONT_LOGGED = True
+        print(f"[checkcredit] error-context font: {what}", flush=True)
+
+
+_MONO_FONT_SCAN_CACHE: Optional[list[str]] = None
+
+
+def _mono_font_dir_candidates() -> list[str]:
+    """
+    Any monospace face the host actually ships, wherever this distro keeps its fonts.
+
+    The hardcoded list below covers macOS and two Debian font packages. A server with neither
+    ``fonts-dejavu-core`` nor ``fonts-liberation`` installed matched nothing at all, so glob the
+    usual roots for anything mono-looking rather than giving up on a fixed list of seven paths.
+
+    Scanned once per process: ``/machineerror`` renders up to six of these images in a loop, and
+    the font tree does not change underneath a running bot.
+    """
+    global _MONO_FONT_SCAN_CACHE
+    if _MONO_FONT_SCAN_CACHE is not None:
+        return _MONO_FONT_SCAN_CACHE
+
+    import glob
+
+    roots = [
+        "/usr/share/fonts",
+        "/usr/local/share/fonts",
+        "/usr/share/texmf/fonts",
+        os.path.expanduser("~/.fonts"),
+        os.path.expanduser("~/.local/share/fonts"),
+        "/Library/Fonts",
+        "/System/Library/Fonts",
+        os.path.expanduser("~/Library/Fonts"),
+    ]
+    hits: list[str] = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for ext in ("ttf", "otf", "ttc"):
+            try:
+                hits.extend(glob.glob(os.path.join(root, "**", f"*.{ext}"), recursive=True))
+            except OSError:
+                continue
+    # "Mono" in the file name is how every common monospace face is shipped (DejaVuSansMono,
+    # LiberationMono, NotoSansMono, JetBrainsMono, SFMono…). Sorted so the pick is stable across
+    # runs rather than filesystem order — a screenshot that changes font between runs reads as a
+    # different tool having made it.
+    mono = [p for p in hits if "mono" in os.path.basename(p).lower()]
+    if not mono:
+        mono = [p for p in hits if "courier" in os.path.basename(p).lower()]
+
+    def _weight_rank(path: str) -> tuple:
+        # Plain alphabetical puts "DejaVuSansMono-Bold.ttf" before "DejaVuSansMono.ttf" ('-' sorts
+        # under '.'), so the naive sort picks Bold on exactly the host this is meant to rescue.
+        # A log viewer is upright and regular; rank that first and keep the name as the tiebreak.
+        name = os.path.basename(path).lower()
+        slanted = any(t in name for t in ("italic", "oblique"))
+        heavy = any(t in name for t in ("bold", "black", "heavy", "light", "thin", "medium"))
+        return (slanted, heavy, name)
+
+    _MONO_FONT_SCAN_CACHE = sorted(set(mono), key=_weight_rank)
+    return _MONO_FONT_SCAN_CACHE
+
+
 def _load_mono_font_for_error_png(*, font_px: int) -> Optional[Any]:
-    """Monospace stack aligned with macOS log / terminal look (SF Mono / Menlo / Courier)."""
+    """
+    A font that can actually be drawn at ``font_px``.
+
+    The order is: an explicitly pinned ``CHECKCREDIT_ERROR_CTX_FONT``, the known macOS/Debian
+    monospace paths, then any mono face found on disk, then Pillow's own **scalable** default.
+
+    The last step matters. ``ImageFont.load_default()`` with no size returns a fixed **11px
+    bitmap** that silently ignores the size asked for — on a host with no font packages every
+    error-context screenshot was drawn at 11px inside a canvas laid out for 24px, which is what
+    made the text look tiny and blurry once Lark scaled the image up. Pillow ≥ 10.1 accepts
+    ``size=`` and returns a real vector font instead, so the text stays sharp even with no system
+    fonts at all. Install ``fonts-dejavu-core`` on the host for a true monospace look.
+    """
     try:
         from PIL import ImageFont
     except Exception:
         return None
     size = max(10, min(40, int(font_px)))
-    candidates = [
+
+    pinned = (os.environ.get("CHECKCREDIT_ERROR_CTX_FONT") or "").strip()
+    candidates: list[tuple[str, bool]] = []
+    if pinned:
+        candidates.append((pinned, pinned.lower().endswith(".ttc")))
+    candidates += [
         ("/System/Library/Fonts/Supplemental/SFMono-Regular.otf", False),
         ("/System/Library/Fonts/SFNSMono.ttf", False),
         ("/System/Library/Fonts/Supplemental/Menlo.ttc", True),
@@ -2728,13 +2817,63 @@ def _load_mono_font_for_error_png(*, font_px: int) -> Optional[Any]:
     for p, is_ttc in candidates:
         if os.path.isfile(p):
             try:
-                if is_ttc or p.lower().endswith(".ttc"):
-                    return ImageFont.truetype(p, size, index=0)
-                return ImageFont.truetype(p, size)
-            except Exception:
+                font = (
+                    ImageFont.truetype(p, size, index=0)
+                    if (is_ttc or p.lower().endswith(".ttc"))
+                    else ImageFont.truetype(p, size)
+                )
+                _log_error_ctx_font_once(f"{p} @ {size}px")
+                return font
+            except Exception as ex:
+                if p == pinned:
+                    # Said here rather than after the loop: a pin that silently loses to the next
+                    # candidate is the hardest kind of setting to debug.
+                    print(
+                        f"[checkcredit] CHECKCREDIT_ERROR_CTX_FONT={pinned!r} could not be "
+                        f"loaded ({ex!r}) — trying the rest of the font stack.",
+                        flush=True,
+                    )
                 continue
+        elif p == pinned:
+            print(
+                f"[checkcredit] CHECKCREDIT_ERROR_CTX_FONT={pinned!r} is not a file — "
+                "trying the rest of the font stack.",
+                flush=True,
+            )
+    # Only scanned once the known paths have all missed — on a host that ships DejaVu or Menlo
+    # this whole walk never runs.
+    for p in _mono_font_dir_candidates():
+        try:
+            font = (
+                ImageFont.truetype(p, size, index=0)
+                if p.lower().endswith(".ttc")
+                else ImageFont.truetype(p, size)
+            )
+            _log_error_ctx_font_once(f"{p} @ {size}px (found by scanning the font tree)")
+            return font
+        except Exception:
+            continue
     try:
-        return ImageFont.load_default()
+        font = ImageFont.load_default(size=size)  # Pillow >= 10.1: scalable, honours `size`
+        _log_error_ctx_font_once(
+            f"no system monospace font found — Pillow built-in @ {size}px. "
+            "Install `fonts-dejavu-core` on the host for a true monospace look."
+        )
+        return font
+    except Exception:
+        # TypeError is old Pillow rejecting `size=`; anything else is a Pillow built without
+        # FreeType. Both still have the bitmap below, so never give up here — returning None
+        # would drop the image entirely, which is worse than a small one.
+        pass
+    try:
+        # Pillow < 10.1 only has the 11px bitmap. The renderer measures whatever it gets, so the
+        # image stays tight and legible — just smaller than asked for.
+        font = ImageFont.load_default()
+        _log_error_ctx_font_once(
+            "no system font and Pillow < 10.1 — fixed 11px bitmap. "
+            "Upgrade Pillow (>= 10.1) or install `fonts-dejavu-core` on the host."
+        )
+        return font
     except Exception:
         return None
 
@@ -2773,16 +2912,24 @@ def _render_text_lines_png(lines: list[str], *, title: str, output_path: str) ->
     all_lines = body_lines
     probe = Image.new("RGB", (10, 10), _ERROR_CTX_BG)
     draw = ImageDraw.Draw(probe)
+    # Spacing and margins below are written in units of the font size that was *asked* for. A
+    # fallback font can come out smaller than that — Pillow's bitmap default ignores the size
+    # outright — and the fixed spacing then strands small text in a mostly empty canvas, which
+    # is precisely how the missing-font bug looked. Scale the layout by what the glyphs actually
+    # measure, so a smaller font yields a smaller image rather than a blurry one. Caps and digits
+    # have no descenders, so their ink height is ~0.72 em.
+    cap_h = _measure_text(draw, "ABCXYZ0123456789", font)[1]
+    eff_dpr = dpr * min(1.0, max(0.25, cap_h / max(1.0, font_px * 0.72)))
     max_w = 0
-    line_h = int(14 * dpr)
+    line_h = int(14 * eff_dpr)
     for ln in all_lines:
         w, h = _measure_text(draw, ln, font)
         max_w = max(max_w, w)
-        line_h = max(line_h, h + max(2, int(round(3 * dpr))))
-    pad_x = int(round(14 * dpr))
-    pad_y = int(round(12 * dpr))
-    width = min(int(4800 * dpr), max(int(640 * dpr), max_w + pad_x * 2))
-    height = max(120, line_h * len(all_lines) + pad_y * 2)
+        line_h = max(line_h, h + max(2, int(round(3 * eff_dpr))))
+    pad_x = int(round(14 * eff_dpr))
+    pad_y = int(round(12 * eff_dpr))
+    width = min(int(4800 * dpr), max(int(640 * eff_dpr), max_w + pad_x * 2))
+    height = max(int(120 * eff_dpr / max(dpr, 1.0)), line_h * len(all_lines) + pad_y * 2)
     try:
         img = Image.new("RGB", (width, height), _ERROR_CTX_BG)
         d = ImageDraw.Draw(img)

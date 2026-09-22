@@ -12,7 +12,11 @@ apscheduler>=3.10
 # scrape loop, OSM-Watch warm browser + encoder scraper (osmwatch), checkcredit /
 # checkmachinelog Third-Http screenshots
 playwright>=1.44              # then: playwright install chromium
-pillow>=10.0                  # error-context / EGM screenshot rendering
+pillow>=10.1                  # error-context / EGM screenshot rendering. 10.1 is the floor
+                              # on purpose: ImageFont.load_default(size=...) arrived there,
+                              # and it is what keeps /machineerror log screenshots sharp on
+                              # a host with no system fonts (10.0 falls back to an 11px
+                              # bitmap that ignores the requested size).
 
 # Amount Loss / CHECKLOG (/al) — Aliyun SLS logs + FPMS TOTP login
 pyotp>=2.9
