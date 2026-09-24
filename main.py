@@ -98,6 +98,12 @@ load_dotenv(_ENV_PATH)
 
 from flask import Flask, request, jsonify, Response
 
+try:
+    import health_report  # daily health card: counters bumped below, started in _run_main_entry
+except Exception as _hr_import_err:  # optional: a missing/broken copy must never stop the bot from booting
+    health_report = None
+    print(f"[health] daily report off: {_hr_import_err!r}", flush=True)
+
 # ================= CONFIGURATION =================
 APP_ID = os.getenv("APP_ID")
 APP_SECRET = os.getenv("APP_SECRET")
@@ -4359,6 +4365,11 @@ def lark_webhook():
         print(f"[lark] verification token mismatch (got {token_in!r}) — 403", flush=True)
         return jsonify({"error": "invalid verification token"}), 403
 
+    # Every inbound event (both modes: persistent-connection frames are POSTed here too).
+    if health_report is not None:
+        health_report.bump("Lark events")
+        health_report.mark("Last Lark event")
+
     hdr_et = _lark_header_event_type(data)
 
     # ---- card.action.trigger (prod-batch / sm wizard / findmachine form / reminder buttons) ----
@@ -4515,6 +4526,8 @@ def lark_webhook():
         if chat_type != "p2p" and not bot_mentioned and not is_np_reply:
             return _lark_im_ack()
 
+        if health_report is not None:
+            health_report.bump("Messages to bot")
         _handle_machine_message(
             chat_id,
             sender_id,
@@ -4790,8 +4803,13 @@ def _lark_ws_apply_card_frame_patch() -> None:
     print("[lark-ws] patched lark-oapi ws Client for CARD callbacks", flush=True)
 
 
+# The running ws.Client — kept only so health_checks can tell whether it is connected.
+_lark_ws_client = None
+
+
 def _run_lark_ws_forever() -> None:
     """Block on Lark persistent connection (im.message + card.action.trigger)."""
+    global _lark_ws_client
     import lark_oapi as lark
 
     if not (APP_ID and APP_SECRET):
@@ -4831,6 +4849,7 @@ def _run_lark_ws_forever() -> None:
         log_level=lark.LogLevel.INFO,
         domain=domain,
     )
+    _lark_ws_client = cli
     print(
         "[lark-ws] Persistent connection active (im.message + card.action.trigger). "
         "Developer console: Subscription mode → Receive events through persistent connection.",
@@ -4971,6 +4990,30 @@ def _run_main_entry() -> int:
             ).start()
         except Exception as _boot_mip_err:
             print(f"[machineip] startup pre-warm skipped: {_boot_mip_err!r}", flush=True)
+        if health_report is not None:
+            try:
+                # Daily health card to the ops group (HEALTH_REPORT_* in .env.example). start()
+                # only spawns its thread; the state file stops a restart from re-sending.
+                import health_checks as _boot_hc
+
+                _this = sys.modules[__name__]
+                _hr_started = health_report.start(
+                    "machine bot",
+                    # Plain send to the chat (never a quoted reply), 15 s timeout + Lark uuid so a retry
+                    # cannot post twice; send_message's requests.post has no timeout and could hang.
+                    send_card=health_report.make_lark_sender(APP_ID, APP_SECRET),
+                    checks=_boot_hc.checks(_this),
+                    expect_threads=_boot_hc.expect_threads(_this),
+                )
+                print(
+                    "[health] daily report scheduled"
+                    if _hr_started
+                    else "[health] daily report not started (not a systemd service, HEALTH_REPORT_ENABLE=0, "
+                    "or start() failed; see stderr)",
+                    flush=True,
+                )
+            except Exception as _boot_hr_err:
+                print(f"[health] daily report start skipped: {_boot_hr_err!r}", flush=True)
 
         if _lark_ws_uses_persistent_connection():
             # /wm dashboard is served by this Flask; bind 0.0.0.0 via FLASK_BIND_HOST when the
