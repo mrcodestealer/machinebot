@@ -12,6 +12,7 @@ Runs on its own Lark app in **persistent connection** mode (Subscription mode �
 | `ALL NWR MACHINES <Venue> set maintenance` | venue-wide set/unset expanded from `webmachine_data.json` |
 | `/sm` | set-machine wizard: env picker card → action → machines |
 | `/set` | set maintenance/test running **now** — the same form as `/sst` minus the date/time: **Game Type** (env → game type → venue) or **Machines** (same box and tokens as `/sst`) → review → confirm. `/set NWR2000-NWR2020` pre-fills the box. Designated group / operator PM only |
+| `/unset` | the same form to **unset** maintenance/test. After the job's summary and screenshots, it opens each affected backend's **Game Name** page (`/egm/floor/gameNameList`) and, for any game still showing `(TEST)`, posts *"Detected {game name} is in test. Kindly inform SRE to unset the game name."* Read-only on that page — never clicks BatchTest / Show / Hidden. Anything it could not verify is reported, never silently skipped. `GAME_NAME_CHECK=0` turns the check off |
 | `NWR2000-NWR2020` | a **range** anywhere a machine list is accepted (`/sst`, `/set`, `/sm`, `/nwrsetmaintenance`, `set maintenance …`) expands to every cabinet in the span. Also `NWR2000-2020`, `NWR2000 to NWR2020`. A hyphenated display name is never mistaken for a range — see `machine_ranges.py` |
 | `/stresstest <paste announcement>` | one-time reminder 10 min before the announced set-maintenance time |
 | maintenance schedule paste (@bot) | parses action + future time + machine list → auto reminder 10 min before |

@@ -3284,6 +3284,8 @@ _HELP_TEXT = (
     "• `/sstlist` — pending scheduled runs, with a Delete button each\n"
     "• `/set` — set maintenance/test **now** — same form as `/sst` without the date/time\n"
     "   (game type or machine list; `NWR2000-NWR2020` ranges work)\n"
+    "• `/unset` — the same form to **unset**; afterwards flags any game still in TEST on the\n"
+    "   backend's Game Name page\n"
     "• `/stresstest <paste announcement>` — one-time reminder 10 min before the set time\n"
     "• paste a maintenance schedule (with @bot) — auto reminder 10 min before\n"
     "• `machine status NWR2008` — read-only status from the live scrape\n"
@@ -3422,13 +3424,16 @@ def _machine_tokens_only(text: str) -> "list[str] | None":
 
 
 def _sst_run_batch(
-    chat_id: str, action: str, machines: list, *, thread_root: Optional[str] = None
+    chat_id: str, action: str, machines: list, *, thread_root: Optional[str] = None,
+    on_done=None,
 ) -> None:
     """
-    Fire a scheduled ``/sst`` run through the normal prod-batch job path.
+    Fire a ``/sst`` / ``/set`` / ``/unset`` run through the normal prod-batch job path.
 
     ``thread_root`` is the "Now will start …" card's message_id, so the job's own progress
-    messages **and** the EGM screenshots post inside that card's thread.
+    messages **and** the EGM screenshots post inside that card's thread. ``on_done`` (``/unset``'s
+    Game Name check) runs after the job's summary and screenshots — see
+    ``smmachine.start_prod_batch_job_direct``.
     """
     import smmachine as _sm
 
@@ -3441,6 +3446,7 @@ def _sst_run_batch(
         machines=machines,
         send_message=make_prod_batch_thread_send(chat_id, thread_root=root),
         thread_root_message_id=root,
+        on_done=on_done,
     )
 
 
@@ -3626,30 +3632,34 @@ def _handle_machine_message(
                 pass
         return
 
-    # ---- /set — immediate Set Maintenance / Test (game type or machines; no date/time) ----
-    # Same gate as /sst: it makes the same PROD change, only without the scheduler in between.
+    # ---- /set and /unset — immediate Set / Unset Maintenance / Test (no date/time) ----
+    # Same gate as /sst: they make the same PROD change, only without the scheduler in between.
     # In a group the bot only sees the message when it is @mentioned, so "tag the bot and send
-    # /set" is already what reaching this branch means.
+    # /set" is already what reaching this branch means. /unset additionally runs the Game Name
+    # TEST check once the job is done (gamename_check.py).
     #
     # ``/set NWR2000-NWR2020`` opens the card with the box already filled. Anything carrying an
-    # action word (``/set maintenance NWR2008``) is left alone — the free-text handler further
-    # down owns that phrasing, and swallowing it here would break it.
+    # action word (``/set maintenance NWR2008``, ``/unset test NWR2008``) is left alone — the
+    # free-text handler further down owns that phrasing, and swallowing it here would break it.
     _sn_rest = " ".join(cmd_parts[1:]).strip()
-    if (cmd in ("/set", "/setmachine")
+    if (cmd in ("/set", "/setmachine", "/unset")
             and (not _sn_rest
                  or not re.search(r"(?i)\b(?:un)?set\b|\bmaintenance\b|\btest\b", _sn_rest))):
+        _sn_cmd = "/unset" if cmd == "/unset" else "/set"
         try:
             import setnow as _setnow_mod
 
             _sn_is_pm = (chat_type == "p2p")
             if not _setnow_mod.access_allowed(chat_id, sender_id=sender_id or "", is_pm=_sn_is_pm):
-                send_message(chat_id, "🚫 `/set` is not available in this private chat."
+                send_message(chat_id, f"🚫 `{_sn_cmd}` is not available in this private chat."
                              if _sn_is_pm else
-                             "🚫 `/set` is only available in the designated group.")
+                             f"🚫 `{_sn_cmd}` is only available in the designated group.")
                 return
             # A machines argument also picks the Machines target — that is plainly what was meant.
             _sn_sid = _setnow_mod.new_session(
-                chat_id, machines_text=_sn_rest,
+                chat_id,
+                op=_setnow_mod.OP_UNSET if _sn_cmd == "/unset" else _setnow_mod.OP_SET,
+                machines_text=_sn_rest,
                 thread_root=_thread_root_for_prod_batch(),
             )
             _sn_sess = _setnow_mod.get_session(_sn_sid) or {}
@@ -3661,7 +3671,7 @@ def _handle_machine_message(
         except Exception as _sn_err:
             print(f"❌ setnow: {_sn_err!r}", flush=True)
             try:
-                send_message(chat_id, f"❌ /set failed: {_sn_err}")
+                send_message(chat_id, f"❌ {_sn_cmd} failed: {_sn_err}")
             except Exception:
                 pass
         return

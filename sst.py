@@ -1510,7 +1510,7 @@ def resolve_session_target(session: dict[str, Any]) -> tuple[list[dict], str]:
 
 
 def problem_report_md(problems: list[dict], found: list[dict], *, max_chars: int = 8_000,
-                      game_type_hint: bool = True) -> str:
+                      game_type_hint: bool = True, scheduled: bool = True) -> str:
     """
     Report **every** token that failed to resolve, with each candidate's ``belongs``.
 
@@ -1531,7 +1531,9 @@ def problem_report_md(problems: list[dict], found: list[dict], *, max_chars: int
     # Counted separately, not as "N of M": duplicate tokens collapse into one ``found`` entry, so
     # ``len(problems) + len(found)`` is not the number of lines the operator typed.
     noun = "name" if len(problems) == 1 else "names"
-    head = f"⚠️ **{len(problems)} machine {noun} did not resolve** — nothing was scheduled."
+    # /set and /unset run immediately — "scheduled" would be wrong there.
+    head = (f"⚠️ **{len(problems)} machine {noun} did not resolve** — nothing was "
+            f"{'scheduled' if scheduled else 'changed'}.")
     if found:
         head += f" ({len(found)} resolved.)"
     lines = [head]
@@ -1547,11 +1549,12 @@ def problem_report_md(problems: list[dict], found: list[dict], *, max_chars: int
             lines.append(f"• {c.get('belongs') or '—'} — `{c.get('machine') or ''}`")
         if len(cands) > 8:
             lines.append(f"• … {len(cands) - 8} more")
-    # /set's card has no Back button and no Game Type step, so pointing at them there would send
-    # the operator looking for controls that are not on their card.
+    # The /set and /unset cards label that button "◀ Change target"; name it as it appears there,
+    # and never point an /unset operator at a different command.
     tail = "Correct the names above (paste them exactly as the dashboard shows them)"
     tail += (", or tap **Back** and use **Game Type** to target a whole game type."
-             if game_type_hint else ", or use `/set` and choose **Game Type** to target a whole game type.")
+             if game_type_hint else
+             ", or tap **◀ Change target** and choose **Game Type** to target a whole game type.")
     lines += ["", tail]
 
     txt = "\n".join(lines)

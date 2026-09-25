@@ -1,5 +1,10 @@
 """
-``/set`` — **immediate** Set-Maintenance / Set-Test.
+``/set`` and ``/unset`` — **immediate** Set / Unset Maintenance / Test.
+
+One card, one state machine; the session's ``op`` says which. ``/unset`` runs the ``unset_*``
+actions and, once the job has posted its summary and screenshots, hands the machines to
+:mod:`gamename_check`, which flags any game still marked (TEST) on the backend's Game Name page.
+Everything below describes both commands.
 
 :mod:`sst` with the schedule taken out. ``/sst`` asks for a date and a time because it parks the
 work on the scheduler; ``/set`` runs the moment the second confirmation is tapped, so a date/time
@@ -53,6 +58,42 @@ MODE_MACHINES = "machines"
 
 CMD = "/set"
 
+# /set and /unset are one card with one state machine; ``op`` on the session is the only switch.
+OP_SET = "set"
+OP_UNSET = "unset"
+
+
+def _op(session: dict[str, Any]) -> str:
+    return OP_UNSET if str(session.get("op") or "") == OP_UNSET else OP_SET
+
+
+def _cmd(session: dict[str, Any]) -> str:
+    return "/unset" if _op(session) == OP_UNSET else "/set"
+
+
+def _verb(session: dict[str, Any]) -> str:
+    return "Unset" if _op(session) == OP_UNSET else "Set"
+
+
+def selection_text_for(session: dict[str, Any], maint: bool, test: bool) -> str:
+    """The line under the toggles, worded for /set or /unset."""
+    v = _verb(session)
+    if maint and test:
+        return f"✅ Selected {v} Maintenance and Test"
+    if maint:
+        return f"✅ Selected {v} Maintenance"
+    if test:
+        return f"✅ Selected {v} Test"
+    return f"⚠️ Kindly select {v} Maintenance or Test"
+
+
+def selection_action_for(session: dict[str, Any], maint: bool, test: bool) -> str | None:
+    """``set_maint`` … or ``unset_maint`` … — the prod-batch action codes (ACTION_LABELS)."""
+    base = selection_action(maint, test)
+    if not base:
+        return None
+    return "un" + base if _op(session) == OP_UNSET else base
+
 
 def chat_allowed(chat_id: str) -> bool:
     """Same designated groups as ``/sst`` — this runs the same PROD change, only sooner."""
@@ -86,11 +127,12 @@ def _cleanup_sessions() -> None:
             _SESSIONS.pop(sid, None)
 
 
-def new_session(chat_id: str, *, machines_text: str = "",
+def new_session(chat_id: str, *, op: str = OP_SET, machines_text: str = "",
                 thread_root: str | None = None) -> str:
     """
-    A fresh form session. ``machines_text`` pre-fills the box (``/set NWR2000-NWR2020``) and
-    starts the card on the Machines target, since that is plainly what was meant.
+    A fresh form session. ``op`` is ``"set"`` or ``"unset"`` — which command was typed — and never
+    changes afterwards. ``machines_text`` pre-fills the box (``/set NWR2000-NWR2020``) and starts
+    the card on the Machines target, since that is plainly what was meant.
     """
     _cleanup_sessions()
     sid = uuid.uuid4().hex[:12]
@@ -99,6 +141,7 @@ def new_session(chat_id: str, *, machines_text: str = "",
         _SESSIONS[sid] = {
             "chat_id": chat_id,
             "thread_root": (thread_root or "").strip() or None,
+            "op": OP_UNSET if op == OP_UNSET else OP_SET,
             # target selection: "" (not chosen) | "game" | "machines"
             "mode": MODE_MACHINES if seed else "",
             "maint": False,
@@ -287,12 +330,14 @@ def build_form_card(sid: str, session: dict[str, Any], *, error: str = "") -> di
     venue = str(session.get("venue") or "").strip().upper()
 
     form_elements: list[dict] = [
-        {"tag": "div", "text": {"tag": "lark_md", "content": "**What to set** — tap to select:"}},
+        {"tag": "div", "text": {"tag": "lark_md",
+                                "content": f"**What to {_verb(session).lower()}** — tap to select:"}},
         _btn_row([
             _toggle_button("Maintenance", on=maint, sid=sid, which="maint"),
             _toggle_button("Test", on=test, sid=sid, which="test"),
         ]),
-        {"tag": "div", "text": {"tag": "lark_md", "content": selection_text(maint, test)}},
+        {"tag": "div", "text": {"tag": "lark_md",
+                                "content": selection_text_for(session, maint, test)}},
     ]
 
     # Loaded once and reused by the venue step and the review list: every call re-reads
@@ -354,7 +399,8 @@ def build_form_card(sid: str, session: dict[str, Any], *, error: str = "") -> di
         # returns [] otherwise, so single-venue game types go straight to the review list.
         names = " + ".join(v for v, _ in venue_choices)
         total = sum(n for _, n in venue_choices)
-        hint = f"**{game_type}** has machines at more than one venue — pick which to set."
+        hint = (f"**{game_type}** has machines at more than one venue — pick which to "
+                f"{_verb(session).lower()}.")
         form_elements.append({"tag": "div", "text": {"tag": "lark_md",
                               "content": f"**Environment:** {env_code}\n**Game type:** {game_type}"
                                          f"\n\nSelect the **venue**:"}})
@@ -382,7 +428,8 @@ def build_form_card(sid: str, session: dict[str, Any], *, error: str = "") -> di
         "schema": "2.0",
         "config": {"update_multi": True, "width_mode": "fill"},
         "header": {"template": "orange",
-                   "title": {"tag": "plain_text", "content": "⚙️ Set Maintenance / Test"}},
+                   "title": {"tag": "plain_text",
+                             "content": f"⚙️ {_verb(session)} Maintenance / Test"}},
         "body": {"elements": (
             ([{"tag": "div", "text": {"tag": "lark_md", "content": error}}, {"tag": "hr"}]
              if error else [])
@@ -416,6 +463,9 @@ _ACTION_WORDS = {
     "set_maint": "maintenance",
     "set_test": "test",
     "set_both": "maintenance and test",
+    "unset_maint": "maintenance",
+    "unset_test": "test",
+    "unset_both": "maintenance and test",
 }
 
 
@@ -428,7 +478,7 @@ def _action_words(session: dict[str, Any]) -> str:
 
 def _details_md(session: dict[str, Any], found: list[dict], *, detail: bool = False) -> str:
     return "\n".join([
-        f"**Action:** Set {_action_words(session)}",
+        f"**Action:** {_verb(session)} {_action_words(session)}",
         _where_line(session),
         f"**Machines ({len(found)}):**",
         machine_lines(found, detail=detail),
@@ -441,12 +491,15 @@ def build_review_card(sid: str, session: dict[str, Any], found: list[dict]) -> d
         "schema": "2.0",
         "config": {"update_multi": True, "width_mode": "fill"},
         "header": {"template": "orange",
-                   "title": {"tag": "plain_text", "content": "⚙️ Confirm Set Maintenance / Test"}},
+                   "title": {"tag": "plain_text",
+                             "content": f"⚙️ Confirm {_verb(session)} Maintenance / Test"}},
         "body": {"elements": [
             {"tag": "div", "text": {"tag": "lark_md",
                                     "content": _details_md(session, found, detail=True)}},
             {"tag": "div", "text": {"tag": "lark_md",
-             "content": "_Confirm to run this **now** — there is no scheduled time._"}},
+             "content": "_Confirm to run this **now** — there is no scheduled time._"
+                        + ("\n_Afterwards the bot checks the Game Name page and flags any game "
+                           "still in **TEST**._" if _op(session) == OP_UNSET else "")}},
             _btn_row([
                 {"tag": "button", "text": {"tag": "plain_text", "content": "Confirm"},
                  "type": "primary",
@@ -468,7 +521,8 @@ def build_start_card(session: dict[str, Any], found: list[dict]) -> dict:
         "config": {"update_multi": True, "width_mode": "fill"},
         "header": {"template": "red",
                    "title": {"tag": "plain_text",
-                             "content": f"▶️ Now will start set {_action_words(session)}"}},
+                             "content": f"▶️ Now will start {_verb(session).lower()} "
+                                        f"{_action_words(session)}"}},
         "body": {"elements": [
             {"tag": "div", "text": {"tag": "lark_md",
              "content": f"{_details_md(session, found)}\n\n"
@@ -491,7 +545,7 @@ def build_started_card(session: dict[str, Any], found: list[dict]) -> dict:
                    "title": {"tag": "plain_text", "content": "✅ Started"}},
         "body": {"elements": [
             {"tag": "div", "text": {"tag": "lark_md",
-             "content": f"Set **{_action_words(session)}** is running on "
+             "content": f"{_verb(session)} **{_action_words(session)}** is running on "
                         f"**{len(found)}** machine(s) — progress posts below.\n"
                         f"{_where_line(session)}"}},
         ]},
@@ -512,23 +566,24 @@ def build_failed_card(session: dict[str, Any], found: list[dict], err: Exception
                    "title": {"tag": "plain_text", "content": "❌ Did NOT start"}},
         "body": {"elements": [
             {"tag": "div", "text": {"tag": "lark_md",
-             "content": f"Set **{_action_words(session)}** on **{len(found)}** machine(s) "
+             "content": f"{_verb(session)} **{_action_words(session)}** on **{len(found)}** machine(s) "
                         f"**failed to start** — nothing was changed.\n"
                         f"{_where_line(session)}\n\n"
-                        f"`{str(err)[:300]}`\n\nSend `{CMD}` to try again."}},
+                        f"`{str(err)[:300]}`\n\nSend `{_cmd(session)}` to try again."}},
         ]},
     }
 
 
-def build_cancelled_card() -> dict:
+def build_cancelled_card(session: dict[str, Any] | None = None) -> dict:
+    session = session or {}
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "width_mode": "fill"},
         "header": {"template": "grey",
                    "title": {"tag": "plain_text", "content": "🚫 Cancelled"}},
         "body": {"elements": [{"tag": "div", "text": {
-            "tag": "lark_md", "content": "Set maintenance/test was **cancelled**. "
-                                         f"Send `{CMD}` to start again."}}]},
+            "tag": "lark_md", "content": f"{_verb(session)} maintenance/test was **cancelled**. "
+                                         f"Send `{_cmd(session)}` to start again."}}]},
     }
 
 
@@ -555,7 +610,8 @@ def resolve_session_target(session: dict[str, Any]) -> tuple[list[dict], str]:
         # unmatchable name — say why, or it reads as "that machine is missing".
         hint = machine_ranges.range_hint(tokens)
         if problems:
-            report = _sst.problem_report_md(problems, found, game_type_hint=False)
+            report = _sst.problem_report_md(problems, found, game_type_hint=False,
+                                            scheduled=False)
             return [], (f"{hint}\n\n{report}" if hint else report)
         if not found:
             if ranged and {t.strip().upper() for t in tokens} <= ranged:
@@ -620,11 +676,11 @@ def handle_card_callback(
     # The buttons carry the same gate as the command — the card is what actually changes PROD,
     # so a check only the command honours is no check at all.
     if not (chat_allowed(chat_id) or pm_allowed(sender_id)):
-        return _toast("error", f"You are not allowed to use {CMD} here.")
+        return _toast("error", "You are not allowed to use /set or /unset here.")
 
     session = get_session(sid)
     if not session:
-        return _toast("error", f"This {CMD} form expired. Send {CMD} again.")
+        return _toast("error", "This form expired. Send /set or /unset again.")
 
     # Fold the typed machine list back in before anything reads it: the toggles submit the form,
     # so without this a toggle would re-render the card with an empty box and Confirm would then
@@ -640,7 +696,7 @@ def handle_card_callback(
         # flight. Claimed under the session lock so a Cancel racing a Confirm cannot win.
         if not claim_cancel(sid):
             return _toast("info", "Already started — use the Cancel button on the progress card.")
-        return _card_reply(build_cancelled_card())
+        return _card_reply(build_cancelled_card(session))
 
     # Any change to what is targeted invalidates an approval made before it, so a stale review
     # card cannot run yesterday's machine list under today's heading. A re-submitted machines box
@@ -692,7 +748,7 @@ def handle_card_callback(
 
     if act == "confirm":
         if not (bool(session.get("maint")) or bool(session.get("test"))):
-            return _toast("error", "Kindly select Set Maintenance or Test")
+            return _toast("error", f"Kindly select {_verb(session)} Maintenance or Test")
         found, err = resolve_session_target(session)
         if err:
             # Banner on the form, not a toast: the report is multi-line and _toast cuts at 180.
@@ -703,21 +759,22 @@ def handle_card_callback(
         # on the card the operator actually approved. What was reviewed is what runs.
         session = update_session(
             sid, approved=found,
-            approved_action=selection_action(bool(session.get("maint")), bool(session.get("test"))),
+            approved_action=selection_action_for(
+                session, bool(session.get("maint")), bool(session.get("test"))),
         ) or session
         return _card_reply(build_review_card(sid, session, found))
 
     if act == "run":
         # A stale review card can still offer Confirm after Cancel was tapped on it.
         if session.get("cancelled"):
-            return _toast("info", f"This was cancelled — send {CMD} again.")
+            return _toast("info", f"This was cancelled — send {_cmd(session)} again.")
         # Deliberately NOT re-resolved — see the snapshot note under "confirm".
         found = [m for m in (session.get("approved") or []) if isinstance(m, dict)]
         action = str(session.get("approved_action") or "")
         if not (found and action):
             return _card_reply(build_form_card(
                 sid, session,
-                error="⚠️ This confirmation expired before it ran — nothing was set. "
+                error="⚠️ This confirmation expired before it ran — nothing was changed. "
                       "Review the machines and tap **Confirm** again."))
         if not claim_run(sid):
             return _toast("info", "Already running — check the cards below.")
@@ -733,8 +790,53 @@ def handle_card_callback(
         else:
             what = (f"{run_session.get('env_code')} / {run_session.get('game_type')} / "
                     f"venue={run_session.get('venue') or '-'}")
-        print(f"[setnow] {CMD} run by {sender_id or 'unknown'} in {run_chat}: {action} on "
+        print(f"[setnow] {_cmd(run_session)} run by {sender_id or 'unknown'} in {run_chat}: {action} on "
               f"{len(found)} machine(s) — {what}", flush=True)
+
+        # /unset only: once the job has posted its summary AND its screenshots, check whether any
+        # game it touched is still flagged (TEST) on the backend's Game Name page. ``on_done`` is
+        # handed the job's own thread sender, so the alert lands in the same thread, last.
+        on_done = None
+        if _op(run_session) == OP_UNSET:
+            game_hint = (str(run_session.get("game_type") or "")
+                         if str(run_session.get("mode") or "") == MODE_GAME else "")
+            # Each machine's game type is looked up NOW, before the unset runs. Afterwards the scrape
+            # loop rewrites webmachine_data.json and renames a test cabinet ("5 Dragons-0278(TEST)"
+            # becomes "5 Dragons-0278"), so a name lookup at check time can miss — which is exactly
+            # the "/unset test" case this check exists for.
+            try:
+                import gamename_check
+
+                checked = gamename_check.attach_game_types(found, game_type_hint=game_hint)
+            except Exception as e:  # noqa: BLE001
+                print(f"[setnow] game type lookup failed, deferring to the check: {e!r}", flush=True)
+                checked = [dict(m) for m in found]
+
+            def on_done(summary: dict, job_send: Callable[..., Any]) -> None:
+                import gamename_check
+
+                # Only the machines the job actually unset — the alert's "Machines unset" count
+                # then matches the summary card, and a job where nothing was unset (every machine
+                # failed, usually a login / Cloudflare problem) does not log in again just to report
+                # the same error twice. A summary without a "success" list is unexpected; check
+                # everything rather than risk skipping a TEST game.
+                ok_list = (summary or {}).get("success")
+                if isinstance(ok_list, list):
+                    ok = {(str(x.get("belongs") or "").upper(),
+                           gamename_check.machine_name_key(x.get("machine") or x.get("name")))
+                          for x in ok_list if isinstance(x, dict)}
+                    ok_bare = {k for _b, k in ok}
+                    targets = [m for m in checked
+                               if (str(m.get("belongs") or "").upper(),
+                                   gamename_check.machine_name_key(m.get("machine"))) in ok
+                               or gamename_check.machine_name_key(m.get("machine")) in ok_bare]
+                    if not targets:
+                        print("[gamename-check] skipped: the job unset no machine", flush=True)
+                        return
+                else:
+                    targets = checked
+                gamename_check.run_and_report(targets, chat_id=run_chat, send_message=job_send,
+                                              game_type_hint=game_hint)
 
         # Posting the start card and starting the job are both network work; Lark gives this
         # callback ~3 s, so they go on their own thread and the card is answered immediately.
@@ -745,7 +847,10 @@ def handle_card_callback(
             except Exception as e:  # noqa: BLE001
                 print(f"[setnow] start card failed: {e!r}", flush=True)
             try:
-                run_batch(run_chat, action, found, thread_root=root or None)
+                if on_done is None:
+                    run_batch(run_chat, action, found, thread_root=root or None)
+                else:
+                    run_batch(run_chat, action, found, thread_root=root or None, on_done=on_done)
             except Exception as e:  # noqa: BLE001
                 # The card already says "Started". Saying nothing here would leave the group
                 # believing a PROD change is running when it never began — and the latch would
@@ -760,4 +865,4 @@ def handle_card_callback(
         threading.Thread(target=_fire, daemon=True).start()
         return _card_reply(build_started_card(session, found))
 
-    return _toast("error", f"Unknown {CMD} action: {act}")
+    return _toast("error", f"Unknown {_cmd(session)} action: {act}")

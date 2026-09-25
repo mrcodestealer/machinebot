@@ -3985,8 +3985,15 @@ def start_prod_batch_job_direct(
     machines: list[dict],
     send_message: Callable[..., Any],
     thread_root_message_id: str | None = None,
+    on_done: Callable[[dict, Callable[..., Any]], Any] | None = None,
 ) -> None:
-    """Run set/unset immediately — no Proceed/Cancel confirm card."""
+    """
+    Run set/unset immediately — no Proceed/Cancel confirm card.
+
+    ``on_done(summary, send_message)`` runs once the job has finished **successfully** (not on
+    cancel, not on a job error), after the summary card and after the row screenshots, with the
+    job's own thread sender — ``/unset`` uses it for the Game Name TEST check.
+    """
     from prod_machine_batch import ACTION_LABELS
 
     if thread_root_message_id:
@@ -4013,6 +4020,7 @@ def start_prod_batch_job_direct(
             "thread_root_message_id": (thread_root_message_id or "").strip() or None,
             "cancel_requested": False,
             "cancel_summary_sent": False,
+            "on_done": on_done,
         }
 
     threading.Thread(
@@ -4287,13 +4295,27 @@ def _prod_batch_send_machine_screenshots_background(
     machines: list[dict],
     summary: dict | None,
     send_message: Callable[..., Any],
+    *,
+    after: Callable[[], Any] | None = None,
 ) -> None:
-    threading.Thread(
-        target=_prod_batch_send_machine_screenshots,
-        args=(chat_id, machines, summary, send_message),
-        daemon=True,
-        name="prod-batch-screenshots",
-    ).start()
+    """
+    Post the row screenshots on a background thread, then run ``after`` (if any) on that same
+    thread — so whatever ``after`` posts is guaranteed to follow the last screenshot. It runs even
+    when screenshots are disabled or fail, because it is not about the screenshots.
+    """
+    def _run() -> None:
+        try:
+            _prod_batch_send_machine_screenshots(chat_id, machines, summary, send_message)
+        except Exception:
+            logger.exception("prod-batch screenshots failed for %s", chat_id)
+        finally:
+            if after is not None:
+                try:
+                    after()
+                except Exception:
+                    logger.exception("prod-batch post-screenshot step failed for %s", chat_id)
+
+    threading.Thread(target=_run, daemon=True, name="prod-batch-screenshots").start()
 
 
 def send_machine_row_screenshots_for_chat(
@@ -4441,6 +4463,7 @@ def _run_prod_batch_bot_job_thread(
         else:
             _PROD_BATCH_JOBS[job_id]["status"] = "running"
         thread_root = (job.get("thread_root_message_id") or "").strip() or None
+        on_done = job.get("on_done")
     _prod_batch_sm_refresh_thread_root(chat_id, thread_root)
 
     def cancel_check() -> bool:
@@ -4641,7 +4664,21 @@ def _run_prod_batch_bot_job_thread(
                 summary, action=action, chat_id=chat_id, machines=machines,
                 send_message=send_message, with_screenshots=False,
             )
-        _prod_batch_send_machine_screenshots_background(chat_id, machines, summary, send_message)
+
+        after = None
+        if callable(on_done):
+            # Chained onto the END of the screenshot thread rather than called here: the
+            # screenshots post on their own thread, and a follow-up that raced them would land in
+            # the middle of the row images instead of after them.
+            def after(summ: dict = summary) -> None:
+                try:
+                    on_done(summ, send_message)
+                except Exception:
+                    logger.exception("prod-batch on_done failed for %s", job_id)
+
+        _prod_batch_send_machine_screenshots_background(
+            chat_id, machines, summary, send_message, after=after,
+        )
     except Exception as exc:
         logger.exception("prod-batch bot job %s failed", job_id)
         with _PROD_BATCH_JOBS_LOCK:
