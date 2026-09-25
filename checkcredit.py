@@ -241,6 +241,30 @@ def resolve_oss_machine_folder(machine_query: str) -> str:
     return q.upper()
 
 
+def oss_folder_aliases(folder: str) -> list[str]:
+    """
+    Other OSS folder names the same cabinet may be filed under, best guess first.
+
+    CP cabinets carry two names in this estate: CP's own asset naming ``OSM289`` (plus the
+    OSM-Watch alias ``OSMCP289``), and the OSS log folder, which is ``CP`` + four digits —
+    ``CP0289``. A request can arrive in either form (typed, pasted from an alert, read off a
+    sheet), and resolving it literally looks in a folder that does not exist.
+
+    Only the CP/OSM family is aliased: it is the one venue with documented dual naming, and
+    guessing across venues would risk reading a *different* cabinet's log with the same digits.
+    """
+    f = re.sub(r"[^A-Za-z0-9]", "", folder or "").upper()
+    m = re.match(r"^(?:OSMCP|OSM|CP)0*(\d+)$", f)
+    if not m:
+        return []
+    n = int(m.group(1))
+    out: list[str] = []
+    for cand in (f"CP{n:04d}", f"CP{n}", f"OSM{n:04d}", f"OSM{n}"):
+        if cand != f and cand not in out:
+            out.append(cand)
+    return out
+
+
 def _filter_logic_basenames_for_date(candidates: list[str], date_str: str) -> list[str]:
     """Primary ``YYYY-MM-DD.log`` plus rotated ``YYYY-MM-DD.*.log`` names, sorted."""
     seen: set[str] = set()
@@ -363,9 +387,25 @@ def load_logic_log_for_date_oss(
     """
     date_str = td.isoformat()
     text_parts: list[str] = []
-    same_day = list_oss_logic_log_basenames_for_date(
-        machine_query, td, timeout_sec=min(30.0, max(5.0, timeout_sec))
-    )
+    list_timeout = min(30.0, max(5.0, timeout_sec))
+    requested_folder = resolve_oss_machine_folder(machine_query)
+    folders_tried = [requested_folder]
+    same_day = list_oss_logic_log_basenames_for_date(machine_query, td, timeout_sec=list_timeout)
+    if not same_day:
+        # The cabinet may be filed under its other name — see oss_folder_aliases.
+        for alias in oss_folder_aliases(requested_folder):
+            folders_tried.append(alias)
+            try:
+                alt = list_oss_logic_log_basenames_for_date(alias, td, timeout_sec=list_timeout)
+            except Exception:  # noqa: BLE001 - a failed alias probe is just "not here"
+                alt = []
+            if alt:
+                text_parts.append(
+                    f"→ No logs under `{requested_folder}` — found them under `{alias}` "
+                    f"(same cabinet, CP's other name)"
+                )
+                machine_query, same_day = alias, alt
+                break
     want = (want_basename or "").strip()
     if want and same_day and want not in same_day:
         text_parts.append(
@@ -389,6 +429,7 @@ def load_logic_log_for_date_oss(
     if want:
         body = _fetch(want)
         return {
+            "folder": resolve_oss_machine_folder(machine_query),
             "body": body,
             "same_day": same_day,
             "merged": [want],
@@ -406,8 +447,8 @@ def load_logic_log_for_date_oss(
             text_parts.append(f"⚠ Could not fetch logic log {fn}: {e}")
     if not bodies:
         raise RuntimeError(
-            f"No readable logic log for {resolve_oss_machine_folder(machine_query)} on {date_str} "
-            f"(tried: {', '.join(same_day)})"
+            f"No readable logic log for {requested_folder} on {date_str} "
+            f"(folders tried: {', '.join(folders_tried)}; files tried: {', '.join(same_day)})"
         )
     body, order = merge_logic_log_bodies(bodies)
     spans = [
@@ -421,6 +462,7 @@ def load_logic_log_for_date_oss(
         for fn, first_ts, last_ts in spans:
             text_parts.append(f"   • {fn}  [{first_ts or 'n/a'} → {last_ts or 'n/a'}]")
     return {
+        "folder": resolve_oss_machine_folder(machine_query),
         "body": body,
         "same_day": same_day,
         "merged": order,
@@ -3153,7 +3195,9 @@ def run_finderror(
         if nav_meta["logic_same_day_multi"]:
             names = ", ".join(same_day)
             text_parts.append(f"→ Same-day logic logs ({len(same_day)}): {names}")
-        machine_display = resolve_oss_machine_folder(machine_query)
+        # The folder the log really came from — it differs from the request when the cabinet
+        # was found under its other name (OSM289 -> CP0289), and Third Http routes on it.
+        machine_display = str(loaded.get("folder") or "") or resolve_oss_machine_folder(machine_query)
         parsed = parse_user_blocks_full(log_body)
     else:
         log_body, machine_display, nav_parts, nav_meta = fetch_log_via_navigator(
